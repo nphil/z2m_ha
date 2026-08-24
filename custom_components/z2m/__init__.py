@@ -21,9 +21,7 @@ from .const import (
     CONF_BASE_TOPIC,
     DEFAULT_BASE_TOPIC,
     DOMAIN,
-    PANEL_ICON,
     PANEL_JS,
-    PANEL_TITLE,
     PANEL_URL_PATH,
     WEBCOMPONENT,
 )
@@ -65,11 +63,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         webcomponent_name=WEBCOMPONENT,
         frontend_url_path=PANEL_URL_PATH,
         module_url=f"/api/panel_custom/{DOMAIN}/{PANEL_JS}?v={integration.version}",
-        sidebar_title=PANEL_TITLE,
-        sidebar_icon=PANEL_ICON,
+        # No sidebar_title/sidebar_icon on purpose: zwave_js has no sidebar item
+        # either. Passing them is what made this feel bolted on. Omitting them
+        # leaves the panel reachable only where a hub integration should be --
+        # Settings > Devices & Services > Zigbee > Configure -- via
+        # config_panel_domain below, which is the frontend's own mechanism
+        # (it resolves the link with `config_panel_domain === domain`).
         require_admin=True,
-        # Makes this the integration's config page, so the entry in
-        # Settings > Devices & Services opens it the way Z-Wave's does.
         config_panel_domain=DOMAIN,
         config={"base_topic": base_topic},
     )

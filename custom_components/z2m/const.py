@@ -5,10 +5,9 @@ DOMAIN = "z2m"
 CONF_BASE_TOPIC = "base_topic"
 DEFAULT_BASE_TOPIC = "zigbee2mqtt"
 
-# Panel
+# Panel. No sidebar title/icon: this is reached from the integration entry, like
+# zwave_js, so it never appears in the sidebar.
 PANEL_URL_PATH = "z2m"
-PANEL_TITLE = "Zigbee"
-PANEL_ICON = "mdi:zigbee"
 WEBCOMPONENT = "z2m-panel"
 PANEL_JS = "z2m-panel.js"
 

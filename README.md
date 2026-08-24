@@ -1,9 +1,14 @@
 # Zigbee for Home Assistant (Zigbee2MQTT)
 
 Gives Zigbee2MQTT the same kind of first-class surface in Home Assistant that
-**Z-Wave JS** and **ZHA** have: an entry under *Settings → Devices & Services*, a
-`mdi:zigbee` sidebar panel, and a dashboard for managing devices — without leaving
-Home Assistant for Zigbee2MQTT's own web UI.
+**Z-Wave JS** and **ZHA** have: an entry under *Settings → Devices & Services* whose
+**Configure** button opens a dashboard for managing the network — without leaving Home
+Assistant for Zigbee2MQTT's own web UI.
+
+There is deliberately **no sidebar item**. Z-Wave JS does not add one either; a hub
+integration belongs behind its entry, not in the navigation. The panel is wired with
+`config_panel_domain`, which is the frontend's own mechanism for this — it resolves the
+Configure link by matching `config_panel_domain` against the integration domain.
 
 Zigbee2MQTT already exposes every device as MQTT entities. What it does not give you
 is a *Home Assistant–native place to manage the network*: rename a device, change its
@@ -36,6 +41,10 @@ and restart.
 Then *Settings → Devices & Services → Add integration → **Zigbee***. The only
 question is the MQTT base topic, which must match `mqtt.base_topic` in your
 Zigbee2MQTT `configuration.yaml` (default `zigbee2mqtt`).
+
+To open it afterwards: *Settings → Devices & Services → **Zigbee** → Configure*. It is
+not in the sidebar by design, and the panel URL is `/z2m` if you want to bookmark or
+iframe it.
 
 ## What you get
 
