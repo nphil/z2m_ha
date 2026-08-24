@@ -1,0 +1,16 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Zigbee",
+        "description": "Surfaces your Zigbee2MQTT network inside Home Assistant. The base topic must match `mqtt.base_topic` in Zigbee2MQTT's configuration.",
+        "data": {
+          "base_topic": "MQTT base topic"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Zigbee is already configured."
+    }
+  }
+}

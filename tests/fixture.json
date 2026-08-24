@@ -1,0 +1,150 @@
+{
+  "info": {
+    "state": "online",
+    "version": "2.13.0",
+    "permit_join": false,
+    "permit_join_end": null,
+    "log_level": "info",
+    "base_topic": "zigbee2mqtt",
+    "restart_required": false,
+    "device_count": 4,
+    "offline_count": 1,
+    "group_count": 1,
+    "serial": "tcp://coordinator.example:7638",
+    "coordinator": {
+      "ieee_address": "0x00124b0000000000",
+      "type": "zStack3x0",
+      "meta": { "maintrel": 1, "majorrel": 2, "minorrel": 7, "revision": "20240710" }
+    },
+    "network": {
+      "channel": 25,
+      "pan_id": 49090,
+      "extended_pan_id": "0x0000000000000000"
+    }
+  },
+  "devices": [
+    {
+      "ieee_address": "0x0000000000000001",
+      "friendly_name": "Hallway Dimmer",
+      "network_address": 4001,
+      "vendor": "Inovelli",
+      "model": "VZM31-SN",
+      "description": "2-in-1 switch + dimmer",
+      "type": "Router",
+      "power_source": "Mains (single phase)",
+      "availability": "online",
+      "supported": true,
+      "software_build_id": "2.15",
+      "date_code": "20230530",
+      "options": [
+        {
+          "type": "binary",
+          "name": "state_action",
+          "property": "state_action",
+          "label": "State action",
+          "description": "State actions will also be published as 'action' when true.",
+          "value_on": true,
+          "value_off": false
+        },
+        {
+          "type": "numeric",
+          "name": "transition",
+          "property": "transition",
+          "label": "Transition",
+          "description": "Time in seconds a transition should take.",
+          "value_min": 0,
+          "value_max": 65535,
+          "value_step": 0.1
+        },
+        {
+          "type": "enum",
+          "name": "effect_color_mode",
+          "property": "effect_color_mode",
+          "label": "Effect color mode",
+          "description": "How the LED bar reports colour while an effect runs.",
+          "values": ["stop", "keep", "restore"]
+        },
+        {
+          "type": "text",
+          "name": "friendly_note",
+          "property": "friendly_note",
+          "label": "Note",
+          "description": "Free-form note stored by Zigbee2MQTT."
+        },
+        {
+          "type": "binary",
+          "name": "color_sync",
+          "property": "color_sync",
+          "label": "Colour sync",
+          "value_on": true,
+          "value_off": false
+        },
+        {
+          "type": "binary",
+          "name": "hue_native_control",
+          "property": "hue_native_control",
+          "label": "Hue native control",
+          "value_on": true,
+          "value_off": false
+        }
+      ],
+      "scenes": []
+    },
+    {
+      "ieee_address": "0x0000000000000002",
+      "friendly_name": "Porch Sensor",
+      "network_address": 4002,
+      "vendor": "Third Reality",
+      "model": "3RWK0148Z",
+      "description": "Water leak sensor",
+      "type": "EndDevice",
+      "power_source": "Battery",
+      "availability": "offline",
+      "supported": true,
+      "options": [
+        {
+          "type": "numeric",
+          "name": "battery_voltage",
+          "property": "battery_voltage",
+          "label": "Battery voltage",
+          "value_min": 0,
+          "value_max": 4000
+        }
+      ],
+      "scenes": []
+    },
+    {
+      "ieee_address": "0x0000000000000003",
+      "friendly_name": "Unknown Gadget",
+      "network_address": 4003,
+      "vendor": null,
+      "model": null,
+      "type": "EndDevice",
+      "availability": "online",
+      "supported": false,
+      "options": [],
+      "scenes": []
+    },
+    {
+      "ieee_address": "0x0000000000000004",
+      "friendly_name": "Quote's \"Tricky\" <Name> & Co",
+      "network_address": 4004,
+      "vendor": "Tuya",
+      "model": "TS0042",
+      "type": "EndDevice",
+      "power_source": "Battery",
+      "availability": "online",
+      "supported": true,
+      "options": [],
+      "scenes": []
+    }
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "friendly_name": "living_room_lights",
+      "members": [{ "ieee_address": "0x0000000000000001", "endpoint": 1 }],
+      "scenes": []
+    }
+  ]
+}

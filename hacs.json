@@ -1,0 +1,5 @@
+{
+  "name": "Zigbee (Zigbee2MQTT)",
+  "render_readme": true,
+  "homeassistant": "2026.6.0"
+}
