@@ -10,14 +10,13 @@ import math
 import struct
 import zlib
 
-HA_BLUE = (0x03, 0xA9, 0xF4)
-WHITE = (0xFF, 0xFF, 0xFF)
+# Home Assistant's integration tiles carry transparent-background marks, not filled
+# app plates, so the glyph is drawn in one ink over transparency. Blue-grey rather
+# than a brand blue: it sits beside HA's own Z-Wave and Matter marks without
+# competing with them.
+INK_LIGHT = (0x37, 0x47, 0x4F)
+INK_DARK = (0xEC, 0xEF, 0xF1)
 
-
-def rounded_rect(px, py, w, h, r):
-    """Signed distance to a rounded rectangle centred on the origin."""
-    qx, qy = abs(px) - (w - r), abs(py) - (h - r)
-    return math.hypot(max(qx, 0.0), max(qy, 0.0)) + min(max(qx, qy), 0.0) - r
 
 
 def circle(px, py, cx, cy, r):
@@ -33,52 +32,45 @@ def capsule(px, py, ax, ay, bx, by, r):
     return math.hypot(pax - bax * t, pay - bay * t) - r
 
 
-def render(size, ss=4):
+def render(size, ink, ss=4):
     """Return RGBA rows. ss = supersampling factor, so edges are genuinely smooth."""
-    # Mesh geometry in a -1..1 space: coordinator centre, three children.
+    # Mesh geometry in a -1..1 space: coordinator centre, three children. Scaled to
+    # fill the canvas because there is no background plate to sit inside.
     hub = (0.0, 0.0)
-    node_r, hub_r, link_r = 0.155, 0.20, 0.055
+    node_r, hub_r, link_r = 0.185, 0.24, 0.07
     # Three children at equal radius (up, down-left, down-right) so no node merges
-    # into the hub: 0.52 apart against summed radii of 0.355.
-    nodes = [(0.0, -0.52), (-0.45, 0.26), (0.45, 0.26)]
+    # into the hub: 0.62 apart against summed radii of 0.425.
+    nodes = [(0.0, -0.62), (-0.537, 0.31), (0.537, 0.31)]
     rows = []
     inv = 1.0 / (size * ss)
+    ir, ig, ib = ink
     for y in range(size):
         row = bytearray()
         for x in range(size):
-            acc = [0.0, 0.0, 0.0, 0.0]
+            acc = 0.0
             for sy in range(ss):
                 for sx in range(ss):
                     # Map to -1..1 with the sub-pixel offset.
                     u = ((x * ss + sx + 0.5) * inv) * 2.0 - 1.0
                     v = ((y * ss + sy + 0.5) * inv) * 2.0 - 1.0
-
-                    # Background plate: rounded square covering most of the canvas.
-                    if rounded_rect(u, v, 0.92, 0.92, 0.30) <= 0.0:
-                        r, g, b = HA_BLUE
-                        a = 255.0
-                        # Mesh drawn on top in white.
-                        d = circle(u, v, hub[0], hub[1], hub_r)
-                        for nx, ny in nodes:
-                            d = min(d, circle(u, v, nx, ny, node_r))
-                            d = min(d, capsule(u, v, hub[0], hub[1], nx, ny, link_r))
-                        if d <= 0.0:
-                            r, g, b = WHITE
-                    else:
-                        r = g = b = a = 0.0
-
-                    acc[0] += r
-                    acc[1] += g
-                    acc[2] += b
-                    acc[3] += a
+                    d = circle(u, v, hub[0], hub[1], hub_r)
+                    for nx, ny in nodes:
+                        d = min(d, circle(u, v, nx, ny, node_r))
+                        d = min(d, capsule(u, v, hub[0], hub[1], nx, ny, link_r))
+                    if d <= 0.0:
+                        acc += 255.0
             n = ss * ss
-            row += bytes(int(round(c / n)) for c in acc)
+            a = int(round(acc / n))
+            # Premultiplication is not wanted here: PNG alpha is straight, so the
+            # ink colour stays constant and only coverage varies. Anything else
+            # leaves a dark fringe when the icon is drawn on a light card.
+            row += bytes((ir, ig, ib, a))
         rows.append(bytes(row))
     return rows
 
 
-def write_png(path, size):
-    rows = render(size)
+def write_png(path, size, ink):
+    rows = render(size, ink)
     raw = b"".join(b"\x00" + r for r in rows)  # filter type 0 per scanline
 
     def chunk(tag, data):
@@ -98,6 +90,11 @@ if __name__ == "__main__":
     import sys
 
     out = sys.argv[1]
-    for name, size in (("icon", 256), ("icon@2x", 512), ("logo", 256), ("logo@2x", 512)):
-        n = write_png(f"{out}/{name}.png", size)
-        print(f"  {name}.png {size}x{size} {n} bytes")
+    # Home Assistant serves these itself from custom_components/<domain>/brand/ via
+    # /api/brands/integration/<domain>/[dark_]<name>.png, trying the custom
+    # integration BEFORE its CDN. It falls back dark_* -> plain, but a dark glyph on
+    # a dark card is invisible, so the dark variants are real files, not a fallback.
+    for prefix, ink in (("", INK_LIGHT), ("dark_", INK_DARK)):
+        for name, size in (("icon", 256), ("icon@2x", 512), ("logo", 256), ("logo@2x", 512)):
+            n = write_png(f"{out}/{prefix}{name}.png", size, ink)
+            print(f"  {prefix}{name}.png {size}x{size} {n} bytes")

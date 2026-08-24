@@ -25,7 +25,10 @@
       "channel": 25,
       "pan_id": 49090,
       "extended_pan_id": "0x0000000000000000"
-    }
+    },
+    "label_id": "zigbee2mqtt",
+    "map_generated": null,
+    "map_scanning": false
   },
   "devices": [
     {
@@ -193,5 +196,204 @@
         "update_percentage": null
       }
     }
+  },
+  "registry": {
+    "devices": {
+      "dev1": {
+        "id": "dev1",
+        "name": "Hallway Dimmer",
+        "labels": [
+          "zigbee2mqtt"
+        ]
+      },
+      "dev2": {
+        "id": "dev2",
+        "name": "Porch Sensor",
+        "labels": [
+          "zigbee2mqtt"
+        ]
+      },
+      "dev3": {
+        "id": "dev3",
+        "name": "Unknown Gadget",
+        "labels": [
+          "zigbee2mqtt"
+        ]
+      },
+      "dev4": {
+        "id": "dev4",
+        "name": "Quote's Tricky Name",
+        "labels": [
+          "zigbee2mqtt"
+        ]
+      },
+      "devX": {
+        "id": "devX",
+        "name": "Not a Zigbee device",
+        "labels": []
+      }
+    },
+    "entities": {
+      "light.hallway_dimmer": {
+        "entity_id": "light.hallway_dimmer",
+        "device_id": "dev1",
+        "labels": [
+          "zigbee2mqtt"
+        ]
+      },
+      "update.hallway_dimmer": {
+        "entity_id": "update.hallway_dimmer",
+        "device_id": "dev1",
+        "labels": [
+          "zigbee2mqtt"
+        ]
+      },
+      "binary_sensor.porch_leak": {
+        "entity_id": "binary_sensor.porch_leak",
+        "device_id": "dev2",
+        "labels": [
+          "zigbee2mqtt"
+        ]
+      },
+      "sensor.porch_battery": {
+        "entity_id": "sensor.porch_battery",
+        "device_id": "dev2",
+        "labels": [
+          "zigbee2mqtt"
+        ]
+      },
+      "update.porch_sensor": {
+        "entity_id": "update.porch_sensor",
+        "device_id": "dev2",
+        "labels": [
+          "zigbee2mqtt"
+        ]
+      },
+      "sensor.cpu": {
+        "entity_id": "sensor.cpu",
+        "device_id": "devX",
+        "labels": []
+      }
+    }
+  },
+  "networkmap": {
+    "generated": 0,
+    "cached": true,
+    "coordinator": "0x00124b0000000000",
+    "nodes": [
+      {
+        "ieee": "0x00124b0000000000",
+        "name": "Coordinator",
+        "type": "Coordinator",
+        "addr": 0,
+        "vendor": "Texas Instruments",
+        "model": "zStack3x0",
+        "description": "coordinator",
+        "lastSeen": null,
+        "failed": [],
+        "availability": null,
+        "device_id": null
+      },
+      {
+        "ieee": "0x0000000000000001",
+        "name": "Hallway Dimmer",
+        "type": "Router",
+        "addr": 4001,
+        "vendor": "Inovelli",
+        "model": "VZM31-SN",
+        "description": "2-in-1 switch + dimmer",
+        "lastSeen": 0,
+        "failed": [],
+        "availability": "online",
+        "device_id": "dev1"
+      },
+      {
+        "ieee": "0x0000000000000002",
+        "name": "Porch Sensor",
+        "type": "EndDevice",
+        "addr": 4002,
+        "vendor": "Third Reality",
+        "model": "3RWK0148Z",
+        "description": "Water leak sensor",
+        "lastSeen": 0,
+        "failed": [
+          "lqi"
+        ],
+        "availability": "offline",
+        "device_id": "dev2"
+      }
+    ],
+    "links": [
+      {
+        "source": "0x0000000000000001",
+        "target": "0x00124b0000000000",
+        "lqi": 120,
+        "relationship": 0,
+        "depth": 1,
+        "rxOnWhenIdle": 1,
+        "routes": []
+      },
+      {
+        "source": "0x0000000000000002",
+        "target": "0x0000000000000001",
+        "lqi": 33,
+        "relationship": 1,
+        "depth": 2,
+        "rxOnWhenIdle": 0,
+        "routes": []
+      }
+    ]
+  },
+  "logs": {
+    "entries": [
+      {
+        "time": 0,
+        "level": "info",
+        "message": "Connected to MQTT server"
+      },
+      {
+        "time": 0,
+        "level": "warning",
+        "message": "Device Porch Sensor is offline"
+      },
+      {
+        "time": 0,
+        "level": "error",
+        "message": "Publish to zigbee2mqtt/x failed"
+      },
+      {
+        "time": 0,
+        "level": "debug",
+        "message": "Received Zigbee message from Hallway Dimmer"
+      }
+    ]
+  },
+  "coordinator_check": {
+    "missing_routers": [
+      {
+        "ieee": "0x0000000000000001",
+        "name": "Hallway Dimmer"
+      }
+    ]
+  },
+  "health_check": {
+    "healthy": true,
+    "mqtt": {
+      "connected": true,
+      "queued": 0,
+      "published": 12345,
+      "received": 54321
+    },
+    "devices": {
+      "0x0000000000000002": {
+        "leave_count": 1,
+        "network_address_changes": 0,
+        "messages": 88,
+        "messages_per_sec": 0.01
+      }
+    }
+  },
+  "backup": {
+    "zip": "UEsDBCBwcmV0ZW5kIGNvb3JkaW5hdG9yIGJhY2t1cA=="
   }
 }

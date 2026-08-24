@@ -67,10 +67,65 @@ device can join anywhere again).
 **Network** — coordinator type and firmware, channel, PAN ID, extended PAN ID, log
 level. The network key is deliberately never shown.
 
-**Topology** — the map is not reimplemented here. If
-[`ha-zigbee-map`](https://codeberg.org/dan-danache/ha-zigbee-map) is installed, the
-dashboard links to it. Note it needs `advanced.enable_external_js: true` in
-Zigbee2MQTT, because it installs a Zigbee2MQTT extension to collect LQI.
+**Map** — a force-directed view of the mesh. Opening it draws **every device at
+once**, from the retained device list, and then fills in the links device by device
+as each router answers, rather than showing a wait message and a blank canvas. Drag
+any device to pull the layout around; double-click to pin it (pinned positions
+persist). Links are coloured by LQI, and neighbours that are not parent or child are
+drawn faint, so the solid lines are the ones that describe actual tree structure.
+
+Select a device and the map traces **its path to the coordinator**, dimming
+everything else. The label on that path is deliberate:
+
+- *Parent chain* — every hop came from a reported parent/child relationship. For an
+  end device this is how its traffic really leaves, because end devices talk only to
+  their parent.
+- *Strongest known path* — the tree was incomplete, so this is inferred from link
+  quality. Routers pick routes dynamically, so live traffic may differ. The map says
+  so rather than implying certainty it does not have.
+
+A scan walks the coordinator's and every router's neighbour table — 15 of the 45
+devices on the network it was built against; end devices hold no neighbour table and
+reach the map through their parent's. Requests are paced (at most two outstanding, at
+least a second apart) because what hurts a mesh is a burst, not a request. The result
+is **cached** (10 minutes by default) and opening the map reads that cache: visiting
+the page does not re-probe the mesh. A scan runs when there is nothing cached yet —
+the first open after a restart — or when you ask for one. What changed is that the
+first scan is no longer a button and a waiting message: it starts by itself and you
+watch it happen.
+
+Streaming it needs a per-device neighbour-table query, which Zigbee2MQTT's
+first-party endpoint does not offer — that one walks every router inside a single
+request and answers once, at the end. So the integration installs an extension
+(`z2m_ha_lqi.js`, ~180 lines, in this repository) into Zigbee2MQTT **once, on setup,
+and leaves it installed**. That is the opposite of what the integration this replaces
+did: it saved its extension when the panel opened and removed it when the panel
+closed, so every visit re-walked every router. Persisting one file is what removes
+that.
+
+Installing needs `advanced.enable_external_js`. With it off, nothing is installed —
+the integration logs that once and the map uses Zigbee2MQTT's own scan instead: the
+fleet is still drawn immediately, and the links arrive in one batch at the end rather
+than device by device.
+
+**Diagnostics on the map** — weak links, devices that failed to answer the scan,
+links whose two directions disagree by 40 LQI or more, and **choke points**: routers
+whose loss would strand other devices, with a count of how many. That last one is the
+question worth asking of a mesh — a weak link with a spare route beside it is not a
+problem, and a strong link that everything depends on is.
+
+**Map as a dashboard card** — the same element is registered as a Lovelace card, so
+it can go on any dashboard. It appears in the card picker as *Zigbee map*, or by YAML:
+
+```yaml
+type: custom:z2m-map-card
+height: 420        # optional, pixels
+diagnostics: true  # optional
+title: Zigbee mesh # optional
+```
+
+No resource registration is needed — the integration serves the file and registers it
+with the frontend itself. The card reads the cached scan and will never trigger one.
 
 ## Design notes
 
@@ -88,6 +143,8 @@ the built-in `zwave_js` panel talks to its integration:
 | `z2m/info` | Bridge summary |
 | `z2m/devices`, `z2m/groups` | Mirrored inventory |
 | `z2m/subscribe` | Push updates to the panel |
+| `z2m/networkmap` | The cached topology, scanning only when stale or forced |
+| `z2m/networkmap/scan` | Runs a scan and pushes it out device by device as it happens |
 | `z2m/permit_join` | Open/close joining |
 | `z2m/device/rename`, `/options`, `/configure`, `/interview`, `/remove` | Device management |
 | `z2m/ota/check` | Firmware check |

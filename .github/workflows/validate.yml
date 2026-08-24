@@ -25,7 +25,7 @@ jobs:
           category: integration
 
   panel:
-    name: panel render tests
+    name: panel and map tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,4 +33,7 @@ jobs:
         with:
           node-version: "22"
       - run: node --check custom_components/z2m/panel/z2m-panel.js
+      - run: node --check custom_components/z2m/panel/z2m-map.js
+      - run: node --check custom_components/z2m/z2m_ha_lqi.js
       - run: node tests/render.test.mjs
+      - run: node tests/map.test.mjs

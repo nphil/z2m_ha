@@ -1,31 +1,154 @@
 /**
- * Zigbee panel.
+ * Zigbee panel: Settings > Devices & Services > Zigbee > Configure.
  *
- * Deliberately plain DOM: no Lit, no bundler, no CDN. Everything is styled with Home
- * Assistant's own CSS custom properties, so theming, dark mode, density and touch
- * target sizing are inherited rather than reimplemented -- which is what makes it
- * behave on phones and wall tablets as well as desktop.
+ * Built out of Home Assistant's OWN components -- hass-subpage, ha-card, ha-md-list,
+ * ha-md-list-item, ha-svg-icon, ha-icon-next, ha-alert, ha-button -- laid out the way
+ * HA's own ZHA and Z-Wave config pages are laid out, so it reads as part of Home
+ * Assistant rather than as a bolt-on. Nothing here re-implements a component HA
+ * already ships, and most of the top level is delegation into HA's own device and
+ * entity tables.
+ *
+ * Deliberately plain DOM: no Lit, no bundler, no CDN, no dependencies at all. The
+ * cost of that choice is two small hand-written passes -- a template string per view,
+ * then one hydration pass that assigns the JS properties markup cannot carry
+ * (`.path`, `.hass`, `.backCallback`, `.topology`, `.scan`) and wires events.
+ *
+ * Availability of those components is a RUNTIME condition, per element. None of them
+ * live in HA's eager `app.*.js`; they ship in lazily loaded chunks. Measured on HA
+ * 2026.8.3, a cold load straight onto this URL already has ha-card, ha-md-list-item,
+ * ha-svg-icon, ha-icon-next, ha-icon-button, ha-alert and ha-button, and is missing
+ * only ha-md-list and hass-subpage -- note the shape of that: the list ITEM is there,
+ * only its container is not. `window.loadCardHelpers` does not exist at all on that
+ * path, so it is called opportunistically and gates nothing.
+ *
+ * So the wait is bounded PER ELEMENT and never fatal: whatever is missing degrades in
+ * its own spot to a neutral container or another HA component that is present, and
+ * anything that shows up later upgrades the page in place. The rows -- where the
+ * visual identity lives -- are always genuine ha-md-list-item. There is deliberately
+ * no whole-page "components unavailable" screen: there is no case where the page
+ * cannot render.
  */
 
-const ICONS = {
-  devices: 'M3 5h8v6H3zm10 0h8v6h-8zM3 13h8v6H3zm10 0h8v6h-8z',
-  add: 'M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6z',
-  group: 'M12 5.5A3.5 3.5 0 1 1 8.5 9 3.5 3.5 0 0 1 12 5.5M5 8a2.5 2.5 0 1 1-2.5 2.5A2.5 2.5 0 0 1 5 8m14 0a2.5 2.5 0 1 1-2.5 2.5A2.5 2.5 0 0 1 19 8m-7 6c2.7 0 5 1.3 5 3v2H7v-2c0-1.7 2.3-3 5-3',
-  ota: 'M12 2 4 6v6c0 5 3.4 9.7 8 10 4.6-.3 8-5 8-10V6zm0 5 4 4h-2.5v4h-3v-4H8z',
-  log: 'M3 4h18v2H3zm0 5h18v2H3zm0 5h12v2H3zm0 5h12v2H3z',
-  info: 'M11 9h2V7h-2m1 13a8 8 0 1 1 8-8 8 8 0 0 1-8 8m0-18a10 10 0 1 0 10 10A10 10 0 0 0 12 2m-1 15h2v-6h-2z',
-  map: 'M15 19l-6-2V5l6 2zm2-.5 4 1.5V6l-4-1.5zM7 18.5 3 20V6l4-1.5z',
-  restart: 'M12 4V1L8 5l4 4V6a6 6 0 1 1-6 6H4a8 8 0 1 0 8-8',
-  backup: 'M14 3v5h5l-7 7-7-7h5V3zM5 18h14v2H5z',
-  health: 'M12 21.35 10.55 20C5.4 15.36 2 12.28 2 8.5A5.5 5.5 0 0 1 12 5.09 5.5 5.5 0 0 1 22 8.5c0 3.78-3.4 6.86-8.55 11.54z',
-  chevron: 'M8.6 16.6 13.2 12 8.6 7.4 10 6l6 6-6 6z',
-  back: 'M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20z',
-  refresh: 'M17.65 6.35A8 8 0 1 0 19.73 14h-2.08A6 6 0 1 1 12 6a5.9 5.9 0 0 1 4.22 1.78L13 11h7V4z',
-  search: 'M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.5 6.5 0 1 1 9.5 3m0 2A4.5 4.5 0 1 0 14 9.5 4.5 4.5 0 0 0 9.5 5',
+/* MDI paths, taken from Home Assistant's own icon set so the iconography matches the
+ * rest of Settings exactly. Several are the very paths HA's ZHA page uses. */
+const MDI = {
+  check: 'M21,7L9,19L3.5,13.5L4.91,12.09L9,16.17L19.59,5.59L21,7Z',
+  back: 'M20,11V13H8L13.5,18.5L12.08,19.92L4.16,12L12.08,4.08L13.5,5.5L8,11H20Z',
+  alert: 'M11,15H13V17H11V15M11,7H13V13H11V7M12,2C6.47,2 2,6.5 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4A8,8 0 0,1 20,12A8,8 0 0,1 12,20Z',
+  devices: 'M3 6H21V4H3C1.9 4 1 4.9 1 6V18C1 19.1 1.9 20 3 20H7V18H3V6M13 12H9V13.78C8.39 14.33 8 15.11 8 16C8 16.89 8.39 17.67 9 18.22V20H13V18.22C13.61 17.67 14 16.88 14 16S13.61 14.33 13 13.78V12M11 17.5C10.17 17.5 9.5 16.83 9.5 16S10.17 14.5 11 14.5 12.5 15.17 12.5 16 11.83 17.5 11 17.5M22 8H16C15.5 8 15 8.5 15 9V19C15 19.5 15.5 20 16 20H22C22.5 20 23 19.5 23 19V9C23 8.5 22.5 8 22 8M21 18H17V10H21V18Z',
+  entities: 'M11,13.5V21.5H3V13.5H11M12,2L17.5,11H6.5L12,2M17.5,13C20,13 22,15 22,17.5C22,20 20,22 17.5,22C15,22 13,20 13,17.5C13,15 15,13 17.5,13Z',
+  groups: 'M22,4A2,2 0 0,1 24,6V16A2,2 0 0,1 22,18H6A2,2 0 0,1 4,16V4A2,2 0 0,1 6,2H12L14,4H22M2,6V20H20V22H2A2,2 0 0,1 0,20V11H0V6H2M6,6V16H22V6H6Z',
+  options: 'M3,17V19H9V17H3M3,5V7H13V5H3M13,21V19H21V17H13V15H11V21H13M7,9V11H3V13H7V15H9V9H7M21,13V11H11V13H21M15,9H17V7H21V5H17V3H15V9Z',
+  info: 'M11,9H13V7H11M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M11,17H13V11H11V17Z',
+  download: 'M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z',
+  plus: 'M19,13H13V19H11V13H5V11H11V5H13V11H19V13Z',
+  map: 'M2 3V9H4.95L6.95 15H6V21H12V16.41L17.41 11H22V5H16V9.57L10.59 15H9.06L7.06 9H8V3M4 5H6V7H4M18 7H20V9H18M8 17H10V19H8Z',
+  logs: 'M6,2A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2H6M6,4H13V9H18V20H6V4M8,12V14H16V12H8M8,16V18H13V16H8Z',
+  diagnostics: 'M19,8C19.56,8 20,8.43 20,9A1,1 0 0,1 19,10C18.43,10 18,9.55 18,9C18,8.43 18.43,8 19,8M2,2V11C2,13.96 4.19,16.5 7.14,16.91C7.76,19.92 10.42,22 13.5,22A6.5,6.5 0 0,0 20,15.5V11.81C21.16,11.39 22,10.29 22,9A3,3 0 0,0 19,6A3,3 0 0,0 16,9C16,10.29 16.84,11.4 18,11.81V15.41C18,17.91 16,19.91 13.5,19.91C11.5,19.91 9.82,18.7 9.22,16.9C12,16.3 14,13.8 14,11V2H10V5H12V11A4,4 0 0,1 8,15A4,4 0 0,1 4,11V5H6V2H2Z',
+  firmware: 'M5.12,5L5.93,4H17.93L18.87,5M12,17.5L6.5,12H10V10H14V12H17.5L12,17.5M20.54,5.23L19.15,3.55C18.88,3.21 18.47,3 18,3H6C5.53,3 5.12,3.21 4.84,3.55L3.46,5.23C3.17,5.57 3,6 3,6.5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V6.5C21,6 20.83,5.57 20.54,5.23Z',
+  restart: 'M12,4C14.1,4 16.1,4.8 17.6,6.3C20.7,9.4 20.7,14.5 17.6,17.6C15.8,19.5 13.3,20.2 10.9,19.9L11.4,17.9C13.1,18.1 14.9,17.5 16.2,16.2C18.5,13.9 18.5,10.1 16.2,7.7C15.1,6.6 13.5,6 12,6V10.6L7,5.6L12,0.6V4M6.3,17.6C3.7,15 3.3,11 5.1,7.9L6.6,9.4C5.5,11.6 5.9,14.4 7.8,16.2C8.3,16.7 8.9,17.1 9.6,17.4L9,19.4C8,19 7.1,18.4 6.3,17.6Z',
+  search: 'M9.5,3A6.5,6.5 0 0,1 16,9.5C16,11.11 15.41,12.59 14.44,13.73L14.71,14H15.5L20.5,19L19,20.5L14,15.5V14.71L13.73,14.44C12.59,15.41 11.11,16 9.5,16A6.5,6.5 0 0,1 3,9.5A6.5,6.5 0 0,1 9.5,3M9.5,5C7,5 5,7 5,9.5C5,12 7,14 9.5,14C12,14 14,12 14,9.5C14,7 12,5 9.5,5Z',
+  refresh: 'M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z',
+  battery: 'M16,20H8V6H16M16.67,4H15V2H9V4H7.33A1.33,1.33 0 0,0 6,5.33V20.67C6,21.4 6.6,22 7.33,22H16.67A1.33,1.33 0 0,0 18,20.67V5.33C18,4.6 17.4,4 16.67,4Z',
+  rename: 'M20.71,7.04C21.1,6.65 21.1,6 20.71,5.63L18.37,3.29C18,2.9 17.35,2.9 16.96,3.29L15.12,5.12L18.87,8.87M3,17.25V21H6.75L17.81,9.93L14.06,6.18L3,17.25Z',
+  remove: 'M19,4H15.5L14.5,3H9.5L8.5,4H5V6H19M6,19A2,2 0 0,0 8,21H16A2,2 0 0,0 18,19V7H6V19Z',
+  wrench: 'M22.7,19L13.6,9.9C14.5,7.6 14,4.9 12.1,3C10.1,1 7.1,0.6 4.7,1.7L9,6L6,9L1.6,4.7C0.4,7.1 0.9,10.1 2.9,12.1C4.8,14 7.5,14.5 9.8,13.6L18.9,22.7C19.3,23.1 19.9,23.1 20.3,22.7L22.6,20.4C23.1,20 23.1,19.3 22.7,19Z',
+  radar: 'M19.07,4.93L17.66,6.34C19.1,7.79 20,9.79 20,12A8,8 0 0,1 12,20A8,8 0 0,1 4,12C4,7.92 7.05,4.56 11,4.07V6.09C8.16,6.57 6,9.03 6,12A6,6 0 0,0 12,18A6,6 0 0,0 18,12C18,10.34 17.33,8.84 16.24,7.76L14.83,9.17C15.55,9.9 16,10.9 16,12A4,4 0 0,1 12,16A4,4 0 0,1 8,12C8,10.14 9.28,8.59 11,8.14V10.28C10.4,10.63 10,11.26 10,12A2,2 0 0,0 12,14A2,2 0 0,0 14,12C14,11.26 13.6,10.62 13,10.28V2H12A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12C22,9.24 20.88,6.74 19.07,4.93Z',
+  health: 'M7.5,4A5.5,5.5 0 0,0 2,9.5C2,10 2.09,10.5 2.22,11H6.3L7.57,7.63C7.87,6.83 9.05,6.75 9.43,7.63L11.5,13L12.09,11.58C12.22,11.25 12.57,11 13,11H21.78C21.91,10.5 22,10 22,9.5A5.5,5.5 0 0,0 16.5,4C14.64,4 13,4.93 12,6.34C11,4.93 9.36,4 7.5,4V4M3,12.5A1,1 0 0,0 2,13.5A1,1 0 0,0 3,14.5H5.44L11,20C12,20.9 12,20.9 13,20L18.56,14.5H21A1,1 0 0,0 22,13.5A1,1 0 0,0 21,12.5H13.4L12.47,14.8C12.07,15.81 10.92,15.67 10.55,14.83L8.5,9.5L7.54,11.83C7.39,12.21 7.05,12.5 6.6,12.5H3Z',
+  unlinked: 'M4,1C2.89,1 2,1.89 2,3V7C2,8.11 2.89,9 4,9H1V11H13V9H10C11.11,9 12,8.11 12,7V3C12,1.89 11.11,1 10,1H4M4,3H10V7H4V3M14,13C12.89,13 12,13.89 12,15V19C12,20.11 12.89,21 14,21H11V23H23V21H20C21.11,21 22,20.11 22,19V15C22,13.89 21.11,13 20,13H14M3.88,13.46L2.46,14.88L4.59,17L2.46,19.12L3.88,20.54L6,18.41L8.12,20.54L9.54,19.12L7.41,17L9.54,14.88L8.12,13.46L6,15.59L3.88,13.46M14,15H20V19H14V15Z',
+  updating: 'M13,2.03C17.73,2.5 21.5,6.25 21.95,11C22.5,16.5 18.5,21.38 13,21.93V19.93C16.64,19.5 19.5,16.61 19.96,12.97C20.5,8.58 17.39,4.59 13,4.05V2.05L13,2.03M11,2.06V4.06C9.57,4.26 8.22,4.84 7.1,5.74L5.67,4.26C7.19,3 9.05,2.25 11,2.06M4.26,5.67L5.69,7.1C4.8,8.23 4.24,9.58 4.05,11H2.05C2.25,9.04 3,7.19 4.26,5.67M2.06,13H4.06C4.24,14.42 4.81,15.77 5.69,16.9L4.27,18.33C3.03,16.81 2.26,14.96 2.06,13M7.1,18.37C8.23,19.25 9.58,19.82 11,20V22C9.04,21.79 7.18,21 5.67,19.74L7.1,18.37M12,16.5L7.5,12H11V8H13V12H16.5L12,16.5Z',
 };
 
-const svg = (path, size = 24) =>
-  `<svg viewBox="0 0 24 24" width="${size}" height="${size}" aria-hidden="true"><path d="${path}"/></svg>`;
+/* Home Assistant components this page is built from. Every one of them is OPTIONAL:
+ * the list is what we wait for, not what we demand. */
+const HA_ELEMENTS = [
+  'ha-card',
+  'ha-md-list',
+  'ha-md-list-item',
+  'ha-svg-icon',
+  'ha-icon-next',
+  'ha-icon-button',
+  'ha-alert',
+  'ha-button',
+  'hass-subpage',
+];
+
+/* The page chrome. Present when the operator arrives from Devices & Services, absent
+ * on a cold load straight onto the panel URL. */
+const CHROME = 'hass-subpage';
+
+/* Per element, in parallel. A missing element costs at most this much and then the
+ * page renders around it. */
+const READY_TIMEOUT_MS = 1500;
+
+/* Matches the backend's own ring buffer, so the view can never claim more history
+ * than z2m/logs is able to replay after a reload. */
+const LOG_MAX = 300;
+
+const LOG_LEVELS = ['error', 'warning', 'info', 'debug'];
+
+const esc = (s) =>
+  String(s ?? '').replace(
+    /[&<>"']/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]
+  );
+
+/** `.path` is assigned as a JS property during hydration; markup carries data-* only. */
+const icon = (path, slot = 'start') =>
+  `<ha-svg-icon${slot ? ` slot="${slot}"` : ''} data-path="${path}"></ha-svg-icon>`;
+
+/**
+ * One HA list row. `href` produces a real link row -- HA's own tables then do the
+ * work; `go` navigates inside the panel; `act` fires a command. A row that carries
+ * its own button must not itself be a button, so `end` suppresses that.
+ */
+const row = (o) => {
+  // `tap` marks a row whose own click is handled in JS (a device row, say). It still
+  // has to be type="button", or HA's row renders as inert text: no ripple, no focus
+  // ring, no keyboard activation.
+  const kind = o.href
+    ? ` type="link" href="${esc(o.href)}"`
+    : o.go
+      ? ` type="button" data-go="${esc(o.go)}"`
+      : o.act && o.end === undefined
+        ? ` type="button" data-act="${esc(o.act)}"`
+        : o.tap
+          ? ' type="button"'
+          : '';
+  const end =
+    o.end !== undefined
+      ? o.end
+      : o.href || o.go || o.act || o.tap
+        ? '<ha-icon-next slot="end"></ha-icon-next>'
+        : '';
+  return `
+      <ha-md-list-item${kind}${o.data || ''}>
+        ${o.icon ? icon(o.icon) : ''}
+        <div slot="headline">${o.headline}</div>
+        ${o.text ? `<div slot="supporting-text">${o.text}</div>` : ''}
+        ${end}
+      </ha-md-list-item>`;
+};
+
+/**
+ * HA's own list container when it is defined, otherwise a neutral role="list"
+ * wrapper. HA's ha-md-list is itself a thin md-list wrapper, so this substitution is
+ * semantics and layout only: the ROWS stay genuine ha-md-list-item, which is where
+ * the visual identity actually lives. On a cold panel load this is the one element
+ * that is reliably missing while its own list item is present.
+ */
+const list = (rows) =>
+  customElements.get('ha-md-list')
+    ? `<ha-md-list>${rows}</ha-md-list>`
+    : `<div role="list" class="mdlist">${rows}</div>`;
+
+const card = (body, cls = 'nav-card') =>
+  `<ha-card class="${cls}"><div class="card-content">${body}</div></ha-card>`;
+
+const rowButton = (label, act, appearance = 'plain') =>
+  `<ha-button appearance="${appearance}" size="s" slot="end" data-act="${esc(act)}">${esc(
+    label
+  )}</ha-button>`;
 
 class Z2MPanel extends HTMLElement {
   constructor() {
@@ -36,8 +159,30 @@ class Z2MPanel extends HTMLElement {
     this._groups = [];
     this._filter = '';
     this._busy = false;
-    this._unsub = null;
-    this._built = false;
+    this._subs = {};
+    this._logs = [];
+    this._logMin = 'all';
+    this._logPinned = true;
+    this._logTimer = null;
+    this._resetMap();
+    this._diag = { health: null, routers: null, error: null, checked: false };
+    this._ticker = null;
+    this._counts = '';
+  }
+
+  /**
+   * The map's own state. `el` outlives every re-render -- it owns the physics, the
+   * pinned layout and the selection -- and `scan` is the single object the element
+   * reads its age and progress from.
+   */
+  _resetMap() {
+    this._map = {
+      el: null,
+      topology: null,
+      error: null,
+      first: true,
+      scan: { generated: null, scanning: false, phase: null, done: 0, total: 0 },
+    };
   }
 
   /* ------------------------------------------------------------ HA plumbing */
@@ -45,48 +190,114 @@ class Z2MPanel extends HTMLElement {
   set hass(hass) {
     const first = !this._hass;
     this._hass = hass;
-    if (first) this._boot();
-    // HA re-sets `hass` on every state change; refresh only the firmware card so
-    // live update progress appears without re-rendering the whole view.
-    else this._syncFw();
+    if (first) {
+      this._boot();
+      return;
+    }
+    // HA re-sets `hass` on every state change, and the registry collections it
+    // carries are how the delegation rows are counted. Patch what reads from it
+    // rather than re-rendering: a full render would clobber typing, the log scroll
+    // position and the map's own physics.
+    if (this._map.el) this._map.el.hass = hass;
+    // The label is applied asynchronously after setup, so the counts legitimately
+    // change under us once. Re-render only when they actually move.
+    if (this._view.name === 'dashboard' && this._countKey() !== this._counts) {
+      this._render();
+      return;
+    }
+    this._syncFw();
   }
+
   set narrow(v) {
     this._narrow = v;
-    if (this._built) this._render();
+    if (this._hass) this._render();
   }
+
   set route(_v) {}
+
   set panel(v) {
     this._panel = v;
   }
 
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
-    this._built = false;
   }
+
   disconnectedCallback() {
-    if (this._unsub) {
-      this._unsub.then((u) => u && u()).catch(() => {});
-      this._unsub = null;
+    Object.keys(this._subs).forEach((k) => this._unsub(k));
+    this._stopTicker();
+    if (this._logTimer) {
+      clearTimeout(this._logTimer);
+      this._logTimer = null;
     }
   }
 
   async _boot() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
+    await this._warmUp();
     await this._refresh();
     // Push updates: the backend fires on every retained bridge topic change.
-    this._unsub = this._hass.connection.subscribeMessage(
-      (ev) => {
-        if (ev && ev.summary) {
-          this._summary = ev.summary;
-          this._render();
-        }
-      },
-      { type: 'z2m/subscribe' }
+    this._sub('summary', { type: 'z2m/subscribe' }, (ev) => {
+      if (!ev || !ev.summary) return;
+      this._summary = ev.summary;
+      // The map and log views own their DOM; re-rendering would throw away the
+      // operator's graph layout or scroll position for a header line they cannot see.
+      if (this._view.name === 'map' || this._view.name === 'logs') return;
+      this._render();
+    });
+  }
+
+  /**
+   * Give HA's components a chance to be defined before the first paint, then render
+   * regardless. The wait is per element and in parallel, so one missing element costs
+   * its own timeout and nothing else, and it can never stop the page from rendering.
+   *
+   * `loadCardHelpers` is the documented warm-up hook, but it is installed by the
+   * Lovelace bundle -- measured absent on a cold load of this URL -- so it is called
+   * opportunistically and its absence is not a failure and gates nothing.
+   */
+  async _warmUp() {
+    try {
+      const warm = typeof window !== 'undefined' && window.loadCardHelpers && window.loadCardHelpers();
+      if (warm && typeof warm.then === 'function') await warm;
+    } catch (_) {
+      /* opportunistic only */
+    }
+    await Promise.all(
+      HA_ELEMENTS.map((name) =>
+        Promise.race([
+          customElements.whenDefined(name),
+          new Promise((r) => setTimeout(r, READY_TIMEOUT_MS)),
+        ])
+      )
     );
+    // Anything that arrives later still upgrades the page in place: _render is
+    // memoised on its own markup, so this costs one comparison per late arrival.
+    HA_ELEMENTS.forEach((name) => {
+      if (!this._has(name)) customElements.whenDefined(name).then(() => this._render());
+    });
+  }
+
+  _has(name) {
+    return !!customElements.get(name);
   }
 
   async _call(type, extra = {}) {
     return this._hass.connection.sendMessagePromise({ type, ...extra });
+  }
+
+  _sub(key, msg, cb) {
+    this._unsub(key);
+    this._subs[key] = this._hass.connection.subscribeMessage(cb, msg);
+  }
+
+  _unsub(key) {
+    const p = this._subs[key];
+    if (!p) return;
+    delete this._subs[key];
+    Promise.resolve(p)
+      .then((u) => u && u())
+      .catch(() => {});
   }
 
   async _refresh() {
@@ -106,87 +317,152 @@ class Z2MPanel extends HTMLElement {
     this._render();
   }
 
+  /* ---------------------------------------------------------------- helpers */
+
+  _dev(ieee) {
+    return this._devices.find((d) => d.ieee_address === ieee);
+  }
+
+  /** Z2M reports when joining ends, not how long is left. */
+  _joinLeft() {
+    const end = Number((this._summary || {}).permit_join_end);
+    if (!end) return null;
+    return Math.max(0, Math.round((end - Date.now()) / 1000));
+  }
+
+  /**
+   * Counts for the two delegation rows. Both of HA's tables filter on the row's OWN
+   * registry labels -- no device-to-entity inheritance anywhere in the filter path --
+   * so count exactly the same way the linked page does. A row that disagrees with the
+   * page it opens is worse than a missing row, because it looks authoritative.
+   */
+  _labelled() {
+    const label = (this._summary || {}).label_id;
+    if (!label) return null;
+    const h = this._hass || {};
+    const count = (m) => Object.values(m || {}).filter((x) => (x.labels || []).includes(label)).length;
+    return { label, devices: count(h.devices), entities: count(h.entities) };
+  }
+
+  _countKey() {
+    const l = this._labelled();
+    return l ? `${l.label}:${l.devices}:${l.entities}` : '';
+  }
+
   /* ----------------------------------------------------------------- styles */
 
   _styles() {
+    // Shadow DOM does not inherit HA's shared `haStyle`, so the two classes HA's
+    // cards rely on (.card-header/.card-content) are restated here using HA's own
+    // spacing tokens. Everything else is HA custom properties, so theming, dark mode,
+    // density and touch target sizing are inherited rather than reimplemented.
     return `
-      :host { display:block; background:var(--primary-background-color); min-height:100%;
+      /* overflow:auto matters only on the fallback-chrome path: with hass-subpage
+         nothing here overflows, because it owns its own scroll container. */
+      :host { display:block; height:100%; overflow:auto;
+              background:var(--primary-background-color);
               color:var(--primary-text-color);
-              font-family:var(--paper-font-body1_-_font-family, Roboto, sans-serif); }
-      .bar { position:sticky; top:0; z-index:2; display:flex; align-items:center; gap:8px;
-             height:56px; padding:0 8px; background:var(--app-header-background-color, var(--primary-color));
-             color:var(--app-header-text-color, #fff); }
-      .bar h1 { font-size:20px; font-weight:400; margin:0; flex:1; }
-      .iconbtn { display:inline-flex; align-items:center; justify-content:center;
-                 width:40px; height:40px; border:0; border-radius:50%; cursor:pointer;
-                 background:transparent; color:inherit; }
-      .iconbtn:hover { background:rgba(255,255,255,.12); }
-      .iconbtn svg { fill:currentColor; }
-      .wrap { max-width:800px; margin:0 auto; padding:16px 16px 48px; box-sizing:border-box; }
-      ha-card, .card { display:block; background:var(--card-background-color,#fff);
-              border-radius:var(--ha-card-border-radius,12px);
-              box-shadow:var(--ha-card-box-shadow, 0 2px 4px rgba(0,0,0,.1));
-              border:var(--ha-card-border-width,1px) solid var(--ha-card-border-color,transparent);
-              margin-bottom:16px; overflow:hidden; }
-      .row { display:flex; align-items:center; gap:16px; padding:14px 16px;
-             min-height:48px; text-decoration:none; color:inherit; }
-      .row + .row { border-top:1px solid var(--divider-color); }
-      .row.tap { cursor:pointer; }
-      .row.tap:hover { background:var(--secondary-background-color); }
-      .row svg { fill:var(--state-icon-color, var(--secondary-text-color)); flex:0 0 auto; }
-      .grow { flex:1; min-width:0; }
-      .title { font-size:16px; }
-      .sub { font-size:13px; color:var(--secondary-text-color); margin-top:2px; }
-      .trail { color:var(--secondary-text-color); font-size:14px; white-space:nowrap; }
-      .hdr { display:flex; align-items:center; gap:16px; padding:16px; }
-      .hdr .big { font-size:20px; }
-      .ok { color:var(--success-color,#0f9d58); }
-      .bad { color:var(--error-color,#db4437); }
-      .warn { color:var(--warning-color,#ffa600); }
-      .sectionhdr { display:flex; align-items:center; justify-content:space-between;
-                    padding:16px 16px 8px; }
-      .sectionhdr h2 { margin:0; font-size:20px; font-weight:400; }
-      button.pill { display:inline-flex; align-items:center; gap:8px; height:36px;
-              padding:0 16px; border:0; border-radius:18px; cursor:pointer;
-              background:var(--primary-color); color:var(--text-primary-color,#fff);
-              font-size:14px; font-family:inherit; }
-      button.pill.ghost { background:var(--secondary-background-color);
-              color:var(--primary-color); }
-      button.pill svg { fill:currentColor; }
-      button.pill:disabled { opacity:.5; cursor:default; }
-      .search { display:flex; align-items:center; gap:8px; padding:8px 16px;
-                border-bottom:1px solid var(--divider-color); }
-      .search input { flex:1; border:0; outline:none; background:transparent;
-                font-size:16px; color:var(--primary-text-color); font-family:inherit;
-                min-width:0; padding:8px 0; }
-      .search svg { fill:var(--secondary-text-color); }
-      .chip { display:inline-block; font-size:11px; line-height:18px; padding:0 8px;
-              border-radius:9px; background:var(--secondary-background-color);
-              color:var(--secondary-text-color); }
-      .chip.off { background:var(--error-color,#db4437); color:#fff; }
-      .chip.warn { background:var(--warning-color,#ffa600); color:#000; }
-      .empty { padding:32px 16px; text-align:center; color:var(--secondary-text-color); }
-      .field { display:flex; align-items:center; gap:12px; padding:12px 16px; }
-      .field + .field { border-top:1px solid var(--divider-color); }
-      .field label { flex:1; font-size:15px; }
-      .field .hint { font-size:12px; color:var(--secondary-text-color); }
-      .field input[type=text], .field input[type=number], .field select {
-              font-size:15px; padding:8px; border-radius:6px; font-family:inherit;
-              border:1px solid var(--divider-color);
-              background:var(--card-background-color); color:var(--primary-text-color);
-              max-width:50%; }
-      .banner { padding:12px 16px; border-radius:8px; margin-bottom:16px;
-                background:var(--error-color,#db4437); color:#fff; font-size:14px; }
-      .kv { display:flex; padding:10px 16px; font-size:14px; gap:16px; }
+              font-family:var(--ha-font-family-body, var(--paper-font-body1_-_font-family, Roboto, sans-serif)); }
+      .container { padding:var(--ha-space-2,8px) var(--ha-space-4,16px)
+                   calc(var(--ha-space-20,80px) + var(--safe-area-inset-bottom,0px)); }
+      ha-card { display:block; margin:auto; margin-top:var(--ha-space-4,16px); max-width:600px; }
+      .card-header { font-size:var(--ha-font-size-2xl,24px); font-weight:var(--ha-font-weight-normal,400);
+                     line-height:var(--ha-line-height-condensed,1.2); padding:12px 16px 16px;
+                     color:var(--ha-card-header-color,var(--primary-text-color)); }
+      .card-content { padding:16px; }
+      .nav-card { overflow:hidden; }
+      .nav-card .card-header { padding-bottom:var(--ha-space-2,8px); justify-content:space-between;
+                               align-items:center; display:flex; gap:8px; }
+      .nav-card .card-content { padding:0; }
+      ha-md-list, .mdlist { background:none; padding:0; display:block; }
+      ha-md-list-item { --md-item-overflow:visible; }
+      .network-status .heading { align-items:center; column-gap:var(--ha-space-4,16px); display:flex; }
+      .network-status .heading .icon { border-radius:var(--ha-border-radius-2xl,28px);
+              --icon-color:var(--primary-color); flex-shrink:0; justify-content:center;
+              align-items:center; width:40px; height:40px; display:flex; position:relative;
+              overflow:hidden; }
+      .network-status .heading .icon.success { --icon-color:var(--success-color,#0f9d58); }
+      .network-status .heading .icon.error { --icon-color:var(--error-color,#db4437); }
+      .network-status .heading .icon:before { content:""; background-color:var(--icon-color);
+              opacity:.2; display:block; position:absolute; inset:0; }
+      .network-status .heading .icon ha-svg-icon { color:var(--icon-color); width:24px; height:24px; }
+      .network-status .details { font-size:var(--ha-font-size-xl,20px); flex:1;
+              line-height:var(--ha-line-height-condensed,1.2); color:var(--primary-text-color); }
+      .network-status small { font-size:var(--ha-font-size-m,14px); letter-spacing:.25px;
+              line-height:var(--ha-line-height-condensed,1.2); color:var(--secondary-text-color); }
+      .network-status small.offline { color:var(--error-color,#db4437); }
+      .network-status .version { font-size:var(--ha-font-size-m,14px); align-self:flex-start;
+              color:var(--secondary-text-color); white-space:nowrap; }
+      ha-alert { display:block; }
+      .kv { display:flex; gap:16px; padding:10px 16px; font-size:var(--ha-font-size-m,14px); }
       .kv + .kv { border-top:1px solid var(--divider-color); }
       .kv .k { color:var(--secondary-text-color); flex:0 0 45%; }
-      .kv .v { flex:1; word-break:break-word; font-family:var(--code-font-family,monospace); }
+      .kv .v { flex:1; word-break:break-word; font-family:var(--ha-font-family-code,monospace); }
+      .empty { padding:32px 16px; text-align:center; color:var(--secondary-text-color); }
+      .note { padding:12px 16px; font-size:var(--ha-font-size-m,14px); color:var(--secondary-text-color); }
+      .actions { display:flex; justify-content:flex-end; gap:8px; padding:8px 16px 16px; }
+      .search { display:flex; align-items:center; gap:12px; padding:8px 16px;
+                border-bottom:1px solid var(--divider-color); }
+      .search input { flex:1; min-width:0; border:0; outline:none; background:transparent;
+                font-size:var(--ha-font-size-l,16px); color:var(--primary-text-color);
+                font-family:inherit; padding:8px 0; }
+      .search .grow { flex:1; font-size:var(--ha-font-size-m,14px); }
+      .search ha-svg-icon { color:var(--secondary-text-color); }
+      .chip { display:inline-block; font-size:var(--ha-font-size-xs,11px); line-height:18px;
+              padding:0 8px; border-radius:9px; background:var(--secondary-background-color);
+              color:var(--secondary-text-color); white-space:nowrap; }
+      .chip.off { background:var(--error-color,#db4437); color:#fff; }
+      .chip.warn { background:var(--warning-color,#ffa600); color:#000; }
+      .chip.ok { background:var(--success-color,#0f9d58); color:#fff; }
+      .chip[hidden] { display:none; }
+      input[type=text], input[type=number], select {
+              font-size:var(--ha-font-size-m,14px); padding:8px; border-radius:8px;
+              font-family:inherit; border:1px solid var(--divider-color);
+              background:var(--card-background-color); color:var(--primary-text-color);
+              max-width:220px; }
+      input[type=checkbox] { width:20px; height:20px; accent-color:var(--primary-color); }
+      /* The map owns everything below the page header: it renders its own age,
+         progress, Re-scan control, legend and node detail as overlays inside its
+         canvas, so there is no row above or below it to subtract. Both chromes put
+         exactly one --header-height band above this element -- hass-subpage's own
+         toolbar on the normal path, the sticky .toolbar below on the fallback path --
+         so one rule serves both, and the wrapper contributes no padding. */
+      .container.mapview { padding:0; }
+      .stage { height:calc(100vh - var(--header-height,56px)); min-height:360px; }
+      .logwrap { height:calc(100vh - 320px); min-height:280px; overflow:auto;
+                 border-top:1px solid var(--divider-color); }
+      .log { display:flex; gap:8px; padding:2px 16px; font-size:var(--ha-font-size-s,12px);
+             font-family:var(--ha-font-family-code,monospace); white-space:pre-wrap;
+             word-break:break-word; }
+      .log .t { color:var(--secondary-text-color); flex:0 0 auto; }
+      .log .l { flex:0 0 60px; text-transform:uppercase; }
+      .log.error .l { color:var(--error-color,#db4437); }
+      .log.warning .l { color:var(--warning-color,#ffa600); }
+      .log.info .l { color:var(--info-color,var(--primary-color)); }
+      .log.debug .l { color:var(--secondary-text-color); }
+      .log .m { flex:1; }
+      /* Fallback chrome, used only when hass-subpage's chunk has not been fetched.
+         Same header tokens HA's own toolbar uses, so it sits in the theme. */
+      .toolbar { display:flex; align-items:center; gap:8px; height:var(--header-height,56px);
+                 position:sticky; top:0; z-index:2;
+                 padding:8px 12px; box-sizing:border-box;
+                 background-color:var(--app-header-background-color,var(--primary-color));
+                 color:var(--app-header-text-color,#fff);
+                 border-bottom:var(--app-header-border-bottom,none); }
+      .toolbar ha-icon-button { color:var(--app-header-text-color,#fff); }
+      .maintitle { flex:1; min-width:0; font-size:var(--ha-font-size-xl,20px);
+                   font-weight:var(--ha-font-weight-normal,400);
+                   line-height:var(--ha-line-height-normal,1.4); overflow-wrap:break-word;
+                   margin-inline-start:var(--ha-space-2,8px); }
+      .fabwrap { position:fixed; z-index:1;
+                 right:calc(16px + var(--safe-area-inset-right,0px));
+                 bottom:calc(16px + var(--safe-area-inset-bottom,0px)); }
       @media (max-width:600px) {
-        .wrap { padding:8px 8px 40px; }
-        .field { flex-wrap:wrap; }
-        .field input[type=text], .field input[type=number], .field select { max-width:100%; width:100%; }
+        .container { padding:var(--ha-space-1,4px) var(--ha-space-2,8px) 40px; }
         .kv { flex-direction:column; gap:2px; }
         .kv .k { flex:none; }
+        input[type=text], input[type=number], select { max-width:140px; }
+        .logwrap { height:calc(100vh - 280px); }
       }
     `;
   }
@@ -195,61 +471,617 @@ class Z2MPanel extends HTMLElement {
 
   _render() {
     if (!this.shadowRoot) return;
-    const s = this._summary || {};
-    let body;
-    if (this._view.name === 'devices') body = this._devicesView();
-    else if (this._view.name === 'device') body = this._deviceView(this._view.ieee);
-    else if (this._view.name === 'network') body = this._networkView();
-    else if (this._view.name === 'groups') body = this._groupsView();
-    else if (this._view.name === 'ota') body = this._otaView();
-    else body = this._dashboard();
 
-    const title =
-      this._view.name === 'dashboard'
-        ? 'Zigbee'
-        : this._view.name === 'device'
-          ? (this._dev(this._view.ieee) || {}).friendly_name || 'Device'
-          : this._view.name.charAt(0).toUpperCase() + this._view.name.slice(1);
 
-    this.shadowRoot.innerHTML = `
-      <style>${this._styles()}</style>
-      <div class="bar">
-        <button class="iconbtn" id="back" title="Back">${svg(ICONS.back)}</button>
-        <h1>${esc(title)}</h1>
-        <button class="iconbtn" id="reload" title="Refresh">${svg(ICONS.refresh)}</button>
-      </div>
-      <div class="wrap">
-        ${this._error ? `<div class="banner">${esc(this._error)}</div>` : ''}
-        ${s.restart_required ? `<div class="banner">Zigbee2MQTT needs a restart for pending changes to apply.</div>` : ''}
-        ${body}
+    this._counts = this._countKey();
+    const body = `<div class="container${this._view.name === 'map' ? ' mapview' : ''}">
+        ${this._error ? `<ha-alert alert-type="error">${esc(this._error)}</ha-alert>` : ''}
+        ${this._bodyFor()}
       </div>`;
 
-    this.shadowRoot.getElementById('reload').onclick = () => this._refresh();
-    this.shadowRoot.getElementById('back').onclick = () => {
-      if (this._view.name === 'device') this._go({ name: 'devices' });
-      else if (this._view.name === 'dashboard') history.back();
-      else this._go({ name: 'dashboard' });
+    const top = this._view.name === 'dashboard';
+    const markup = `<style>${this._styles()}</style>${
+      this._has(CHROME) ? this._subpageChrome(body, top) : this._plainChrome(body, top)
+    }`;
+
+    // Pushes arrive on every retained bridge topic change, and per-device
+    // availability across a 45-device mesh means most of them change nothing on
+    // screen. Rebuilding anyway would recreate HA's components, drop the scroll
+    // position and steal the caret, so a render that would produce identical markup
+    // is simply not performed.
+    if (markup === this._markup) return;
+    this._markup = markup;
+
+    // The operator may be mid-word in the device search when a push lands.
+    const focused = this.shadowRoot.activeElement;
+    const focusId = focused && focused.id;
+    let caret = null;
+    try {
+      caret = focused ? focused.selectionStart : null;
+    } catch (_) {
+      caret = null; // inputs that do not support selection throw on read
+    }
+
+    this.shadowRoot.innerHTML = markup;
+    this._hydrate();
+
+    if (focusId) {
+      const again = this.shadowRoot.getElementById(focusId);
+      if (again && again.focus) {
+        again.focus();
+        try {
+          if (caret !== null && again.setSelectionRange) again.setSelectionRange(caret, caret);
+        } catch (_) {
+          /* selection is a nicety; focus is the part that matters */
+        }
+      }
+    }
+
+    this._enter();
+  }
+
+  /** HA's own page chrome: header, back arrow, toolbar action and FAB slot. */
+  _subpageChrome(body, top) {
+    return `<hass-subpage id="page" header="${esc(this._title())}"${top ? ' main-page' : ''}${
+      this._narrow ? ' narrow' : ''
+    }>
+        <ha-icon-button id="reload" slot="toolbar-icon" data-act="refresh"
+          data-path="${MDI.refresh}" data-label="Refresh"></ha-icon-button>
+        ${body}
+        ${top ? this._fab(true) : ''}
+      </hass-subpage>`;
+  }
+
+  /**
+   * Chrome for a cold load straight onto the panel URL, where hass-subpage's chunk
+   * has not been fetched. Plainer chrome is an honest degradation: the content is
+   * unchanged, the back and refresh affordances are still HA's own ha-icon-button,
+   * and it uses HA's header tokens so it sits in the theme.
+   */
+  _plainChrome(body, top) {
+    return `<div class="toolbar">
+        ${
+          top
+            ? ''
+            : `<ha-icon-button id="back" data-act="back" data-path="${MDI.back}"
+                 data-label="Back"></ha-icon-button>`
+        }
+        <div class="maintitle">${esc(this._title())}</div>
+        <ha-icon-button id="reload" data-act="refresh" data-path="${MDI.refresh}"
+          data-label="Refresh"></ha-icon-button>
+      </div>
+      ${body}
+      ${top ? `<div class="fabwrap">${this._fab(false)}</div>` : ''}`;
+  }
+
+  _fab(slotted) {
+    const open = (this._summary || {}).permit_join;
+    const left = this._joinLeft();
+    return `<ha-button${slotted ? ' slot="fab"' : ' appearance="filled"'} size="l" data-act="permit">
+        ${icon(open ? MDI.check : MDI.plus)}
+        <span id="fabtext">${
+          open ? `Close network${left ? ` (${left}s)` : ''}` : 'Add device'
+        }</span>
+      </ha-button>`;
+  }
+
+  _title() {
+    switch (this._view.name) {
+      case 'devices':
+        return 'Devices';
+      case 'device':
+        return (this._dev(this._view.ieee) || {}).friendly_name || 'Device';
+      case 'groups':
+        return 'Groups';
+      case 'network':
+        return 'Network information';
+      case 'ota':
+        return 'Firmware';
+      case 'map':
+        return 'Network map';
+      case 'logs':
+        return 'Logs';
+      case 'diagnostics':
+        return 'Diagnostics';
+      case 'options':
+        return 'Options';
+      default:
+        return 'Zigbee';
+    }
+  }
+
+  _bodyFor() {
+    switch (this._view.name) {
+      case 'devices':
+        return this._devicesView();
+      case 'device':
+        return this._deviceView(this._view.ieee);
+      case 'groups':
+        return this._groupsView();
+      case 'network':
+        return this._networkView();
+      case 'ota':
+        return this._otaView();
+      case 'map':
+        return this._mapView();
+      case 'logs':
+        return this._logsView();
+      case 'diagnostics':
+        return this._diagView();
+      case 'options':
+        return this._optionsView();
+      default:
+        return this._dashboard();
+    }
+  }
+
+  /** Assign the JS properties and listeners markup cannot carry. */
+  _hydrate() {
+    const r = this.shadowRoot;
+
+    r.querySelectorAll('[data-path]').forEach((el) => {
+      el.path = el.dataset.path;
+      if (el.dataset.label) el.label = el.dataset.label;
+    });
+
+    const page = r.getElementById('page');
+    if (page) {
+      page.hass = this._hass;
+      // Sub-views step back through the panel's own view state. The top level has no
+      // in-panel parent, so it shows HA's menu button instead of a back arrow.
+      page.backCallback = this._view.name === 'dashboard' ? undefined : () => this._back();
+    }
+
+    r.querySelectorAll('[data-go]').forEach((el) => {
+      el.onclick = () => this._go({ name: el.dataset.go });
+    });
+    r.querySelectorAll('[data-ieee]').forEach((el) => {
+      el.onclick = () => this._go({ name: 'device', ieee: el.dataset.ieee });
+    });
+    r.querySelectorAll('[data-act]').forEach((el) => {
+      el.onclick = () => this._dispatch(el.dataset.act);
+    });
+    r.querySelectorAll('[data-change]').forEach((el) => {
+      el.onchange = () => this._change(el.dataset.change, el);
+    });
+
+    const q = r.getElementById('q');
+    // _render restores focus and caret for whatever was focused, so typing here just
+    // needs to update the filter.
+    if (q) q.oninput = () => {
+      this._filter = q.value;
+      this._render();
     };
-    this._wire();
+
+    const scroll = r.getElementById('logscroll');
+    if (scroll) {
+      scroll.onscroll = () => {
+        this._logPinned = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 48;
+        const chip = this.shadowRoot.getElementById('logpaused');
+        if (chip) chip.hidden = this._logPinned;
+      };
+    }
+
+    const stage = r.getElementById('mapstage');
+    if (stage && !stage._z2mWired) {
+      stage._z2mWired = true;
+      // The Re-scan control lives inside the map's own canvas, and so does the node
+      // detail panel it opens on a selection -- there is nothing for the shell to
+      // draw, so it listens for the one event it acts on.
+      stage.addEventListener('z2m-rescan', () => this._startScan());
+    }
+
+    if (this._view.name === 'device') this._lastFw = this._fwInner(this._dev(this._view.ieee) || {});
+    this._startTicker();
+  }
+
+  _back() {
+    if (this._view.name === 'device') this._go({ name: 'devices' });
+    else this._go({ name: 'dashboard' });
   }
 
   _go(view) {
+    this._leave();
     this._view = view;
     this._filter = '';
     this._render();
     this.shadowRoot.scrollTop = 0;
   }
 
-  _dev(ieee) {
-    return this._devices.find((d) => d.ieee_address === ieee);
+  /** Tear down whatever the view being left had running. */
+  _leave() {
+    if (this._view.name === 'logs') this._unsub('logs');
+    if (this._view.name === 'map') {
+      this._unsub('map');
+      this._unsub('scan');
+      this._map.scan.scanning = false;
+      this._map.scan.phase = null;
+    }
+    this._stopTicker();
   }
 
-  /** Z2M reports when joining ends, not how long is left. */
-  _joinLeft(s) {
-    const end = Number(s.permit_join_end);
-    if (!end) return 'Open';
-    const left = Math.max(0, Math.round((end - Date.now()) / 1000));
-    return left ? `${left}s` : 'Open';
+  /** Start whatever the freshly rendered view needs. */
+  _enter() {
+    if (this._view.name === 'logs' && !this._subs.logs) this._openLogs();
+    // Re-hosting on every render matters: the element instance is retained, so a
+    // render caused by (say) a scan error has to put it back where it was.
+    if (this._view.name === 'map') {
+      if (this._subs.map) this._mountMap();
+      else this._openMap();
+    }
+    if (this._view.name === 'diagnostics' && !this._diag.checked) this._runCoordinatorCheck();
+  }
+
+  /* ---------------------------------------------------------------- ticker */
+
+  /** One second tick, only while something on screen actually counts. */
+  _needsTicker() {
+    if (this._view.name === 'map') return true;
+    return this._view.name === 'dashboard' && !!(this._summary || {}).permit_join;
+  }
+
+  _startTicker() {
+    this._stopTicker();
+    if (!this._needsTicker()) return;
+    this._ticker = setInterval(() => this._tick(), 1000);
+  }
+
+  _stopTicker() {
+    if (this._ticker) {
+      clearInterval(this._ticker);
+      this._ticker = null;
+    }
+  }
+
+  _tick() {
+    const r = this.shadowRoot;
+    if (!r) return;
+    const join = r.getElementById('joinstate');
+    if (join) join.textContent = this._joinText();
+    const fab = r.getElementById('fabtext');
+    if (fab) {
+      const left = this._joinLeft();
+      fab.textContent = left ? `Close network (${left}s)` : 'Close network';
+    }
+    if (this._view.name === 'map') this._syncScan();
+  }
+
+  /* -------------------------------------------------------------- dashboard */
+
+  _joinText() {
+    const s = this._summary || {};
+    if (!s.permit_join) return 'Joining closed';
+    const left = this._joinLeft();
+    return left ? `Joining open \u2014 ${left}s left` : 'Joining open';
+  }
+
+  _dashboard() {
+    return this._statusCard() + this._networkCard() + this._toolsCard() + this._backupCard();
+  }
+
+  _statusCard() {
+    const s = this._summary || {};
+    const online = s.state === 'online';
+    const offline = s.offline_count || 0;
+    const c = s.coordinator || {};
+    const rev = (c.meta && (c.meta.revision || c.meta.version)) || null;
+    return `
+      <ha-card class="content network-status">
+        ${
+          s.restart_required
+            ? `<ha-alert alert-type="warning" title="Restart required">
+                 Zigbee2MQTT is holding pending changes until it restarts.
+                 <ha-button slot="action" appearance="plain" size="s" data-act="restart">Restart</ha-button>
+               </ha-alert>`
+            : ''
+        }
+        <div class="card-content">
+          <div class="heading">
+            <div class="icon ${online ? 'success' : 'error'}">
+              ${icon(online ? MDI.check : MDI.alert, '')}
+            </div>
+            <div class="details">
+              ${online ? 'Online' : 'Offline'}<br>
+              <small>${s.device_count || 0} device${(s.device_count || 0) === 1 ? '' : 's'}</small>
+              ${offline ? `<small class="offline">(${offline} offline)</small>` : ''}
+              <br><small id="joinstate">${esc(this._joinText())}</small>
+              ${rev ? `<br><small>Coordinator ${esc(c.type || '')} ${esc(String(rev))}</small>` : ''}
+            </div>
+            <span class="version">Zigbee2MQTT ${esc(String(s.version || '?'))}</span>
+          </div>
+        </div>
+      </ha-card>`;
+  }
+
+  _networkCard() {
+    const s = this._summary || {};
+    const l = this._labelled();
+    const rows = [
+      l
+        ? row({
+            icon: MDI.devices,
+            headline: `${l.devices} device${l.devices === 1 ? '' : 's'}`,
+            // Deliberately not repeating the offline count from the status card
+            // above. This number is one higher than the card's on purpose: the
+            // table includes the coordinator, the mesh count does not. Saying so
+            // here is cheaper than leaving the operator to spot the discrepancy.
+            text: 'In Home Assistant\u2019s device table, incl. coordinator',
+            href: `/config/devices/dashboard?historyBack=1&label=${encodeURIComponent(l.label)}`,
+          })
+        : row({
+            // No label yet is a real state on a fresh install, so route to the
+            // panel's own list rather than emitting label=null.
+            icon: MDI.devices,
+            headline: `${s.device_count || 0} device${(s.device_count || 0) === 1 ? '' : 's'}`,
+            text: s.offline_count ? `${s.offline_count} offline` : '',
+            go: 'devices',
+          }),
+      l
+        ? row({
+            icon: MDI.entities,
+            headline: `${l.entities} entit${l.entities === 1 ? 'y' : 'ies'}`,
+            text: 'In Home Assistant\u2019s entity table',
+            href: `/config/entities/dashboard?historyBack=1&label=${encodeURIComponent(l.label)}`,
+          })
+        : '',
+      row({
+        icon: MDI.groups,
+        headline: `${s.group_count || 0} group${(s.group_count || 0) === 1 ? '' : 's'}`,
+        go: 'groups',
+      }),
+    ].join('');
+
+    return `
+      <ha-card class="nav-card">
+        <div class="card-header">My network
+          <ha-button appearance="filled" data-act="map">${icon(MDI.map)}Show map</ha-button>
+        </div>
+        <div class="card-content">${list(rows)}</div>
+      </ha-card>`;
+  }
+
+  _toolsCard() {
+    const s = this._summary || {};
+    const cap = this._devices.filter((d) => d.update_entity);
+    const avail = cap.filter((d) => (this._fw(d) || {}).available).length;
+    const unassessed = cap.filter((d) => !(this._fw(d) || {}).assessed).length;
+    const fwText = avail
+      ? `${avail} update${avail === 1 ? '' : 's'} available`
+      : unassessed
+        ? `${unassessed} of ${cap.length} not assessed yet`
+        : `${cap.length} devices, all up to date`;
+
+    return card(
+      list(
+        // The row above delegates to HA's device table. This one is a different
+        // capability: the Zigbee side of each device -- rename, reconfigure,
+        // re-interview, remove, per-device Z2M options -- which HA's own device page
+        // knows nothing about.
+        row({
+          icon: MDI.devices,
+          headline: 'Zigbee devices',
+          text: 'Rename, reconfigure, re-interview, remove, per-device settings',
+          go: 'devices',
+        }) +
+          row({
+            icon: MDI.options,
+            headline: 'Options',
+            text: `Log level, permit join and restart${
+              s.log_level ? ` \u00b7 now ${esc(s.log_level)}` : ''
+            }`,
+            go: 'options',
+          }) +
+          row({
+            icon: MDI.diagnostics,
+            headline: 'Diagnostics',
+            text: 'Health check and coordinator routing table',
+            go: 'diagnostics',
+          }) +
+          row({
+            icon: MDI.logs,
+            headline: 'Logs',
+            go: 'logs',
+          }) +
+          row({
+            icon: MDI.firmware,
+            headline: 'Firmware',
+            text: fwText,
+            go: 'ota',
+          }) +
+          row({
+            icon: MDI.info,
+            headline: 'Network information',
+            text: 'Coordinator, channel, PAN ID and adapter',
+            go: 'network',
+          })
+      )
+    );
+  }
+
+  _backupCard() {
+    return card(
+      list(
+        row({
+          icon: MDI.download,
+          headline: 'Download backup',
+          text: 'Asks Zigbee2MQTT for a fresh coordinator backup and saves the archive',
+          act: 'backup',
+          end: rowButton('Download', 'backup'),
+        })
+      )
+    );
+  }
+
+  /* ---------------------------------------------------------------- devices */
+
+  _devicesView() {
+    const f = this._filter.toLowerCase();
+    const matches = this._devices.filter(
+      (d) =>
+        !f ||
+        (d.friendly_name || '').toLowerCase().includes(f) ||
+        (d.model || '').toLowerCase().includes(f) ||
+        (d.vendor || '').toLowerCase().includes(f)
+    );
+
+    const rows = matches
+      .map((d) => {
+        const off = d.availability === 'offline';
+        const batt = d.power_source && d.power_source !== 'Mains (single phase)';
+        return row({
+          icon: batt ? MDI.battery : MDI.devices,
+          headline: esc(d.friendly_name || d.ieee_address),
+          text: esc([d.vendor, d.model].filter(Boolean).join(' \u00b7 ') || 'Unknown model'),
+          data: ` data-ieee="${esc(d.ieee_address)}"`,
+          tap: true,
+          end: `${
+            off ? '<span slot="end" class="chip off">offline</span>' : ''
+          }<ha-icon-next slot="end"></ha-icon-next>`,
+        });
+      })
+      .join('');
+
+    return `<ha-card class="nav-card">
+        <div class="search">${icon(MDI.search, '')}
+          <input id="q" type="text" placeholder="Search ${this._devices.length} devices"
+            value="${esc(this._filter)}">
+        </div>
+        <div class="card-content">${
+          rows
+            ? list(rows)
+            : `<div class="empty">No devices match &ldquo;${esc(this._filter)}&rdquo;.</div>`
+        }</div>
+      </ha-card>`;
+  }
+
+  /* ----------------------------------------------------------- device detail */
+
+  _deviceView(ieee) {
+    const d = this._dev(ieee);
+    if (!d) return `<div class="empty">Device not found.</div>`;
+
+    const opts = (d.options || []).filter((o) =>
+      ['numeric', 'binary', 'enum', 'text'].includes(o.type)
+    );
+
+    return `
+      <ha-card class="nav-card">${this._kvs([
+        ['Friendly name', d.friendly_name],
+        ['IEEE address', d.ieee_address],
+        ['Network address', d.network_address],
+        ['Vendor', d.vendor],
+        ['Model', d.model],
+        ['Description', d.description],
+        ['Type', d.type],
+        ['Power source', d.power_source],
+        ['Availability', d.availability || 'unknown'],
+        ['Firmware build', d.software_build_id],
+        ['Firmware date', d.date_code],
+        ['Supported by Z2M', d.supported === false ? 'NO - custom converter needed' : 'yes'],
+      ])}</ha-card>
+
+      <ha-card class="nav-card">
+        <div class="card-header">Rename</div>
+        <div class="card-content">${list(
+          row({
+            icon: MDI.rename,
+            headline: 'Friendly name',
+            text: 'Changes the MQTT topic, so Home Assistant entity IDs regenerate',
+            end: `<input slot="end" id="rn" type="text" value="${esc(d.friendly_name || '')}">`,
+          })
+        )}</div>
+        <div class="actions">
+          <ha-button appearance="filled" size="s" data-act="rename">Rename</ha-button>
+        </div>
+      </ha-card>
+
+      ${
+        opts.length
+          ? `<ha-card class="nav-card">
+               <div class="card-header">Device settings</div>
+               <div class="card-content">${list(
+                 opts.map((o) => this._optionField(o)).join('')
+               )}</div>
+               <div class="note">Written straight to Zigbee2MQTT.</div>
+               <div class="actions">
+                 <ha-button appearance="filled" size="s" data-act="options">Save settings</ha-button>
+               </div>
+             </ha-card>`
+          : ''
+      }
+
+      <ha-card class="nav-card"><div id="fwbox">${this._fwInner(d)}</div></ha-card>
+
+      <ha-card class="nav-card">
+        <div class="card-header">Maintenance</div>
+        <div class="card-content">${list(
+          row({
+            icon: MDI.wrench,
+            headline: 'Reconfigure',
+            text: 'Re-apply reporting configuration and bindings',
+            end: rowButton('Reconfigure', 'configure'),
+          }) +
+            row({
+              icon: MDI.radar,
+              headline: 'Re-interview',
+              text: 'Rebuild what Zigbee2MQTT knows about this device',
+              end: rowButton('Interview', 'interview'),
+            }) +
+            row({
+              icon: MDI.remove,
+              headline: 'Remove from network',
+              text:
+                'Force removal does not tell the device to leave, so it needs a factory reset before it can pair again',
+              end: rowButton('Remove', 'remove'),
+            })
+        )}</div>
+      </ha-card>`;
+  }
+
+  _kvs(pairs) {
+    return pairs
+      .filter(([k, v]) => k && v !== undefined && v !== null && v !== '')
+      .map(
+        ([k, v]) =>
+          `<div class="kv"><div class="k">${esc(k)}</div><div class="v">${esc(String(v))}</div></div>`
+      )
+      .join('');
+  }
+
+  /**
+   * Z2M ships an `options` schema per device, so the form is generated from it rather
+   * than hard-coded per model. The controls are plain form controls hosted in HA's own
+   * row component: HA ships no form-control set a non-Lit panel can drive without
+   * importing Lit, and a hand-rolled imitation of one would drift.
+   */
+  _optionField(o) {
+    const attrs = ` id="opt_${esc(o.property)}" slot="end" data-prop="${esc(o.property)}"`;
+    let control;
+    if (o.type === 'binary') {
+      control = `<input${attrs} data-kind="binary" type="checkbox">`;
+    } else if (o.type === 'enum') {
+      const values = (o.values || [])
+        .map((v) => `<option value="${esc(String(v))}">${esc(String(v))}</option>`)
+        .join('');
+      control = `<select${attrs} data-kind="enum"><option value=""></option>${values}</select>`;
+    } else if (o.type === 'numeric') {
+      control =
+        `<input${attrs} data-kind="numeric" type="number"` +
+        `${o.value_min !== undefined ? ` min="${esc(o.value_min)}"` : ''}` +
+        `${o.value_max !== undefined ? ` max="${esc(o.value_max)}"` : ''}` +
+        `${o.value_step !== undefined ? ` step="${esc(o.value_step)}"` : ''}>`;
+    } else {
+      control = `<input${attrs} data-kind="text" type="text">`;
+    }
+    const range =
+      o.type === 'numeric' && o.value_min !== undefined && o.value_max !== undefined
+        ? ` (${esc(o.value_min)}\u2013${esc(o.value_max)})`
+        : '';
+    return row({
+      headline: `${esc(o.label || o.name || o.property)}${range}`,
+      text: o.description ? esc(o.description) : '',
+      end: control,
+    });
   }
 
   /* --------------------------------------------------------------- firmware */
@@ -265,17 +1097,15 @@ class Z2MPanel extends HTMLElement {
     const s = this._hass.states[eid];
     if (!s) return null;
     const a = s.attributes || {};
-    const iv = a.installed_version;
-    const lv = a.latest_version;
     // Z2M publishes -1 for "never assessed" -- it has not asked the OTA index yet.
     const unset = (v) => v === null || v === undefined || String(v) === '-1';
     return {
       entity: eid,
       available: s.state === 'on',
       unavailable: s.state === 'unavailable',
-      installed: iv,
-      latest: lv,
-      assessed: !(unset(iv) || unset(lv)),
+      installed: a.installed_version,
+      latest: a.latest_version,
+      assessed: !(unset(a.installed_version) || unset(a.latest_version)),
       inProgress: !!a.in_progress,
       pct: a.update_percentage,
     };
@@ -286,445 +1116,807 @@ class Z2MPanel extends HTMLElement {
     const f = this._fw(d);
 
     if (!f) {
-      return `<div class="sectionhdr"><h2>Firmware</h2></div>
-        <div class="row"><div class="grow sub">This device reports no OTA support,
-        so Zigbee2MQTT exposes no update entity for it.</div></div>`;
+      return `<div class="card-header">Firmware</div>
+        <div class="note">This device reports no OTA support, so Zigbee2MQTT exposes no
+        update entity for it.</div>`;
     }
 
-    let status, cls = '';
+    let status = 'Up to date';
+    let chip = 'ok';
     if (f.inProgress) {
-      status = `Updating${f.pct != null ? ` — ${f.pct}%` : ''}`;
+      status = `Updating${f.pct != null ? ` \u2014 ${f.pct}%` : ''}`;
+      chip = 'warn';
     } else if (f.unavailable) {
       status = 'Device unreachable';
-      cls = 'bad';
+      chip = 'off';
     } else if (!f.assessed) {
       status = 'Not assessed';
+      chip = '';
     } else if (f.available) {
       status = 'Update available';
-      cls = 'warn';
-    } else {
-      status = 'Up to date';
-      cls = 'ok';
+      chip = 'warn';
     }
 
-    const ver = (v) => (v === null || v === undefined || String(v) === '-1' ? '—' : esc(String(v)));
+    const ver = (v) =>
+      v === null || v === undefined || String(v) === '-1' ? '\u2014' : esc(String(v));
+
+    const buttons = f.inProgress
+      ? '<ha-button appearance="plain" size="s" data-act="fwabort">Abort</ha-button>'
+      : '<ha-button appearance="plain" size="s" data-act="fwcheck">Check</ha-button>' +
+        (f.available && !battery
+          ? '<ha-button appearance="filled" size="s" data-act="fwinstall">Install</ha-button>'
+          : '') +
+        (f.available && battery
+          ? '<ha-button appearance="plain" size="s" data-act="fwunsched">Cancel schedule</ha-button>' +
+            '<ha-button appearance="filled" size="s" data-act="fwsched">Schedule</ha-button>'
+          : '');
 
     return `
-      <div class="sectionhdr"><h2>Firmware</h2>
-        <span class="chip ${cls === 'bad' ? 'off' : ''}">${esc(status)}</span></div>
-      <div class="kv"><div class="k">Installed</div><div class="v">${ver(f.installed)}</div></div>
-      <div class="kv"><div class="k">Latest known</div><div class="v">${ver(f.latest)}</div></div>
-      ${f.inProgress && f.pct != null ? `
-        <div class="kv"><div class="k">Progress</div><div class="v">${f.pct}%</div></div>` : ''}
-      ${!f.assessed ? `
-        <div class="row"><div class="grow sub">Zigbee2MQTT has never asked the OTA index
-        about this device. Check to populate it.</div></div>` : ''}
-      <div class="row">
-        <div class="grow sub">${battery
+      <div class="card-header">Firmware <span class="chip ${chip}">${esc(status)}</span></div>
+      ${this._kvs([
+        ['Installed', ver(f.installed)],
+        ['Latest known', ver(f.latest)],
+        f.inProgress && f.pct != null ? ['Progress', `${f.pct}%`] : ['', ''],
+      ])}
+      <div class="note">${
+        !f.assessed
+          ? 'Zigbee2MQTT has never asked the OTA index about this device. Check to populate it. '
+          : ''
+      }${
+        battery
           ? 'Battery device: schedule the update and it applies when the device next wakes.'
-          : 'Checking only contacts the firmware index; it never installs.'}</div>
-        ${f.inProgress
-          ? `<button class="pill ghost" id="fwabort">Abort</button>`
-          : `<button class="pill ghost" id="fwcheck">Check</button>
-             ${f.available && !battery ? `<button class="pill" id="fwinstall">Install</button>` : ''}
-             ${f.available && battery ? `<button class="pill" id="fwsched">Schedule</button>` : ''}`}
-      </div>`;
+          : 'Checking only contacts the firmware index; it never installs.'
+      }</div>
+      <div class="actions">${buttons}</div>`;
   }
 
-  _wireFw(d) {
-    const r = this.shadowRoot;
-    const on = (id, fn) => { const el = r.getElementById(id); if (el) el.onclick = fn; };
-    const device = d.ieee_address;
-    on('fwcheck', () => this._act('z2m/ota/check', { device }));
-    on('fwabort', () => {
-      if (confirm('Abort the firmware update in progress?')) this._act('z2m/ota/abort', { device });
-    });
-    on('fwinstall', () => {
-      if (!confirm(`Install firmware on ${d.friendly_name}?\n\n`
-        + 'Do not cut power during an update. A mains device is unusable while it flashes.'))
-        return;
-      this._act('z2m/ota/update', { device });
-    });
-    on('fwsched', () => this._act('z2m/ota/schedule', { device }));
-  }
-
-  /** Patch only the firmware card, so a state push cannot clobber typing elsewhere. */
+  /** Patch only the firmware surface, so a state push cannot clobber typing elsewhere. */
   _syncFw() {
     const r = this.shadowRoot;
     if (!r) return;
-    if (this._view.name === 'ota') { this._render(); return; }
+    if (this._view.name === 'ota') {
+      const box = r.getElementById('otalist');
+      if (!box) return;
+      const html = this._otaRows();
+      if (html === this._lastOta) return;
+      this._lastOta = html;
+      box.innerHTML = html;
+      this._hydrate();
+      return;
+    }
+    if (this._view.name !== 'device') return;
     const box = r.getElementById('fwbox');
-    if (!box || this._view.name !== 'device') return;
+    if (!box) return;
     const d = this._dev(this._view.ieee);
     if (!d) return;
     const html = this._fwInner(d);
     if (html === this._lastFw) return;
     this._lastFw = html;
     box.innerHTML = html;
-    this._wireFw(d);
+    this._hydrate();
   }
 
-  /* ------------------------------------------------------------- ota view */
+  /* -------------------------------------------------------------- ota fleet */
+
+  _otaRows() {
+    const cap = this._devices.filter((d) => d.update_entity);
+    if (!cap.length) return '<div class="empty">No OTA-capable devices.</div>';
+    return list(
+      cap
+        .map((d) => {
+          const f = this._fw(d) || {};
+          let chip = '<span slot="end" class="chip">not assessed</span>';
+          let ico = MDI.firmware;
+          if (f.inProgress) {
+            chip = `<span slot="end" class="chip warn">${esc(f.pct ?? 0)}%</span>`;
+            ico = MDI.updating;
+          } else if (f.unavailable) chip = '<span slot="end" class="chip off">offline</span>';
+          else if (f.available) chip = '<span slot="end" class="chip warn">update</span>';
+          else if (f.assessed) chip = '<span slot="end" class="chip ok">up to date</span>';
+          return row({
+            icon: ico,
+            headline: esc(d.friendly_name),
+            text: esc([d.vendor, d.model].filter(Boolean).join(' \u00b7 ')),
+            data: ` data-ieee="${esc(d.ieee_address)}"`,
+            tap: true,
+            end: `${chip}<ha-icon-next slot="end"></ha-icon-next>`,
+          });
+        })
+        .join('')
+    );
+  }
 
   _otaView() {
-    const rows = this._devices
-      .filter((d) => d.update_entity)
-      .map((d) => {
-        const f = this._fw(d) || {};
-        let tag = '<span class="chip">not assessed</span>';
-        if (f.inProgress) tag = `<span class="chip warn">${f.pct ?? 0}%</span>`;
-        else if (f.unavailable) tag = '<span class="chip off">offline</span>';
-        else if (f.available) tag = '<span class="chip warn">update</span>';
-        else if (f.assessed) tag = '<span class="chip">up to date</span>';
-        return `<div class="row tap" data-ieee="${esc(d.ieee_address)}">
-          ${svg(ICONS.ota, 20)}
-          <div class="grow">
-            <div class="title">${esc(d.friendly_name)}</div>
-            <div class="sub">${esc([d.vendor, d.model].filter(Boolean).join(' · '))}</div>
-          </div>${tag}${svg(ICONS.chevron, 20)}</div>`;
-      })
-      .join('');
-
     const n = this._devices.filter((d) => d.update_entity).length;
-    return `
-      <div class="card">
-        <div class="row">
-          <div class="grow"><div class="title">Check all ${n} devices</div>
-          <div class="sub">Staggered a few seconds apart on purpose: a burst of queries
-          is heavy on the coordinator.</div></div>
-          <button class="pill ghost" id="checkall">Check all</button>
-        </div>
-      </div>
-      <div class="card">${rows || '<div class="empty">No OTA-capable devices.</div>'}</div>`;
-  }
-
-  /* -------------------------------------------------------------- dashboard */
-
-  _dashboard() {
-    const s = this._summary || {};
-    const online = s.state === 'online';
-    const offline = s.offline_count || 0;
-    const hasMap = true; // Zigbee Map panel, linked rather than reimplemented.
-    return `
-      <div class="card">
-        <div class="hdr">
-          <span class="${online ? 'ok' : 'bad'}">${svg(ICONS.health, 28)}</span>
-          <div class="grow">
-            <div class="big">${online ? 'Online' : 'Offline'}</div>
-            <div class="sub">${s.device_count || 0} devices${offline ? ` (${offline} offline)` : ''}</div>
-          </div>
-          <span class="chip">Z2M ${esc((s.version || '?').toString())}</span>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="sectionhdr">
-          <h2>My network</h2>
-          ${hasMap ? `<button class="pill ghost" id="showmap">${svg(ICONS.map, 18)} Show map</button>` : ''}
-        </div>
-        <div class="row tap" data-go="devices">
-          ${svg(ICONS.devices)}<div class="grow"><div class="title">${s.device_count || 0} devices</div></div>
-          <span class="trail">${offline ? `${offline} offline` : ''}</span>${svg(ICONS.chevron, 20)}
-        </div>
-        <div class="row tap" data-go="groups">
-          ${svg(ICONS.group)}<div class="grow"><div class="title">${s.group_count || 0} groups</div></div>
-          ${svg(ICONS.chevron, 20)}
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="row tap" id="permit">
-          ${svg(ICONS.add)}
-          <div class="grow"><div class="title">Add device</div>
-            <div class="sub">${s.permit_join ? 'Joining is OPEN — tap to close' : 'Open the network for pairing'}</div></div>
-          <span class="trail">${s.permit_join ? this._joinLeft(s) : 'Off'}</span>${svg(ICONS.chevron, 20)}
-        </div>
-        <div class="row tap" data-go="ota">
-          ${svg(ICONS.ota)}
-          <div class="grow"><div class="title">Firmware</div>
-            <div class="sub">${(() => {
-              const cap = this._devices.filter((x) => x.update_entity);
-              const avail = cap.filter((x) => (this._fw(x) || {}).available).length;
-              const unass = cap.filter((x) => !(this._fw(x) || {}).assessed).length;
-              if (avail) return `${avail} update${avail > 1 ? 's' : ''} available`;
-              if (unass) return `${unass} of ${cap.length} not assessed yet`;
-              return `${cap.length} devices, all up to date`;
-            })()}</div></div>
-          ${svg(ICONS.chevron, 20)}
-        </div>
-        <div class="row tap" data-go="network">
-          ${svg(ICONS.info)}
-          <div class="grow"><div class="title">Network information</div>
-            <div class="sub">Coordinator, channel, PAN ID and Z2M version</div></div>
-          ${svg(ICONS.chevron, 20)}
-        </div>
-        <a class="row tap" href="/zigbee-log">
-          ${svg(ICONS.log)}
-          <div class="grow"><div class="title">Logs</div>
-            <div class="sub">Live Zigbee traffic and Z2M log</div></div>
-          ${svg(ICONS.chevron, 20)}
-        </a>
-        <div class="row tap" id="health">
-          ${svg(ICONS.health)}
-          <div class="grow"><div class="title">Health check</div>
-            <div class="sub">Ask Z2M to re-check every device</div></div>
-          ${svg(ICONS.chevron, 20)}
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="row">
-          ${svg(ICONS.backup)}
-          <div class="grow"><div class="title">Coordinator backup</div>
-            <div class="sub">Writes a fresh backup inside Zigbee2MQTT</div></div>
-          <button class="pill ghost" id="backup">Create</button>
-        </div>
-        <div class="row">
-          ${svg(ICONS.restart)}
-          <div class="grow"><div class="title">Restart Zigbee2MQTT</div>
-            <div class="sub">Brief loss of all Zigbee devices</div></div>
-          <button class="pill ghost" id="restart">Restart</button>
-        </div>
-      </div>`;
-  }
-
-  /* ---------------------------------------------------------------- devices */
-
-  _devicesView() {
-    const f = this._filter.toLowerCase();
-    const list = this._devices.filter(
-      (d) =>
-        !f ||
-        (d.friendly_name || '').toLowerCase().includes(f) ||
-        (d.model || '').toLowerCase().includes(f) ||
-        (d.vendor || '').toLowerCase().includes(f)
+    return (
+      card(
+        list(
+          row({
+            icon: MDI.refresh,
+            headline: `Check all ${n} devices`,
+            text:
+              'Staggered a few seconds apart on purpose: a burst of queries is heavy on the coordinator',
+            end: rowButton('Check all', 'checkall'),
+          })
+        )
+      ) + `<ha-card class="nav-card"><div id="otalist">${this._otaRows()}</div></ha-card>`
     );
-    const rows =
-      list
-        .map((d) => {
-          const off = d.availability === 'offline';
-          const batt = d.power_source && d.power_source !== 'Mains (single phase)';
-          return `<div class="row tap" data-ieee="${esc(d.ieee_address)}">
-            ${svg(ICONS.devices, 20)}
-            <div class="grow">
-              <div class="title">${esc(d.friendly_name || d.ieee_address)}</div>
-              <div class="sub">${esc([d.vendor, d.model].filter(Boolean).join(' · ') || 'Unknown model')}</div>
-            </div>
-            ${off ? '<span class="chip off">offline</span>' : ''}
-            ${batt ? '<span class="chip">battery</span>' : ''}
-            ${svg(ICONS.chevron, 20)}
-          </div>`;
-        })
-        .join('') || `<div class="empty">No devices match “${esc(this._filter)}”.</div>`;
-    return `<div class="card">
-        <div class="search">${svg(ICONS.search, 20)}
-          <input id="q" type="text" placeholder="Search ${this._devices.length} devices" value="${esc(this._filter)}">
-        </div>${rows}</div>`;
   }
 
-  /* ----------------------------------------------------------- device detail */
-
-  _deviceView(ieee) {
-    const d = this._dev(ieee);
-    if (!d) return `<div class="empty">Device not found.</div>`;
-    const kv = (k, v) =>
-      v === undefined || v === null || v === '' ? '' : `<div class="kv"><div class="k">${esc(k)}</div><div class="v">${esc(String(v))}</div></div>`;
-
-    // Z2M ships an `options` schema per device; generate the form from it rather
-    // than hard-coding a form per model.
-    const opts = (d.options || [])
-      .filter((o) => ['numeric', 'binary', 'enum', 'text'].includes(o.type))
-      .map((o) => this._optionField(o))
-      .join('');
-
-    return `
-      <div class="card">
-        ${kv('Friendly name', d.friendly_name)}
-        ${kv('IEEE address', d.ieee_address)}
-        ${kv('Network address', d.network_address)}
-        ${kv('Vendor', d.vendor)}
-        ${kv('Model', d.model)}
-        ${kv('Description', d.description)}
-        ${kv('Type', d.type)}
-        ${kv('Power source', d.power_source)}
-        ${kv('Availability', d.availability || 'unknown')}
-        ${kv('Firmware build', d.software_build_id)}
-        ${kv('Firmware date', d.date_code)}
-        ${kv('Supported by Z2M', d.supported === false ? 'NO - custom converter needed' : 'yes')}
-      </div>
-
-      <div class="card">
-        <div class="sectionhdr"><h2>Rename</h2></div>
-        <div class="field">
-          <label for="rn">Friendly name</label>
-          <input id="rn" type="text" value="${esc(d.friendly_name || '')}">
-        </div>
-        <div class="row"><div class="grow sub">Changes the MQTT topic, so Home Assistant entity IDs regenerate.</div>
-          <button class="pill" id="dorename">Rename</button></div>
-      </div>
-
-      ${opts ? `<div class="card"><div class="sectionhdr"><h2>Device settings</h2></div>${opts}
-        <div class="row"><div class="grow sub">Written straight to Zigbee2MQTT.</div>
-        <button class="pill" id="dooptions">Save settings</button></div></div>` : ''}
-
-      <div class="card"><div id="fwbox">${this._fwInner(d)}</div></div>
-
-      <div class="card">
-        <div class="sectionhdr"><h2>Maintenance</h2></div>
-        <div class="row"><div class="grow"><div class="title">Reconfigure</div>
-          <div class="sub">Re-apply reporting and bindings</div></div>
-          <button class="pill ghost" id="doconfigure">Reconfigure</button></div>
-        <div class="row"><div class="grow"><div class="title">Re-interview</div>
-          <div class="sub">Rebuild what Z2M knows about this device</div></div>
-          <button class="pill ghost" id="dointerview">Interview</button></div>
-      </div>
-
-      <div class="card">
-        <div class="row"><div class="grow"><div class="title bad">Remove from network</div>
-          <div class="sub">Force removal does not tell the device to leave, so it will need a factory reset before it can pair again.</div></div>
-          <button class="pill ghost" id="doremove">Remove</button></div>
-      </div>`;
-  }
-
-  _optionField(o) {
-    const id = `opt_${o.property}`;
-    const label = esc(o.label || o.name || o.property);
-    const hint = o.description ? `<div class="hint">${esc(o.description)}</div>` : '';
-    if (o.type === 'binary') {
-      return `<div class="field"><label for="${id}">${label}${hint}</label>
-        <input id="${id}" data-prop="${esc(o.property)}" data-kind="binary" type="checkbox"></div>`;
-    }
-    if (o.type === 'enum') {
-      const values = (o.values || []).map((v) => `<option value="${esc(String(v))}">${esc(String(v))}</option>`).join('');
-      return `<div class="field"><label for="${id}">${label}${hint}</label>
-        <select id="${id}" data-prop="${esc(o.property)}" data-kind="enum"><option value=""></option>${values}</select></div>`;
-    }
-    if (o.type === 'numeric') {
-      const rng = [o.value_min, o.value_max].every((x) => x !== undefined) ? ` (${o.value_min}–${o.value_max})` : '';
-      return `<div class="field"><label for="${id}">${label}${rng}${hint}</label>
-        <input id="${id}" data-prop="${esc(o.property)}" data-kind="numeric" type="number"
-          ${o.value_min !== undefined ? `min="${o.value_min}"` : ''}
-          ${o.value_max !== undefined ? `max="${o.value_max}"` : ''}
-          ${o.value_step !== undefined ? `step="${o.value_step}"` : ''}></div>`;
-    }
-    return `<div class="field"><label for="${id}">${label}${hint}</label>
-      <input id="${id}" data-prop="${esc(o.property)}" data-kind="text" type="text"></div>`;
-  }
-
-  /* ---------------------------------------------------------------- network */
+  /* -------------------------------------------------------- network / groups */
 
   _networkView() {
     const s = this._summary || {};
     const c = s.coordinator || {};
     const n = s.network || {};
-    const kv = (k, v) =>
-      v === undefined || v === null || v === '' ? '' : `<div class="kv"><div class="k">${esc(k)}</div><div class="v">${esc(String(v))}</div></div>`;
-    return `<div class="card">
-        ${kv('Zigbee2MQTT version', s.version)}
-        ${kv('Coordinator type', c.type)}
-        ${kv('Coordinator firmware', (c.meta && (c.meta.revision || c.meta.version)) || '')}
-        ${kv('Serial / adapter', s.serial)}
-        ${kv('Channel', n.channel)}
-        ${kv('PAN ID', n.pan_id)}
-        ${kv('Extended PAN ID', Array.isArray(n.extended_pan_id) ? n.extended_pan_id.join(':') : n.extended_pan_id)}
-        ${kv('MQTT base topic', s.base_topic)}
-        ${kv('Log level', s.log_level)}
-      </div>
-      <div class="card"><div class="row"><div class="grow sub">
-        The network key is deliberately not shown here.</div></div></div>`;
+    return (
+      `<ha-card class="nav-card">${this._kvs([
+        ['Zigbee2MQTT version', s.version],
+        ['Coordinator type', c.type],
+        ['Coordinator IEEE', c.ieee_address],
+        ['Coordinator firmware', (c.meta && (c.meta.revision || c.meta.version)) || ''],
+        ['Serial / adapter', s.serial],
+        ['Channel', n.channel],
+        ['PAN ID', n.pan_id],
+        [
+          'Extended PAN ID',
+          Array.isArray(n.extended_pan_id) ? n.extended_pan_id.join(':') : n.extended_pan_id,
+        ],
+        ['MQTT base topic', s.base_topic],
+        ['Log level', s.log_level],
+      ])}</ha-card>` + card('<div class="note">The network key is deliberately not shown here.</div>')
+    );
   }
 
   _groupsView() {
-    const rows =
-      (this._groups || [])
-        .map(
-          (g) => `<div class="row"><div class="grow">
-            <div class="title">${esc(g.friendly_name || String(g.id))}</div>
-            <div class="sub">ID ${esc(String(g.id))} · ${(g.members || []).length} members</div>
-          </div></div>`
-        )
-        .join('') || `<div class="empty">No Zigbee groups.</div>`;
-    return `<div class="card">${rows}</div>`;
+    const rows = (this._groups || [])
+      .map((g) =>
+        row({
+          icon: MDI.groups,
+          headline: esc(g.friendly_name || String(g.id)),
+          text: `ID ${esc(String(g.id))} \u00b7 ${(g.members || []).length} member${
+            (g.members || []).length === 1 ? '' : 's'
+          }`,
+          end: '',
+        })
+      )
+      .join('');
+    return `<ha-card class="nav-card"><div class="card-content">${
+      rows ? list(rows) : '<div class="empty">No Zigbee groups.</div>'
+    }</div></ha-card>`;
   }
 
-  /* ------------------------------------------------------------------ events */
+  /* ---------------------------------------------------------------- options */
 
-  _wire() {
+  _optionsView() {
+    const s = this._summary || {};
+    const levels = LOG_LEVELS.map(
+      (l) => `<option value="${l}"${s.log_level === l ? ' selected' : ''}>${l}</option>`
+    ).join('');
+    return (
+      card(
+        list(
+          row({
+            icon: MDI.logs,
+            headline: 'Log level',
+            text: 'Applied to Zigbee2MQTT immediately; debug is very chatty',
+            end: `<select slot="end" id="loglevel" data-change="loglevel">${levels}</select>`,
+          }) +
+            row({
+              icon: MDI.plus,
+              headline: 'Permit joining',
+              text: s.permit_join
+                ? 'Open \u2014 any Zigbee device may join right now'
+                : 'Closed \u2014 devices cannot join',
+              end: rowButton(s.permit_join ? 'Close' : 'Open for 254s', 'permit'),
+            }) +
+            row({
+              icon: MDI.restart,
+              headline: 'Restart Zigbee2MQTT',
+              text: 'Brief loss of all Zigbee devices',
+              end: rowButton('Restart', 'restart'),
+            })
+        )
+      ) +
+      card(
+        list(
+          row({
+            icon: MDI.options,
+            headline: 'Integration settings',
+            text: 'MQTT base topic and entry options',
+            href: '/config/integrations/integration/z2m',
+          })
+        )
+      )
+    );
+  }
+
+  /* ------------------------------------------------------------ diagnostics */
+
+  _diagView() {
+    const d = this._diag;
+    const routers = d.routers;
+
+    let routerBody;
+    if (!d.checked) {
+      routerBody = '<div class="note">Asking the coordinator for its routing table\u2026</div>';
+    } else if (routers === null) {
+      routerBody = '<div class="note">The coordinator table could not be read.</div>';
+    } else if (!routers.length) {
+      routerBody =
+        '<ha-alert alert-type="success">Every router is present in the coordinator\u2019s table.</ha-alert>';
+    } else {
+      routerBody = list(
+        routers
+          .map((r) =>
+            row({
+              icon: MDI.unlinked,
+              headline: esc(r.name || r.ieee),
+              text: esc(r.ieee),
+              data: ` data-ieee="${esc(r.ieee)}"`,
+              tap: true,
+            })
+          )
+          .join('')
+      );
+    }
+
+    return (
+      (d.error ? `<ha-alert alert-type="error">${esc(d.error)}</ha-alert>` : '') +
+      card(
+        list(
+          row({
+            icon: MDI.health,
+            headline: 'Health check',
+            text: 'Asks Zigbee2MQTT to report its own state and per-device counters',
+            end: rowButton('Run', 'health'),
+          })
+        )
+      ) +
+      (d.health ? this._healthCard(d.health) : '') +
+      `<ha-card class="nav-card">
+         <div class="card-header">Routers missing from the coordinator
+           <ha-button appearance="plain" size="s" data-act="coordcheck">Re-check</ha-button>
+         </div>
+         <div class="card-content">${routerBody}</div>
+         <div class="note">A router the coordinator cannot see is still reachable through its
+         neighbours, but it will not be offered as a parent for devices that join next.</div>
+       </ha-card>`
+    );
+  }
+
+  /** Z2M's health payload is version dependent, so render whatever it actually sent. */
+  _healthCard(health) {
+    const flat = [];
+    const walk = (obj, prefix) => {
+      Object.keys(obj || {}).forEach((k) => {
+        const v = obj[k];
+        const label = prefix ? `${prefix} \u203a ${k}` : k;
+        if (v && typeof v === 'object' && !Array.isArray(v)) walk(v, label);
+        else flat.push([label, Array.isArray(v) ? v.join(', ') : String(v)]);
+      });
+    };
+    walk(health, '');
+    const healthy = health && health.healthy;
+    return `<ha-card class="nav-card">
+        <div class="card-header">Health${
+          healthy === undefined
+            ? ''
+            : ` <span class="chip ${healthy ? 'ok' : 'off'}">${
+                healthy ? 'healthy' : 'unhealthy'
+              }</span>`
+        }</div>
+        ${
+          flat.length
+            ? this._kvs(flat)
+            : '<div class="note">Zigbee2MQTT returned an empty payload.</div>'
+        }
+      </ha-card>`;
+  }
+
+  async _runCoordinatorCheck() {
+    this._diag.checked = true;
+    try {
+      const res = await this._call('z2m/coordinator_check');
+      this._diag.routers = (res && res.missing_routers) || [];
+      this._diag.error = null;
+    } catch (err) {
+      this._diag.routers = null;
+      this._diag.error = (err && (err.message || err.code)) || 'Coordinator check failed';
+    }
+    if (this._view.name === 'diagnostics') this._render();
+  }
+
+  /* ------------------------------------------------------------------- logs */
+
+  _logsView() {
+    const levels = ['all']
+      .concat(LOG_LEVELS)
+      .map((l) => `<option value="${l}"${this._logMin === l ? ' selected' : ''}>${l}</option>`)
+      .join('');
+    return (
+      `<ha-card class="nav-card">
+        <div class="search">
+          ${icon(MDI.logs, '')}
+          <div class="grow">Minimum level</div>
+          <select id="logmin" data-change="logmin">${levels}</select>
+          <span class="chip warn" id="logpaused"${this._logPinned ? ' hidden' : ''}>paused</span>
+          <ha-button appearance="plain" size="s" data-act="logbottom">Latest</ha-button>
+        </div>
+        <div class="logwrap" id="logscroll"><div id="loglist">${this._logHtml()}</div></div>
+      </ha-card>` +
+      // The scroll behaviour is visible on screen; what is NOT visible is that this
+      // filter is local to the view, so that is the only part worth saying.
+      card(
+        '<div class="note">This filter only changes what is shown here -- Options sets what ' +
+          'Zigbee2MQTT actually emits.</div>'
+      )
+    );
+  }
+
+  _visibleLogs() {
+    if (this._logMin === 'all') return this._logs;
+    const max = LOG_LEVELS.indexOf(this._logMin);
+    return this._logs.filter((e) => {
+      const i = LOG_LEVELS.indexOf(String(e.level || '').toLowerCase());
+      return i === -1 || i <= max;
+    });
+  }
+
+  _logHtml() {
+    const entries = this._visibleLogs();
+    if (!entries.length) return '<div class="empty">No log entries yet.</div>';
+    return entries.map((e) => this._logLine(e)).join('');
+  }
+
+  _logLine(e) {
+    const t = e.time ? new Date(e.time * 1000).toLocaleTimeString() : '';
+    const level = String(e.level || '').toLowerCase();
+    return `<div class="log ${esc(level)}"><span class="t">${esc(t)}</span><span class="l">${esc(
+      level
+    )}</span><span class="m">${esc(e.message)}</span></div>`;
+  }
+
+  async _openLogs() {
+    // Replay the backend's ring buffer first, then follow it. Subscribing before the
+    // replay lands would interleave the two, so the order matters.
+    try {
+      const res = await this._call('z2m/logs');
+      this._logs = ((res && res.entries) || []).slice(-LOG_MAX);
+      this._paintLogs();
+    } catch (err) {
+      this._error = (err && (err.message || err.code)) || 'Could not read the log';
+      this._render();
+      return;
+    }
+    if (this._view.name !== 'logs') return;
+    this._sub('logs', { type: 'z2m/logs/subscribe' }, (entry) => {
+      if (!entry || !entry.message) return;
+      this._logs.push(entry);
+      if (this._logs.length > LOG_MAX) this._logs.splice(0, this._logs.length - LOG_MAX);
+      this._scheduleLogPaint();
+    });
+  }
+
+  /**
+   * Debug logging arrives in bursts, so coalesce paints instead of rewriting the list
+   * once per line.
+   */
+  _scheduleLogPaint() {
+    if (this._logTimer) return;
+    this._logTimer = setTimeout(() => {
+      this._logTimer = null;
+      this._paintLogs();
+    }, 100);
+  }
+
+  _paintLogs() {
     const r = this.shadowRoot;
-    r.querySelectorAll('[data-go]').forEach((el) => {
-      el.onclick = () => this._go({ name: el.dataset.go });
-    });
-    r.querySelectorAll('[data-ieee]').forEach((el) => {
-      el.onclick = () => this._go({ name: 'device', ieee: el.dataset.ieee });
-    });
-    const q = r.getElementById('q');
-    if (q)
-      q.oninput = () => {
-        this._filter = q.value;
-        const pos = q.selectionStart;
-        this._render();
-        const nq = this.shadowRoot.getElementById('q');
-        if (nq) { nq.focus(); nq.setSelectionRange(pos, pos); }
-      };
+    if (!r || this._view.name !== 'logs') return;
+    const box = r.getElementById('loglist');
+    if (!box) return;
+    box.innerHTML = this._logHtml();
+    if (!this._logPinned) return;
+    const scroll = r.getElementById('logscroll');
+    if (scroll) scroll.scrollTop = scroll.scrollHeight;
+  }
 
-    const map = r.getElementById('showmap');
-    if (map) map.onclick = () => { window.location.href = '/zigbee-map'; };
+  /* -------------------------------------------------------------------- map */
 
-    const on = (id, fn) => { const el = r.getElementById(id); if (el) el.onclick = fn; };
+  _mapView() {
+    // Nothing but the map and, when there is one, a real error. Age, progress,
+    // Re-scan and node detail are drawn by the element inside its own canvas, which
+    // is why it gets the entire area.
+    return `${
+      this._map.error ? `<ha-alert alert-type="error">${esc(this._map.error)}</ha-alert>` : ''
+    }
+      <div class="stage" id="mapstage"></div>`;
+  }
 
-    on('permit', async () => {
-      const s = this._summary || {};
-      // Time is the only field Z2M reads; 0 closes the network.
-      await this._act('z2m/permit_join', { time: s.permit_join ? 0 : 254 });
-    });
-    on('health', () => this._act('z2m/health_check'));
+  /** Overridable seam so the shell can be exercised without the map module present. */
+  _loadMapModule() {
+    return import('./z2m-map.js');
+  }
 
-    // Stagger deliberately. A burst of per-device queries is real load on the
-    // coordinator, and Z2M serialises them per device with a 10s timeout each.
-    on('checkall', async () => {
-      const cap = this._devices.filter((x) => x.update_entity);
-      if (!confirm(`Check firmware on ${cap.length} devices?\n\n`
-        + 'Spread ~4s apart to stay gentle on the coordinator.')) return;
-      for (const d of cap) {
-        try { await this._call('z2m/ota/check', { device: d.ieee_address }); } catch (e) { /* keep going */ }
-        await new Promise((r) => setTimeout(r, 4000));
+  /**
+   * Opening the map never blocks on the radio. Either a scan is cached, in which
+   * case the cached topology is read and drawn, or nothing is cached and a STREAMING
+   * scan starts: the retained device list lands first so every device is on screen
+   * immediately, then each neighbour table attaches as its reply arrives.
+   *
+   * The cache is probed through the summary's `map_generated`, never by calling
+   * z2m/networkmap blind: that command scans when the cache is absent or stale, and
+   * that blocking scan is exactly what this view exists to avoid.
+   */
+  async _openMap() {
+    // Follow the scan lifecycle first, so a scan already running elsewhere shows up.
+    this._sub('map', { type: 'z2m/networkmap/subscribe' }, (ev) => this._onMapPhase(ev));
+
+    try {
+      await this._loadMapModule();
+    } catch (err) {
+      this._map.error =
+        'The network map module could not be loaded: ' + ((err && err.message) || 'unknown error');
+      this._render();
+      return;
+    }
+    if (this._view.name !== 'map') return;
+
+    const cached = !!this._map.topology || !!(this._summary || {}).map_generated;
+    if (cached && !this._map.topology) {
+      try {
+        this._map.topology = await this._call('z2m/networkmap');
+        this._map.error = null;
+      } catch (err) {
+        this._map.error = (err && (err.message || err.code)) || 'Could not read the cached map';
       }
-      this._refresh();
-    });
-    on('backup', () => this._act('z2m/backup'));
-    on('restart', () => {
-      if (confirm('Restart Zigbee2MQTT? All Zigbee devices are briefly unavailable.'))
-        this._act('z2m/restart');
-    });
+      if (this._view.name !== 'map') return;
+    }
 
+    // Mount first either way: the scan's very first event carries every device, and
+    // it needs somewhere to land.
+    this._mountMap();
+    // Deliberately unconditional when nothing is cached, including while another
+    // session's scan is already running: z2m/networkmap/scan is single-flight and a
+    // second caller attaches to the walk in progress, which is how this view gets
+    // the fleet drawn instead of an empty canvas until that scan finishes.
+    if (!cached) this._startScan();
+  }
+
+  /**
+   * The element instance outlives re-renders: it owns the physics, the operator's
+   * pinned layout and the current selection, and rebuilding it would throw all three
+   * away. `.topology` is therefore assigned only on first mount and after a scan
+   * completes, never on a summary push.
+   */
+  _mountMap() {
+    const stage = this.shadowRoot && this.shadowRoot.getElementById('mapstage');
+    if (!stage) return;
+    let el = this._map.el;
+    if (!el) {
+      // Never create it before its module has defined it: properties assigned to a
+      // not-yet-upgraded element become own properties that shadow the class's own
+      // setters, and the map would then silently ignore hass, topology and scan.
+      if (!this._has('z2m-network-map')) return;
+      el = document.createElement('z2m-network-map');
+      this._map.el = el;
+      el.hass = this._hass;
+      el.diagnostics = true;
+      el.reveal = this._map.first;
+      this._map.first = false;
+      if (this._map.topology) el.topology = this._map.topology;
+    }
+    stage.appendChild(el);
+    this._syncScan();
+  }
+
+  /**
+   * One property carries the whole status line the map draws for itself. `generated`
+   * is handed over as an epoch rather than as text so the element can age it without
+   * being told, and the ticker re-pushes it while this view is open so the age stays
+   * honest even if the element keeps no clock of its own.
+   */
+  _syncScan() {
+    const el = this._map.el;
+    if (!el) return;
+    const s = this._map.scan;
+    el.scan = {
+      generated:
+        s.generated ||
+        (this._map.topology && this._map.topology.generated) ||
+        (this._summary || {}).map_generated ||
+        null,
+      scanning: !!s.scanning,
+      phase: s.phase,
+      done: s.done,
+      total: s.total,
+    };
+  }
+
+  /**
+   * A subscription, not a request: the events arrive on this connection while the
+   * walk runs. `_sub` replaces whatever was streaming, so Re-scan supersedes a scan
+   * in flight rather than queuing behind it.
+   */
+  _startScan() {
+    const hadError = !!this._map.error;
+    this._map.error = null;
+    this._map.scan = {
+      generated: this._map.scan.generated,
+      scanning: true,
+      phase: null,
+      done: 0,
+      total: 0,
+    };
+    this._syncScan();
+    this._sub('scan', { type: 'z2m/networkmap/scan' }, (ev) => this._onScanEvent(ev));
+    const pending = this._subs.scan;
+    Promise.resolve(pending).catch((err) => {
+      // A scan that cannot even be started is reported in the same shape as one that
+      // fails mid-walk, so there is a single path for it.
+      if (this._subs.scan !== pending) return;
+      this._onScanEvent({
+        phase: 'error',
+        error: (err && (err.message || err.code)) || 'The scan could not be started',
+      });
+    });
+    if (hadError) this._render();
+  }
+
+  /**
+   * One event per device, in the order the replies land. The element owns the
+   * animation; this owns the bookkeeping, the final cache, and the one thing that
+   * belongs outside the canvas -- a scan that failed outright.
+   */
+  _onScanEvent(ev) {
+    if (!ev) return;
+    const s = this._map.scan;
+    s.phase = ev.phase || null;
+    if (ev.phase === 'start') {
+      s.scanning = true;
+      s.done = 0;
+      s.total = Number(ev.total) || 0;
+    } else if (ev.phase === 'device') {
+      s.done += 1;
+      // A device the start event did not announce still counts: the denominator must
+      // never end up smaller than the numerator on screen.
+      if (s.total < s.done) s.total = s.done;
+    } else if (ev.phase === 'done') {
+      s.scanning = false;
+      s.generated = ev.generated || null;
+      s.total = s.total || s.done;
+      s.done = s.total;
+      this._map.topology = {
+        generated: ev.generated,
+        coordinator: ev.coordinator,
+        nodes: ev.nodes || [],
+        links: ev.links || [],
+      };
+      this._unsub('scan');
+    } else if (ev.phase === 'error') {
+      s.scanning = false;
+      this._map.error = ev.error || 'The scan failed';
+      this._unsub('scan');
+    }
+
+    this._syncScan();
+    const el = this._map.el;
+    if (el && typeof el.applyScanEvent === 'function') el.applyScanEvent(ev);
+    // A map that cannot take the stream still gets the finished graph. Assigning
+    // `.topology` on top of a streamed build would discard the graph it just built.
+    else if (el && ev.phase === 'done') el.topology = this._map.topology;
+
+    // The alert renders above the map without replacing it: _enter re-hosts the very
+    // same element after the render.
+    if (ev.phase === 'error') this._render();
+  }
+
+  /**
+   * The lifecycle channel, which reports scans started anywhere -- another browser
+   * tab, an automation. Our own stream reports the same lifecycle in far more
+   * detail, so while it is running this channel is ignored: re-reading the cache
+   * underneath a live stream would throw away the graph it is building.
+   */
+  _onMapPhase(ev) {
+    if (!ev || this._subs.scan) return;
+    const s = this._map.scan;
+    s.scanning = ev.phase === 'scanning';
+    s.phase = ev.phase || null;
+    if (ev.error) this._map.error = ev.error;
+    if (ev.phase === 'done') {
+      // Somebody else's scan finished: pick up the cache it just wrote.
+      this._call('z2m/networkmap')
+        .then((t) => {
+          this._map.topology = t;
+          s.generated = (t && t.generated) || null;
+          if (this._map.el) this._map.el.topology = t;
+          this._syncScan();
+        })
+        .catch(() => {});
+    }
+    this._syncScan();
+  }
+
+  /* ----------------------------------------------------------------- backup */
+
+  /**
+   * Z2M answers bridge/request/backup with a base64 ZIP in `zip`, and the backend
+   * hands that response straight through. No archive means the request failed, and
+   * the operator needs to be told rather than reassured.
+   *
+   * The hand-off to the browser follows Home Assistant's own `fileDownload` helper,
+   * including its Safari carve-out: Safari aborts a download whose blob URL is
+   * revoked in the same turn, and this household drives the panel from iPads.
+   */
+  async _downloadBackup() {
+    const res = await this._call('z2m/backup');
+    const b64 = res && res.zip;
+    if (!b64) throw new Error('Zigbee2MQTT returned no backup archive');
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/zip' }));
+    const a = document.createElement('a');
+    a.target = '_blank';
+    a.href = url;
+    a.download = `zigbee2mqtt-backup-${new Date().toISOString().slice(0, 10)}.zip`;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.dispatchEvent(new MouseEvent('click'));
+    document.body.removeChild(a);
+    const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+    if (/^((?!chrome|android).)*safari/i.test(ua)) setTimeout(() => URL.revokeObjectURL(url), 10000);
+    else URL.revokeObjectURL(url);
+  }
+
+  /* ----------------------------------------------------------------- events */
+
+  _change(name, el) {
+    if (name === 'logmin') {
+      this._logMin = el.value;
+      this._paintLogs();
+      return;
+    }
+    if (name === 'loglevel') this._act('z2m/log_level', { value: el.value });
+  }
+
+  async _dispatch(act) {
+    const r = this.shadowRoot;
     const d = this._view.name === 'device' ? this._dev(this._view.ieee) : null;
-    if (d) {
-      on('dorename', async () => {
-        const to = r.getElementById('rn').value.trim();
-        if (!to || to === d.friendly_name) return;
-        await this._act('z2m/device/rename', { from: d.friendly_name, to });
-      });
-      on('doconfigure', () => this._act('z2m/device/configure', { device: d.ieee_address }));
-      on('dointerview', () => this._act('z2m/device/interview', { device: d.ieee_address }));
-      this._wireFw(d);
-      this._lastFw = this._fwInner(d);
-      on('doremove', () => {
-        if (!confirm(`Remove ${d.friendly_name} from the Zigbee network?`)) return;
-        const force = confirm('Device unreachable? OK = force removal (needs a factory reset before it can pair again).');
-        this._act('z2m/device/remove', { device: d.ieee_address, force });
-      });
-      on('dooptions', async () => {
-        const options = {};
-        r.querySelectorAll('[data-prop]').forEach((el) => {
-          const kind = el.dataset.kind;
-          if (kind === 'binary') options[el.dataset.prop] = el.checked;
-          else if (el.value !== '') {
-            options[el.dataset.prop] = kind === 'numeric' ? Number(el.value) : el.value;
+    // `id` is reserved by Home Assistant's websocket envelope, so every
+    // device-targeted command carries `device` and the backend maps it onto Z2M's own
+    // `id` field. Putting it in `id` here silently loses the device.
+    const device = d && d.ieee_address;
+
+    switch (act) {
+      case 'refresh':
+        return this._refresh();
+
+      // Only reachable from the fallback chrome; hass-subpage owns its own back arrow.
+      case 'back':
+        return this._back();
+
+      case 'map':
+        return this._go({ name: 'map' });
+
+      case 'permit': {
+        // Time is the only field Z2M reads; 0 closes the network.
+        const open = (this._summary || {}).permit_join;
+        return this._act('z2m/permit_join', { time: open ? 0 : 254 });
+      }
+
+      case 'restart':
+        if (!confirm('Restart Zigbee2MQTT? All Zigbee devices are briefly unavailable.')) return;
+        return this._act('z2m/restart');
+
+      case 'backup':
+        try {
+          await this._downloadBackup();
+        } catch (err) {
+          this._error = (err && (err.message || err.code)) || 'Backup failed';
+          this._render();
+        }
+        return;
+
+      case 'health':
+        try {
+          this._diag.health = await this._call('z2m/health_check');
+          this._diag.error = null;
+        } catch (err) {
+          this._diag.error = (err && (err.message || err.code)) || 'Health check failed';
+        }
+        return this._render();
+
+      case 'coordcheck':
+        this._diag.routers = null;
+        return this._runCoordinatorCheck();
+
+      case 'logbottom': {
+        this._logPinned = true;
+        const chip = r && r.getElementById('logpaused');
+        if (chip) chip.hidden = true;
+        return this._paintLogs();
+      }
+
+      // Stagger deliberately. A burst of per-device queries is real load on the
+      // coordinator, and Z2M serialises them per device with a 10s timeout each.
+      case 'checkall': {
+        const cap = this._devices.filter((x) => x.update_entity);
+        if (
+          !confirm(
+            `Check firmware on ${cap.length} devices?\n\nSpread ~4s apart to stay gentle on the coordinator.`
+          )
+        )
+          return;
+        for (const dev of cap) {
+          try {
+            await this._call('z2m/ota/check', { device: dev.ieee_address });
+          } catch (_) {
+            /* one unreachable device must not stop the sweep */
           }
+          await new Promise((done) => setTimeout(done, 4000));
+        }
+        return this._refresh();
+      }
+
+      case 'fwcheck':
+        return this._act('z2m/ota/check', { device });
+
+      case 'fwabort':
+        if (!confirm('Abort the firmware update in progress?')) return;
+        return this._act('z2m/ota/abort', { device });
+
+      case 'fwinstall':
+        if (
+          !confirm(
+            `Install firmware on ${d.friendly_name}?\n\nDo not cut power during an update. ` +
+              'A mains device is unusable while it flashes.'
+          )
+        )
+          return;
+        return this._act('z2m/ota/update', { device });
+
+      case 'fwsched':
+        return this._act('z2m/ota/schedule', { device });
+
+      case 'fwunsched':
+        return this._act('z2m/ota/unschedule', { device });
+
+      case 'configure':
+        return this._act('z2m/device/configure', { device });
+
+      case 'interview':
+        return this._act('z2m/device/interview', { device });
+
+      case 'remove': {
+        if (!confirm(`Remove ${d.friendly_name} from the Zigbee network?`)) return;
+        const force = confirm(
+          'Device unreachable? OK = force removal (needs a factory reset before it can pair again).'
+        );
+        return this._act('z2m/device/remove', { device, force });
+      }
+
+      case 'rename': {
+        const input = r.getElementById('rn');
+        const to = input && String(input.value || '').trim();
+        if (!to || to === d.friendly_name) return;
+        return this._act('z2m/device/rename', { from: d.friendly_name, to });
+      }
+
+      case 'options': {
+        const options = {};
+        r.querySelectorAll('[data-prop]').forEach((input) => {
+          const kind = input.dataset.kind;
+          if (kind === 'binary') options[input.dataset.prop] = input.checked;
+          else if (input.value !== '')
+            options[input.dataset.prop] = kind === 'numeric' ? Number(input.value) : input.value;
         });
         if (!Object.keys(options).length) return;
-        await this._act('z2m/device/options', { device: d.ieee_address, options });
-      });
+        return this._act('z2m/device/options', { device, options });
+      }
+
+      default:
+        return undefined;
     }
   }
 
@@ -742,12 +1934,6 @@ class Z2MPanel extends HTMLElement {
       this._busy = false;
     }
   }
-}
-
-function esc(s) {
-  return String(s ?? '').replace(/[&<>"']/g, (c) =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]
-  );
 }
 
 customElements.define('z2m-panel', Z2MPanel);
