@@ -14,7 +14,12 @@
     "coordinator": {
       "ieee_address": "0x00124b0000000000",
       "type": "zStack3x0",
-      "meta": { "maintrel": 1, "majorrel": 2, "minorrel": 7, "revision": "20240710" }
+      "meta": {
+        "maintrel": 1,
+        "majorrel": 2,
+        "minorrel": 7,
+        "revision": "20240710"
+      }
     },
     "network": {
       "channel": 25,
@@ -62,7 +67,11 @@
           "property": "effect_color_mode",
           "label": "Effect color mode",
           "description": "How the LED bar reports colour while an effect runs.",
-          "values": ["stop", "keep", "restore"]
+          "values": [
+            "stop",
+            "keep",
+            "restore"
+          ]
         },
         {
           "type": "text",
@@ -88,7 +97,8 @@
           "value_off": false
         }
       ],
-      "scenes": []
+      "scenes": [],
+      "update_entity": "update.hallway_dimmer"
     },
     {
       "ieee_address": "0x0000000000000002",
@@ -111,7 +121,8 @@
           "value_max": 4000
         }
       ],
-      "scenes": []
+      "scenes": [],
+      "update_entity": "update.porch_sensor"
     },
     {
       "ieee_address": "0x0000000000000003",
@@ -123,7 +134,8 @@
       "availability": "online",
       "supported": false,
       "options": [],
-      "scenes": []
+      "scenes": [],
+      "update_entity": null
     },
     {
       "ieee_address": "0x0000000000000004",
@@ -136,15 +148,50 @@
       "availability": "online",
       "supported": true,
       "options": [],
-      "scenes": []
+      "scenes": [],
+      "update_entity": "update.tricky_name"
     }
   ],
   "groups": [
     {
       "id": 1,
       "friendly_name": "living_room_lights",
-      "members": [{ "ieee_address": "0x0000000000000001", "endpoint": 1 }],
+      "members": [
+        {
+          "ieee_address": "0x0000000000000001",
+          "endpoint": 1
+        }
+      ],
       "scenes": []
     }
-  ]
+  ],
+  "states": {
+    "update.hallway_dimmer": {
+      "state": "on",
+      "attributes": {
+        "installed_version": "2.15",
+        "latest_version": "2.18",
+        "in_progress": false,
+        "update_percentage": null
+      }
+    },
+    "update.porch_sensor": {
+      "state": "on",
+      "attributes": {
+        "installed_version": "1.0.4",
+        "latest_version": "1.0.9",
+        "in_progress": false,
+        "update_percentage": null
+      }
+    },
+    "update.tricky_name": {
+      "state": "off",
+      "attributes": {
+        "installed_version": "-1",
+        "latest_version": "-1",
+        "in_progress": false,
+        "update_percentage": null
+      }
+    }
+  }
 }

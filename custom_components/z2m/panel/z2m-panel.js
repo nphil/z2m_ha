@@ -46,6 +46,9 @@ class Z2MPanel extends HTMLElement {
     const first = !this._hass;
     this._hass = hass;
     if (first) this._boot();
+    // HA re-sets `hass` on every state change; refresh only the firmware card so
+    // live update progress appears without re-rendering the whole view.
+    else this._syncFw();
   }
   set narrow(v) {
     this._narrow = v;
@@ -161,6 +164,7 @@ class Z2MPanel extends HTMLElement {
               border-radius:9px; background:var(--secondary-background-color);
               color:var(--secondary-text-color); }
       .chip.off { background:var(--error-color,#db4437); color:#fff; }
+      .chip.warn { background:var(--warning-color,#ffa600); color:#000; }
       .empty { padding:32px 16px; text-align:center; color:var(--secondary-text-color); }
       .field { display:flex; align-items:center; gap:12px; padding:12px 16px; }
       .field + .field { border-top:1px solid var(--divider-color); }
@@ -197,6 +201,7 @@ class Z2MPanel extends HTMLElement {
     else if (this._view.name === 'device') body = this._deviceView(this._view.ieee);
     else if (this._view.name === 'network') body = this._networkView();
     else if (this._view.name === 'groups') body = this._groupsView();
+    else if (this._view.name === 'ota') body = this._otaView();
     else body = this._dashboard();
 
     const title =
@@ -247,6 +252,152 @@ class Z2MPanel extends HTMLElement {
     return left ? `${left}s` : 'Open';
   }
 
+  /* --------------------------------------------------------------- firmware */
+  //
+  // Firmware state is read from Home Assistant's own `update` entity for the device
+  // rather than parsed a second time from MQTT. Z2M already feeds installed_version /
+  // latest_version / in_progress / update_percentage into it, so this cannot disagree
+  // with what HA's native update UI shows.
+
+  _fw(d) {
+    const eid = d && d.update_entity;
+    if (!eid || !this._hass || !this._hass.states) return null;
+    const s = this._hass.states[eid];
+    if (!s) return null;
+    const a = s.attributes || {};
+    const iv = a.installed_version;
+    const lv = a.latest_version;
+    // Z2M publishes -1 for "never assessed" -- it has not asked the OTA index yet.
+    const unset = (v) => v === null || v === undefined || String(v) === '-1';
+    return {
+      entity: eid,
+      available: s.state === 'on',
+      unavailable: s.state === 'unavailable',
+      installed: iv,
+      latest: lv,
+      assessed: !(unset(iv) || unset(lv)),
+      inProgress: !!a.in_progress,
+      pct: a.update_percentage,
+    };
+  }
+
+  _fwInner(d) {
+    const battery = d.power_source && d.power_source !== 'Mains (single phase)';
+    const f = this._fw(d);
+
+    if (!f) {
+      return `<div class="sectionhdr"><h2>Firmware</h2></div>
+        <div class="row"><div class="grow sub">This device reports no OTA support,
+        so Zigbee2MQTT exposes no update entity for it.</div></div>`;
+    }
+
+    let status, cls = '';
+    if (f.inProgress) {
+      status = `Updating${f.pct != null ? ` — ${f.pct}%` : ''}`;
+    } else if (f.unavailable) {
+      status = 'Device unreachable';
+      cls = 'bad';
+    } else if (!f.assessed) {
+      status = 'Not assessed';
+    } else if (f.available) {
+      status = 'Update available';
+      cls = 'warn';
+    } else {
+      status = 'Up to date';
+      cls = 'ok';
+    }
+
+    const ver = (v) => (v === null || v === undefined || String(v) === '-1' ? '—' : esc(String(v)));
+
+    return `
+      <div class="sectionhdr"><h2>Firmware</h2>
+        <span class="chip ${cls === 'bad' ? 'off' : ''}">${esc(status)}</span></div>
+      <div class="kv"><div class="k">Installed</div><div class="v">${ver(f.installed)}</div></div>
+      <div class="kv"><div class="k">Latest known</div><div class="v">${ver(f.latest)}</div></div>
+      ${f.inProgress && f.pct != null ? `
+        <div class="kv"><div class="k">Progress</div><div class="v">${f.pct}%</div></div>` : ''}
+      ${!f.assessed ? `
+        <div class="row"><div class="grow sub">Zigbee2MQTT has never asked the OTA index
+        about this device. Check to populate it.</div></div>` : ''}
+      <div class="row">
+        <div class="grow sub">${battery
+          ? 'Battery device: schedule the update and it applies when the device next wakes.'
+          : 'Checking only contacts the firmware index; it never installs.'}</div>
+        ${f.inProgress
+          ? `<button class="pill ghost" id="fwabort">Abort</button>`
+          : `<button class="pill ghost" id="fwcheck">Check</button>
+             ${f.available && !battery ? `<button class="pill" id="fwinstall">Install</button>` : ''}
+             ${f.available && battery ? `<button class="pill" id="fwsched">Schedule</button>` : ''}`}
+      </div>`;
+  }
+
+  _wireFw(d) {
+    const r = this.shadowRoot;
+    const on = (id, fn) => { const el = r.getElementById(id); if (el) el.onclick = fn; };
+    const device = d.ieee_address;
+    on('fwcheck', () => this._act('z2m/ota/check', { device }));
+    on('fwabort', () => {
+      if (confirm('Abort the firmware update in progress?')) this._act('z2m/ota/abort', { device });
+    });
+    on('fwinstall', () => {
+      if (!confirm(`Install firmware on ${d.friendly_name}?\n\n`
+        + 'Do not cut power during an update. A mains device is unusable while it flashes.'))
+        return;
+      this._act('z2m/ota/update', { device });
+    });
+    on('fwsched', () => this._act('z2m/ota/schedule', { device }));
+  }
+
+  /** Patch only the firmware card, so a state push cannot clobber typing elsewhere. */
+  _syncFw() {
+    const r = this.shadowRoot;
+    if (!r) return;
+    if (this._view.name === 'ota') { this._render(); return; }
+    const box = r.getElementById('fwbox');
+    if (!box || this._view.name !== 'device') return;
+    const d = this._dev(this._view.ieee);
+    if (!d) return;
+    const html = this._fwInner(d);
+    if (html === this._lastFw) return;
+    this._lastFw = html;
+    box.innerHTML = html;
+    this._wireFw(d);
+  }
+
+  /* ------------------------------------------------------------- ota view */
+
+  _otaView() {
+    const rows = this._devices
+      .filter((d) => d.update_entity)
+      .map((d) => {
+        const f = this._fw(d) || {};
+        let tag = '<span class="chip">not assessed</span>';
+        if (f.inProgress) tag = `<span class="chip warn">${f.pct ?? 0}%</span>`;
+        else if (f.unavailable) tag = '<span class="chip off">offline</span>';
+        else if (f.available) tag = '<span class="chip warn">update</span>';
+        else if (f.assessed) tag = '<span class="chip">up to date</span>';
+        return `<div class="row tap" data-ieee="${esc(d.ieee_address)}">
+          ${svg(ICONS.ota, 20)}
+          <div class="grow">
+            <div class="title">${esc(d.friendly_name)}</div>
+            <div class="sub">${esc([d.vendor, d.model].filter(Boolean).join(' · '))}</div>
+          </div>${tag}${svg(ICONS.chevron, 20)}</div>`;
+      })
+      .join('');
+
+    const n = this._devices.filter((d) => d.update_entity).length;
+    return `
+      <div class="card">
+        <div class="row">
+          <div class="grow"><div class="title">Check all ${n} devices</div>
+          <div class="sub">Staggered a few seconds apart on purpose: a burst of queries
+          is heavy on the coordinator.</div></div>
+          <button class="pill ghost" id="checkall">Check all</button>
+        </div>
+      </div>
+      <div class="card">${rows || '<div class="empty">No OTA-capable devices.</div>'}</div>`;
+  }
+
   /* -------------------------------------------------------------- dashboard */
 
   _dashboard() {
@@ -287,6 +438,19 @@ class Z2MPanel extends HTMLElement {
           <div class="grow"><div class="title">Add device</div>
             <div class="sub">${s.permit_join ? 'Joining is OPEN — tap to close' : 'Open the network for pairing'}</div></div>
           <span class="trail">${s.permit_join ? this._joinLeft(s) : 'Off'}</span>${svg(ICONS.chevron, 20)}
+        </div>
+        <div class="row tap" data-go="ota">
+          ${svg(ICONS.ota)}
+          <div class="grow"><div class="title">Firmware</div>
+            <div class="sub">${(() => {
+              const cap = this._devices.filter((x) => x.update_entity);
+              const avail = cap.filter((x) => (this._fw(x) || {}).available).length;
+              const unass = cap.filter((x) => !(this._fw(x) || {}).assessed).length;
+              if (avail) return `${avail} update${avail > 1 ? 's' : ''} available`;
+              if (unass) return `${unass} of ${cap.length} not assessed yet`;
+              return `${cap.length} devices, all up to date`;
+            })()}</div></div>
+          ${svg(ICONS.chevron, 20)}
         </div>
         <div class="row tap" data-go="network">
           ${svg(ICONS.info)}
@@ -403,6 +567,8 @@ class Z2MPanel extends HTMLElement {
         <div class="row"><div class="grow sub">Written straight to Zigbee2MQTT.</div>
         <button class="pill" id="dooptions">Save settings</button></div></div>` : ''}
 
+      <div class="card"><div id="fwbox">${this._fwInner(d)}</div></div>
+
       <div class="card">
         <div class="sectionhdr"><h2>Maintenance</h2></div>
         <div class="row"><div class="grow"><div class="title">Reconfigure</div>
@@ -411,9 +577,6 @@ class Z2MPanel extends HTMLElement {
         <div class="row"><div class="grow"><div class="title">Re-interview</div>
           <div class="sub">Rebuild what Z2M knows about this device</div></div>
           <button class="pill ghost" id="dointerview">Interview</button></div>
-        <div class="row"><div class="grow"><div class="title">Check for firmware update</div>
-          <div class="sub">Automatic checks are disabled by design</div></div>
-          <button class="pill ghost" id="dootacheck">Check</button></div>
       </div>
 
       <div class="card">
@@ -515,6 +678,19 @@ class Z2MPanel extends HTMLElement {
       await this._act('z2m/permit_join', { time: s.permit_join ? 0 : 254 });
     });
     on('health', () => this._act('z2m/health_check'));
+
+    // Stagger deliberately. A burst of per-device queries is real load on the
+    // coordinator, and Z2M serialises them per device with a 10s timeout each.
+    on('checkall', async () => {
+      const cap = this._devices.filter((x) => x.update_entity);
+      if (!confirm(`Check firmware on ${cap.length} devices?\n\n`
+        + 'Spread ~4s apart to stay gentle on the coordinator.')) return;
+      for (const d of cap) {
+        try { await this._call('z2m/ota/check', { device: d.ieee_address }); } catch (e) { /* keep going */ }
+        await new Promise((r) => setTimeout(r, 4000));
+      }
+      this._refresh();
+    });
     on('backup', () => this._act('z2m/backup'));
     on('restart', () => {
       if (confirm('Restart Zigbee2MQTT? All Zigbee devices are briefly unavailable.'))
@@ -528,13 +704,14 @@ class Z2MPanel extends HTMLElement {
         if (!to || to === d.friendly_name) return;
         await this._act('z2m/device/rename', { from: d.friendly_name, to });
       });
-      on('doconfigure', () => this._act('z2m/device/configure', { id: d.ieee_address }));
-      on('dointerview', () => this._act('z2m/device/interview', { id: d.ieee_address }));
-      on('dootacheck', () => this._act('z2m/ota/check', { id: d.ieee_address }));
+      on('doconfigure', () => this._act('z2m/device/configure', { device: d.ieee_address }));
+      on('dointerview', () => this._act('z2m/device/interview', { device: d.ieee_address }));
+      this._wireFw(d);
+      this._lastFw = this._fwInner(d);
       on('doremove', () => {
         if (!confirm(`Remove ${d.friendly_name} from the Zigbee network?`)) return;
         const force = confirm('Device unreachable? OK = force removal (needs a factory reset before it can pair again).');
-        this._act('z2m/device/remove', { id: d.ieee_address, force });
+        this._act('z2m/device/remove', { device: d.ieee_address, force });
       });
       on('dooptions', async () => {
         const options = {};
@@ -546,7 +723,7 @@ class Z2MPanel extends HTMLElement {
           }
         });
         if (!Object.keys(options).length) return;
-        await this._act('z2m/device/options', { id: d.ieee_address, options });
+        await this._act('z2m/device/options', { device: d.ieee_address, options });
       });
     }
   }

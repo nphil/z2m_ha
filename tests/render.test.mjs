@@ -67,9 +67,17 @@ if (!Panel) throw new Error('z2m-panel was never registered');
 
 // ---- drive it -------------------------------------------------------------
 const sent = [];
+const reservedKeyUse = [];
 const hass = {
+  // The panel reads firmware from HA's own `update` entities, so the stub must
+  // carry states just like the real hass object does.
+  states: fx.states,
   connection: {
     sendMessagePromise: (msg) => {
+      // Home Assistant assigns the websocket envelope `id` itself and overwrites
+      // whatever the caller put there. A command that uses `id` as a parameter
+      // therefore loses it silently -- which shipped once, so it is asserted here.
+      if (Object.prototype.hasOwnProperty.call(msg, 'id')) reservedKeyUse.push(msg.type);
       sent.push(msg);
       if (msg.type === 'z2m/info') return Promise.resolve(fx.info);
       if (msg.type === 'z2m/devices') return Promise.resolve(fx.devices);
@@ -134,7 +142,7 @@ check(`rendered ${rendered.length} option fields`,
 check('has rename', html().includes('dorename'));
 check('has reconfigure', html().includes('doconfigure'));
 check('has re-interview', html().includes('dointerview'));
-check('has OTA check', html().includes('dootacheck'));
+check('has firmware card', html().includes('id="fwbox"'));
 check('has remove', html().includes('doremove'));
 
 console.log('=== every device detail renders ===');
@@ -153,6 +161,70 @@ check('withholds network key', !html().toLowerCase().includes('network_key'));
 p._go({ name: 'groups' });
 check('lists groups', fx.groups.every((g) => html().includes(esc(g.friendly_name))));
 
+console.log('=== firmware: device card ===');
+// Mains device with an update available -> Install offered, not Schedule.
+p._go({ name: 'device', ieee: '0x0000000000000001' });
+check('firmware card rendered', html().includes('Firmware'));
+check('shows installed version', html().includes('2.15'));
+check('shows latest version', html().includes('2.18'));
+check('flags update available', html().includes('Update available'));
+check('offers Install for mains device', html().includes('fwinstall'));
+check('no Schedule for mains device', !html().includes('fwsched'));
+check('offers Check', html().includes('fwcheck'));
+
+// Battery device -> Schedule instead of Install, because it is asleep.
+p._go({ name: 'device', ieee: '0x0000000000000002' });
+check('battery device offers Schedule', html().includes('fwsched'));
+check('battery device hides Install', !html().includes('fwinstall'));
+check('explains the wake-up behaviour', html().includes('next wakes'));
+
+// Z2M publishes -1/-1 when it has never consulted the OTA index.
+p._go({ name: 'device', ieee: '0x0000000000000004' });
+check('-1 renders as Not assessed', html().includes('Not assessed'));
+check('-1 is not shown as a version', !html().includes('>-1<'));
+
+// Device with no OTA support at all.
+p._go({ name: 'device', ieee: '0x0000000000000003' });
+check('no-OTA device explains itself', html().includes('no OTA support'));
+check('no-OTA device offers no buttons', !html().includes('fwcheck'));
+
+console.log('=== firmware: fleet view ===');
+p._go({ name: 'ota' });
+const otaDevs = fx.devices.filter((d) => d.update_entity);
+check(`lists all ${otaDevs.length} OTA-capable devices`,
+  otaDevs.every((d) => html().includes(esc(d.friendly_name))));
+check('excludes non-OTA device', !html().includes('Unknown Gadget'));
+check('has Check all', html().includes('checkall'));
+check('warns that check-all is staggered', html().includes('seconds apart'));
+
+console.log('=== firmware: commands ===');
+p._go({ name: 'device', ieee: '0x0000000000000001' });
+sent.length = 0;
+p.shadowRoot.getElementById('fwcheck')._onclick();
+await new Promise((r) => setTimeout(r, 20));
+check('Check -> z2m/ota/check', sent.some((m) => m.type === 'z2m/ota/check'
+  && m.device === '0x0000000000000001'));
+sent.length = 0;
+p.shadowRoot.getElementById('fwinstall')._onclick();
+await new Promise((r) => setTimeout(r, 20));
+check('Install -> z2m/ota/update', sent.some((m) => m.type === 'z2m/ota/update'));
+
+console.log('=== firmware: live progress patch ===');
+// Simulate HA pushing an in-progress update; only the firmware card should change.
+hass.states['update.hallway_dimmer'] = {
+  state: 'on',
+  attributes: { installed_version: '2.15', latest_version: '2.18',
+                in_progress: true, update_percentage: 42 },
+};
+p.hass = hass;
+// _syncFw patches the firmware card's own innerHTML rather than re-rendering the
+// view, so assert against that element -- the shadow root's html is intentionally
+// left untouched, which is the whole point of the targeted patch.
+const fwbox = p.shadowRoot.getElementById('fwbox');
+check('progress patched into the firmware card', String(fwbox.innerHTML).includes('42'));
+check('Abort replaces Check while updating', String(fwbox.innerHTML).includes('fwabort'));
+check('view was NOT fully re-rendered', !html().includes('42'));
+
 console.log('=== actions call the right commands ===');
 p._go({ name: 'dashboard' });
 sent.length = 0;
@@ -163,6 +235,13 @@ sent.length = 0;
 p.shadowRoot.getElementById('restart')._onclick();
 await new Promise((r) => setTimeout(r, 20));
 check('Restart -> z2m/restart', sent.some((m) => m.type === 'z2m/restart'));
+
+console.log('=== websocket envelope contract ===');
+check(`no command uses the reserved 'id' key (${reservedKeyUse.length} offenders)`,
+  reservedKeyUse.length === 0, reservedKeyUse.join(', '));
+check('device-targeted commands carry `device`',
+  sent.filter((m) => /device|ota/.test(m.type))
+      .every((m) => !('id' in m)));
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) =>

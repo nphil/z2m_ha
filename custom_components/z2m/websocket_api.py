@@ -12,6 +12,7 @@ import voluptuous as vol
 
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
 from .const import DOMAIN, SIGNAL_UPDATE
@@ -43,6 +44,9 @@ def async_setup_websocket(hass: HomeAssistant) -> None:
         ws_backup,
         ws_ota_check,
         ws_ota_update,
+        ws_ota_abort,
+        ws_ota_schedule,
+        ws_ota_unschedule,
         ws_set_log_level,
         ws_restart,
     ):
@@ -76,7 +80,47 @@ async def ws_info(hass, connection, msg, data) -> None:
 @websocket_api.async_response
 @_guard
 async def ws_devices(hass, connection, msg, data) -> None:
-    connection.send_result(msg["id"], data.device_list())
+    connection.send_result(msg["id"], _with_update_entities(hass, data.device_list()))
+
+
+def _with_update_entities(hass: HomeAssistant, devices: list[dict]) -> list[dict]:
+    """Attach each device's Home Assistant `update` entity id.
+
+    Z2M's MQTT discovery already gives every OTA-capable device an `update` entity,
+    and the MQTT integration keeps installed_version / latest_version / in_progress /
+    update_percentage on it from the per-device topics. Reusing that beats
+    subscribing to another 47 topics to parse the same numbers a second time, and it
+    means the panel and HA's own update UI can never disagree.
+
+    Devices are matched by the IEEE suffix of the MQTT identifier
+    (`<base_topic>_0x...`) rather than by a hardcoded prefix, so a renamed base topic
+    does not silently break the mapping.
+    """
+    dev_reg = dr.async_get(hass)
+    ent_reg = er.async_get(hass)
+
+    by_ieee: dict[str, str] = {}
+    for entry in dev_reg.devices.values():
+        for domain, ident in entry.identifiers:
+            if domain != "mqtt":
+                continue
+            suffix = ident.rsplit("_", 1)[-1]
+            if suffix.startswith("0x"):
+                by_ieee[suffix] = entry.id
+
+    out = []
+    for device in devices:
+        entity_id = None
+        device_id = by_ieee.get(device.get("ieee_address"))
+        if device_id is not None:
+            for entity in er.async_entries_for_device(
+                ent_reg, device_id, include_disabled_entities=True
+            ):
+                if entity.domain == "update":
+                    entity_id = entity.entity_id
+                    break
+        out.append({**device, "update_entity": entity_id})
+    return out
 
 
 @websocket_api.websocket_command({vol.Required("type"): "z2m/groups"})
@@ -146,7 +190,7 @@ async def ws_rename(hass, connection, msg, data) -> None:
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "z2m/device/remove",
-        vol.Required("id"): str,
+        vol.Required("device"): str,
         vol.Optional("force", default=False): bool,
         vol.Optional("block", default=False): bool,
     }
@@ -156,7 +200,7 @@ async def ws_rename(hass, connection, msg, data) -> None:
 async def ws_remove(hass, connection, msg, data) -> None:
     await data.async_request(
         "device/remove",
-        {"id": msg["id"], "force": msg["force"], "block": msg["block"]},
+        {"id": msg["device"], "force": msg["force"], "block": msg["block"]},
     )
     connection.send_result(msg["id"])
 
@@ -165,7 +209,7 @@ async def ws_remove(hass, connection, msg, data) -> None:
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "z2m/device/options",
-        vol.Required("id"): str,
+        vol.Required("device"): str,
         vol.Required("options"): dict,
     }
 )
@@ -173,30 +217,30 @@ async def ws_remove(hass, connection, msg, data) -> None:
 @_guard
 async def ws_set_options(hass, connection, msg, data) -> None:
     await data.async_request(
-        "device/options", {"id": msg["id"], "options": msg["options"]}
+        "device/options", {"id": msg["device"], "options": msg["options"]}
     )
     connection.send_result(msg["id"])
 
 
 @websocket_api.require_admin
 @websocket_api.websocket_command(
-    {vol.Required("type"): "z2m/device/configure", vol.Required("id"): str}
+    {vol.Required("type"): "z2m/device/configure", vol.Required("device"): str}
 )
 @websocket_api.async_response
 @_guard
 async def ws_configure(hass, connection, msg, data) -> None:
-    await data.async_request("device/configure", {"id": msg["id"]})
+    await data.async_request("device/configure", {"id": msg["device"]})
     connection.send_result(msg["id"])
 
 
 @websocket_api.require_admin
 @websocket_api.websocket_command(
-    {vol.Required("type"): "z2m/device/interview", vol.Required("id"): str}
+    {vol.Required("type"): "z2m/device/interview", vol.Required("device"): str}
 )
 @websocket_api.async_response
 @_guard
 async def ws_interview(hass, connection, msg, data) -> None:
-    await data.async_request("device/interview", {"id": msg["id"]})
+    await data.async_request("device/interview", {"id": msg["device"]})
     connection.send_result(msg["id"])
 
 
@@ -218,25 +262,99 @@ async def ws_backup(hass, connection, msg, data) -> None:
     connection.send_result(msg["id"])
 
 
+# NOTE: `id` is reserved by Home Assistant's websocket envelope (every message
+# carries a numeric id), so device-targeted commands take `device` and map it onto
+# Z2M's own `id` field when building the bridge/request payload. Using `id` here
+# silently loses the device: the frontend overwrites it with the message id.
+# ---------------------------------------------------------------------- firmware
+#
+# Z2M 2.13 dispatches on
+#   bridge/request/device/ota_update/(update|check|schedule|unschedule)/?(downgrade|abort)?
+# read from the add-on image's own compiled otaUpdate.js. `check` also republishes the
+# device's update state, which is what populates HA's `update` entity -- so with
+# ota.disable_automatic_update_check on, a check here is the only thing that ever
+# fills in latest_version.
+
+
 @websocket_api.require_admin
 @websocket_api.websocket_command(
-    {vol.Required("type"): "z2m/ota/check", vol.Required("id"): str}
+    {
+        vol.Required("type"): "z2m/ota/check",
+        vol.Required("device"): str,
+        vol.Optional("downgrade", default=False): bool,
+    }
 )
 @websocket_api.async_response
 @_guard
 async def ws_ota_check(hass, connection, msg, data) -> None:
-    await data.async_request("device/ota_update/check", {"id": msg["id"]})
+    path = "device/ota_update/check"
+    if msg["downgrade"]:
+        path += "/downgrade"
+    await data.async_request(path, {"id": msg["device"]})
     connection.send_result(msg["id"])
 
 
 @websocket_api.require_admin
 @websocket_api.websocket_command(
-    {vol.Required("type"): "z2m/ota/update", vol.Required("id"): str}
+    {
+        vol.Required("type"): "z2m/ota/update",
+        vol.Required("device"): str,
+        vol.Optional("downgrade", default=False): bool,
+    }
 )
 @websocket_api.async_response
 @_guard
 async def ws_ota_update(hass, connection, msg, data) -> None:
-    await data.async_request("device/ota_update/update", {"id": msg["id"]})
+    path = "device/ota_update/update"
+    if msg["downgrade"]:
+        path += "/downgrade"
+    await data.async_request(path, {"id": msg["device"]})
+    connection.send_result(msg["id"])
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {vol.Required("type"): "z2m/ota/abort", vol.Required("device"): str}
+)
+@websocket_api.async_response
+@_guard
+async def ws_ota_abort(hass, connection, msg, data) -> None:
+    """Stop an update that is already streaming blocks to the device."""
+    await data.async_request("device/ota_update/update/abort", {"id": msg["device"]})
+    connection.send_result(msg["id"])
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "z2m/ota/schedule",
+        vol.Required("device"): str,
+        vol.Optional("downgrade", default=False): bool,
+    }
+)
+@websocket_api.async_response
+@_guard
+async def ws_ota_schedule(hass, connection, msg, data) -> None:
+    """Queue an update for a sleeping device: it applies when the device next wakes.
+
+    This is the only workable path for battery devices, which are not listening when
+    an immediate update would try to stream to them.
+    """
+    path = "device/ota_update/schedule"
+    if msg["downgrade"]:
+        path += "/downgrade"
+    await data.async_request(path, {"id": msg["device"]})
+    connection.send_result(msg["id"])
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {vol.Required("type"): "z2m/ota/unschedule", vol.Required("device"): str}
+)
+@websocket_api.async_response
+@_guard
+async def ws_ota_unschedule(hass, connection, msg, data) -> None:
+    await data.async_request("device/ota_update/unschedule", {"id": msg["device"]})
     connection.send_result(msg["id"])
 
 
