@@ -1354,22 +1354,66 @@ class Z2MData:
             raise Z2MError(
                 f"Zigbee2MQTT does not know a device or group called '{target}'"
             )
-        endpoints: list[dict[str, Any]] = []
-        union: dict[Any, dict[str, Any]] = {}
-        for number, endpoint in self._sorted_endpoints(device):
-            scenes = [s for s in endpoint.get("scenes") or [] if isinstance(s, dict)]
-            endpoints.append(
-                {"endpoint": number, "name": endpoint.get("name"), "scenes": scenes}
-            )
-            for scene in scenes:
-                union.setdefault(scene.get("id"), scene)
+        endpoints = [
+            {"endpoint": number, "name": endpoint.get("name"),
+             "scenes": [s for s in endpoint.get("scenes") or [] if isinstance(s, dict)]}
+            for number, endpoint in self._sorted_endpoints(device)
+        ]
         return {
             "target": device.get("ieee_address"),
             "kind": "device",
             "friendly_name": device.get("friendly_name"),
-            "scenes": list(union.values()),
+            "scenes": self._device_scenes(device),
             "endpoints": endpoints,
         }
+
+    @callback
+    def _device_scenes(self, device: dict[str, Any]) -> list[dict[str, Any]]:
+        """One device's scenes, unioned across its endpoints.
+
+        A device entry carries no top-level `scenes` field -- the Zigbee scene table
+        is per endpoint, so per endpoint is where Z2M reports it, and a two-gang
+        switch can genuinely hold different scenes on each gang. Unioned here because
+        the device list is one row per device; the breakdown is what z2m/scenes gives.
+
+        Where two endpoints hold the same scene id the first name wins, which is
+        endpoint order because _sorted_endpoints is numeric.
+        """
+        union: dict[Any, dict[str, Any]] = {}
+        for _, endpoint in self._sorted_endpoints(device):
+            for scene in endpoint.get("scenes") or []:
+                if isinstance(scene, dict):
+                    union.setdefault(scene.get("id"), scene)
+        return list(union.values())
+
+    @callback
+    def _option_values(self, ieee: Any) -> dict[str, Any]:
+        """The device option values currently in force, defaults included.
+
+        NOT from bridge/devices, which is the trap: a device entry there carries no
+        options at all, only `disabled` and `description`. The values live on
+        bridge/info, where Z2M publishes its entire settings object as `config` --
+        `config.device_options` for the fleet-wide defaults and
+        `config.devices["<ieee>"]` for this device's own overrides. Merged in that
+        order, because that is the precedence Z2M itself applies, so a form bound to
+        this shows the value actually in effect rather than a blank where a default
+        is doing the work.
+
+        Live, not a snapshot: Z2M republishes bridge/info on every option write.
+        """
+        config = self.info.get("config")
+        if not isinstance(config, dict):
+            return {}
+        values: dict[str, Any] = {}
+        defaults = config.get("device_options")
+        if isinstance(defaults, dict):
+            values.update(defaults)
+        devices = config.get("devices")
+        if isinstance(devices, dict) and isinstance(ieee, str):
+            own = devices.get(ieee)
+            if isinstance(own, dict):
+                values.update(own)
+        return values
 
     @callback
     def _scene_ids(self, target: Any) -> set[Any] | None:
@@ -2372,15 +2416,17 @@ class Z2MData:
                     "exposes": defn.get("exposes") or [],
                     "options": defn.get("options") or [],
                     # The SCHEMA above describes the fields; this is what they are
-                    # currently SET to. Z2M keeps the two in different places --
-                    # `definition.options` is per model, `options` is per device --
-                    # and a settings form needs both or it renders every field
-                    # blank. Kept as separate keys because a device with no
-                    # overrides still has a schema, and vice versa.
-                    "option_values": (
-                        d["options"] if isinstance(d.get("options"), dict) else {}
-                    ),
-                    "scenes": d.get("scenes") or [],
+                    # currently SET to, and the two come from DIFFERENT TOPICS. A
+                    # bridge/devices entry carries no options at all, so reading them
+                    # from `d` would leave every field in a settings form blank; the
+                    # values are on bridge/info under config.devices/<ieee>, merged
+                    # over config.device_options. Kept as separate keys because a
+                    # device with no overrides still has a schema, and vice versa.
+                    "option_values": self._option_values(d.get("ieee_address")),
+                    # Also NOT a device-level field in bridge/devices: the Zigbee
+                    # scene table is per endpoint. Unioned so this stays one row per
+                    # device; z2m/scenes has the per-endpoint breakdown.
+                    "scenes": self._device_scenes(d),
                 }
             )
         out.sort(key=lambda x: (x.get("friendly_name") or "").lower())

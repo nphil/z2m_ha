@@ -888,6 +888,45 @@ check('excludes non-OTA device', !html().includes('Unknown Gadget'));
 check('has Check all', !!find('data-act', 'checkall'));
 check('warns that check-all is staggered', html().includes('seconds apart'));
 check('fleet rows are HA rows', html().includes('<ha-md-list-item'));
+// The fleet screen exists to answer "what needs attention", so the counts and the
+// grouping are the feature, not decoration.
+const fleet = p._otaFleet();
+check('counts what it lists', fleet.capable.length === otaDevs.length);
+check('every capable device lands in exactly one bucket',
+  fleet.updating.length + fleet.available.length + fleet.unassessed.length
+    + fleet.offline.length + fleet.current.length === fleet.capable.length);
+check('says how many devices have no OTA support at all',
+  fleet.noOta > 0 && html().includes('report no OTA support at all'));
+check('groups the rows by what they need', html().includes('class="ota-group"'));
+// A device mid-update, with a percentage.
+// Use the device the command tests do not touch, so a mid-update state here cannot
+// change what those see.
+const upIeee = '0x0000000000000004';
+const upEntity = p._dev(upIeee).update_entity;
+hass.states[upEntity] = { state: 'on', attributes: {
+  installed_version: '1.0.0', latest_version: '1.2.0', in_progress: true, update_percentage: 37 } };
+p.hass = hass;
+go('ota');
+check('an update in flight is grouped first',
+  (html().match(/class="ota-group">([^<]*)/) || [])[1].includes('Updating now'));
+check('and shows a determinate bar at the reported percentage',
+  html().includes('aria-valuenow="37"') && html().includes('width:37%'));
+check('with the percentage in words too', html().includes('>37%<'));
+// Z2M reports nothing at all for the first stretch of a transfer.
+hass.states[upEntity] = { state: 'on', attributes: {
+  installed_version: '1.0.0', latest_version: '1.2.0', in_progress: true } };
+p.hass = hass;
+go('ota');
+check('unknown progress is indeterminate, never a fake 0%',
+  html().includes('ota-bar unknown') && !html().includes('aria-valuenow')
+    && !html().includes('>0%<'));
+check('and it says it is starting rather than showing a number',
+  html().includes('>starting<'));
+hass.states[upEntity] = fx.states[upEntity];
+// A fresh object: the setter patches from what changed, and the same reference twice
+// is indistinguishable from nothing having happened.
+p.hass = { ...hass, states: { ...hass.states } };
+go('ota');
 
 console.log('=== firmware: commands ===');
 p._go({ name: 'device', ieee: '0x0000000000000001' });

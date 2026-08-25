@@ -147,6 +147,10 @@ const list = (rows) =>
     ? `<ha-md-list>${rows}</ha-md-list>`
     : `<div role="list" class="mdlist">${rows}</div>`;
 
+/** Zigbee2MQTT publishes -1 for "never asked the OTA index". That is not a version. */
+const fwVersion = (v) =>
+  v === null || v === undefined || String(v) === '-1' ? '\u2014' : esc(String(v));
+
 const card = (body, cls = 'nav-card') =>
   `<ha-card class="${cls}"><div class="card-content">${body}</div></ha-card>`;
 
@@ -619,6 +623,27 @@ class Z2MPanel extends HTMLElement {
       ha-button:focus-visible, ha-icon-button:focus-visible {
               outline:var(--ha-outline-width, 2px) solid var(--primary-color);
               outline-offset:var(--ha-space-1, 4px); }
+      /* Firmware progress. A determinate bar fills; an indeterminate one sweeps,
+       * because Zigbee2MQTT reports nothing for the first stretch of a transfer and
+       * drawing 0% there reads as "stuck". */
+      .ota-group { padding:var(--ha-space-3, 12px) var(--ha-space-4, 16px) 0;
+                   color:var(--secondary-text-color);
+                   font-size:var(--ha-font-size-s, 13px); text-transform:uppercase;
+                   letter-spacing:.04em; }
+      .ota-cell { display:flex; align-items:center; gap:var(--ha-space-2, 8px); }
+      .ota-bar { position:relative; width:72px; height:6px; overflow:hidden;
+                 border-radius:var(--ha-border-radius-pill, 999px);
+                 background:var(--divider-color); }
+      .ota-fill { height:100%; background:var(--warning-color, #ff9800);
+                  transition:width .3s ease; }
+      .ota-bar.unknown .ota-fill { width:40%; animation:otasweep 1.2s ease-in-out infinite; }
+      @keyframes otasweep {
+        0% { transform:translateX(-100%); }
+        100% { transform:translateX(250%); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .ota-bar.unknown .ota-fill { animation:none; width:100%; opacity:.4; }
+      }
       .pair-identity { padding:var(--ha-space-3, 12px) var(--ha-space-4, 16px);
                        border:var(--ha-border-width, 1px) solid var(--divider-color);
                        border-radius:var(--ha-border-radius-md, 8px); }
@@ -1543,8 +1568,7 @@ class Z2MPanel extends HTMLElement {
       chip = 'warn';
     }
 
-    const ver = (v) =>
-      v === null || v === undefined || String(v) === '-1' ? '\u2014' : esc(String(v));
+    const ver = fwVersion;
 
     const buttons = f.inProgress
       ? '<ha-button appearance="plain" size="s" data-act="fwabort">Abort</ha-button>'
@@ -1604,47 +1628,137 @@ class Z2MPanel extends HTMLElement {
 
   /* -------------------------------------------------------------- ota fleet */
 
+  /**
+   * What the fleet's firmware state actually is, counted once.
+   *
+   * Every number here comes from Home Assistant's own `update` entities, which
+   * Zigbee2MQTT feeds, so this cannot disagree with HA's native update UI.
+   */
+  _otaFleet() {
+    const capable = this._devices.filter((d) => d.update_entity);
+    const fleet = {
+      capable,
+      // Devices Z2M exposes no update entity for: they told the network they have no
+      // OTA cluster, so there is nothing to check and nothing to install.
+      noOta: this._devices.filter((d) => !d.update_entity && d.type !== 'Coordinator').length,
+      updating: [],
+      available: [],
+      current: [],
+      unassessed: [],
+      offline: [],
+    };
+    capable.forEach((d) => {
+      const f = this._fw(d);
+      if (!f) return;
+      if (f.inProgress) fleet.updating.push({ d, f });
+      else if (f.unavailable) fleet.offline.push({ d, f });
+      else if (!f.assessed) fleet.unassessed.push({ d, f });
+      else if (f.available) fleet.available.push({ d, f });
+      else fleet.current.push({ d, f });
+    });
+    return fleet;
+  }
+
+  /**
+   * A progress bar, or an indeterminate one when Zigbee2MQTT has not said how far in
+   * it is.
+   *
+   * An OTA transfer reports nothing at all for its first stretch, and drawing 0% for
+   * that is a lie the operator will read as "stuck". Indeterminate says the true
+   * thing: it is running, and how far is not yet known.
+   */
+  _otaProgress(f, id) {
+    const known = f.pct !== null && f.pct !== undefined;
+    return `<div class="ota-bar${known ? '' : ' unknown'}" id="${esc(id)}"
+        role="progressbar" aria-valuemin="0" aria-valuemax="100"${
+          known ? ` aria-valuenow="${esc(f.pct)}"` : ''
+        }>
+        <div class="ota-fill" style="${known ? `width:${Number(f.pct)}%` : ''}"></div>
+      </div>`;
+  }
+
   _otaRows() {
-    const cap = this._devices.filter((d) => d.update_entity);
-    if (!cap.length) return '<div class="empty">No OTA-capable devices.</div>';
-    return list(
-      cap
-        .map((d) => {
-          const f = this._fw(d) || {};
-          let chip = '<span slot="end" class="chip">not assessed</span>';
-          let ico = MDI.firmware;
-          if (f.inProgress) {
-            chip = `<span slot="end" class="chip warn">${esc(f.pct ?? 0)}%</span>`;
-            ico = MDI.updating;
-          } else if (f.unavailable) chip = '<span slot="end" class="chip off">offline</span>';
-          else if (f.available) chip = '<span slot="end" class="chip warn">update</span>';
-          else if (f.assessed) chip = '<span slot="end" class="chip ok">up to date</span>';
-          return row({
-            icon: ico,
-            headline: esc(d.friendly_name),
-            text: esc([d.vendor, d.model].filter(Boolean).join(' \u00b7 ')),
-            data: ` data-ieee="${esc(d.ieee_address)}"`,
-            tap: true,
-            end: `${chip}<ha-icon-next slot="end"></ha-icon-next>`,
-          });
-        })
-        .join('')
-    );
+    const fleet = this._otaFleet();
+    if (!fleet.capable.length) return '<div class="empty">No OTA-capable devices.</div>';
+
+    // Mid-update first, then what can be acted on, then the quiet majority: the
+    // operator came here for the ones that are doing something.
+    const order = [
+      ['Updating now', fleet.updating],
+      ['Update available', fleet.available],
+      ['Never assessed', fleet.unassessed],
+      ['Offline', fleet.offline],
+      ['Up to date', fleet.current],
+    ];
+
+    return order
+      .filter(([, group]) => group.length)
+      .map(([title, group]) => {
+        const rows = group
+          .map(({ d, f }) => {
+            const battery = d.power_source && d.power_source !== 'Mains (single phase)';
+            const id = `otap_${esc(d.ieee_address)}`;
+            let end;
+            if (f.inProgress) {
+              end = `<span slot="end" class="ota-cell">${this._otaProgress(f, id)}<span
+                class="chip warn">${f.pct == null ? 'starting' : `${esc(f.pct)}%`}</span></span>`;
+            } else if (f.unavailable) {
+              end = '<span slot="end" class="chip off">offline</span>';
+            } else if (f.available) {
+              end = `<span slot="end" class="chip warn">${battery ? 'battery' : 'update'}</span>`;
+            } else if (!f.assessed) {
+              end = '<span slot="end" class="chip">not assessed</span>';
+            } else {
+              end = '<span slot="end" class="chip ok">up to date</span>';
+            }
+            return row({
+              icon: f.inProgress ? MDI.updating : MDI.firmware,
+              headline: esc(d.friendly_name),
+              // Z2M publishes -1 for "never asked the OTA index", which is not a
+              // version and must not be rendered as one.
+              text: `${fwVersion(f.installed)} \u2192 ${fwVersion(f.latest)}`,
+              data: ` data-ieee="${esc(d.ieee_address)}"`,
+              tap: true,
+              end: `${end}<ha-icon-next slot="end"></ha-icon-next>`,
+            });
+          })
+          .join('');
+        return `<div class="ota-group">${esc(title)} \u00b7 ${group.length}</div>${list(rows)}`;
+      })
+      .join('');
   }
 
   _otaView() {
-    const n = this._devices.filter((d) => d.update_entity).length;
+    const fleet = this._otaFleet();
+    const n = fleet.capable.length;
+    const summary = [
+      fleet.updating.length ? `${fleet.updating.length} updating` : '',
+      fleet.available.length ? `${fleet.available.length} with an update` : '',
+      fleet.unassessed.length ? `${fleet.unassessed.length} never assessed` : '',
+      `${fleet.current.length} up to date`,
+    ]
+      .filter(Boolean)
+      .join(' \u00b7 ');
+
     return (
       card(
-        list(
-          row({
-            icon: MDI.refresh,
-            headline: `Check all ${n} devices`,
-            text:
-              'Staggered a few seconds apart on purpose: a burst of queries is heavy on the coordinator',
-            end: rowButton('Check all', 'checkall'),
-          })
-        )
+        `<div class="card-header">Firmware across ${n} device${n === 1 ? '' : 's'}</div>
+         <div class="note">${esc(summary)}${
+           fleet.noOta
+             ? ` \u00b7 ${fleet.noOta} device${
+                 fleet.noOta === 1 ? '' : 's'
+               } report no OTA support at all`
+             : ''
+         }</div>` +
+          list(
+            row({
+              icon: MDI.refresh,
+              headline: `Check all ${n} devices`,
+              text:
+                'Staggered a few seconds apart on purpose: a burst of queries is heavy on the coordinator',
+              end: rowButton('Check all', 'checkall'),
+            })
+          )
       ) + `<ha-card class="nav-card"><div id="otalist">${this._otaRows()}</div></ha-card>`
     );
   }
