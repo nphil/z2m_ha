@@ -32,12 +32,16 @@ ZWAVE_PANEL_URL_PATH = "config/zwave_js/dashboard"
 ZWAVE_SIDEBAR_TITLE = "Z-Wave"
 ZWAVE_SIDEBAR_ICON = "mdi:z-wave"
 
-# Signals fired on the HA bus.
+# Signals fired on the HA dispatcher.
 SIGNAL_UPDATE = f"{DOMAIN}_update"  # any mirrored bridge state changed
-SIGNAL_DEVICES = f"{DOMAIN}_devices"  # bridge/devices itself changed
+# bridge/devices inventory changes only; label reconciliation listens to this.
+SIGNAL_DEVICES = f"{DOMAIN}_devices"
+# The panel projections have narrower signals so availability does not reconcile labels.
+SIGNAL_DEVICE_LIST = f"{DOMAIN}_device_list"
+SIGNAL_GROUPS = f"{DOMAIN}_groups"
+SIGNAL_PAIRING = f"{DOMAIN}_pairing"  # one normalized snapshot/event envelope
 SIGNAL_LOG = f"{DOMAIN}_log"  # one new bridge/logging line, passed as the arg
 SIGNAL_MAP = f"{DOMAIN}_map"  # network map scan phase, passed as the arg
-
 # Retained bridge topics we mirror into local state. Each is JSON except `state`,
 # which Z2M publishes as {"state": "online"|"offline"}.
 TOPIC_INFO = "bridge/info"
@@ -52,6 +56,8 @@ BRIDGE_TOPICS = (TOPIC_INFO, TOPIC_DEVICES, TOPIC_GROUPS, TOPIC_STATE, TOPIC_HEA
 # for every MQTT publish -- so it gets its own handler and its own signal rather
 # than joining BRIDGE_TOPICS and re-rendering the panel per line.
 TOPIC_LOGGING = "bridge/logging"
+# Join/interview lifecycle events. Unlike BRIDGE_TOPICS this is not retained.
+TOPIC_EVENT = "bridge/event"
 LOG_BUFFER = 300
 
 # Z2M answers every bridge/request/<x> on bridge/response/<x> with

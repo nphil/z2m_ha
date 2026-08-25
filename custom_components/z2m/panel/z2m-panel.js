@@ -13,20 +13,16 @@
  * then one hydration pass that assigns the JS properties markup cannot carry
  * (`.path`, `.hass`, `.backCallback`, `.topology`, `.scan`) and wires events.
  *
- * Availability of those components is a RUNTIME condition, per element. None of them
- * live in HA's eager `app.*.js`; they ship in lazily loaded chunks. Measured on HA
- * 2026.8.3, a cold load straight onto this URL already has ha-card, ha-md-list-item,
- * ha-svg-icon, ha-icon-next, ha-icon-button, ha-alert and ha-button, and is missing
- * only ha-md-list and hass-subpage -- note the shape of that: the list ITEM is there,
- * only its container is not. `window.loadCardHelpers` does not exist at all on that
- * path, so it is called opportunistically and gates nothing.
- *
- * So the wait is bounded PER ELEMENT and never fatal: whatever is missing degrades in
- * its own spot to a neutral container or another HA component that is present, and
- * anything that shows up later upgrades the page in place. The rows -- where the
- * visual identity lives -- are always genuine ha-md-list-item. There is deliberately
- * no whole-page "components unavailable" screen: there is no case where the page
- * cannot render.
+ * Availability of those components is a runtime condition. On a cold load straight
+ * onto this URL, HA may not yet have fetched ha-md-list or hass-subpage. The panel
+ * paints with the elements that already exist, then upgrades naturally as the rest
+ * arrive. Loading helpers are strictly opportunistic: a helper promise that never
+ * settles must never delay data reads or first paint.
+
+ * There is deliberately no whole-page "components unavailable" screen. A missing
+ * list container falls back to a neutral semantic wrapper while the genuine HA list
+ * rows remain in place, and a missing page shell uses HA header tokens rather than
+ * inventing a second visual system.
  */
 
 /* MDI paths, taken from Home Assistant's own icon set so the iconography matches the
@@ -77,15 +73,15 @@ const HA_ELEMENTS = [
  * on a cold load straight onto the panel URL. */
 const CHROME = 'hass-subpage';
 
-/* Per element, in parallel. A missing element costs at most this much and then the
- * page renders around it. */
-const READY_TIMEOUT_MS = 1500;
 
 /* Matches the backend's own ring buffer, so the view can never claim more history
  * than z2m/logs is able to replay after a reload. */
 const LOG_MAX = 300;
 
 const LOG_LEVELS = ['error', 'warning', 'info', 'debug'];
+
+const PAIR_OPEN_SECONDS = 254;
+const PAIR_LOG_MAX = 24;
 
 const esc = (s) =>
   String(s ?? '').replace(
@@ -157,6 +153,9 @@ class Z2MPanel extends HTMLElement {
     this._summary = null;
     this._devices = [];
     this._groups = [];
+    this._feedErrors = { info: null, devices: null, groups: null };
+    this._feedVersions = { info: 0, devices: 0, groups: 0 };
+    this._feedRequests = { info: 0, devices: 0, groups: 0 };
     this._filter = '';
     this._busy = false;
     this._subs = {};
@@ -165,6 +164,7 @@ class Z2MPanel extends HTMLElement {
     this._logPinned = true;
     this._logTimer = null;
     this._resetMap();
+    this._resetPairing();
     this._diag = { health: null, routers: null, error: null, checked: false };
     this._ticker = null;
     this._counts = '';
@@ -182,6 +182,29 @@ class Z2MPanel extends HTMLElement {
       error: null,
       first: true,
       scan: { generated: null, scanning: false, phase: null, done: 0, total: 0 },
+    };
+  }
+
+  _resetPairing() {
+    const old = this._pairing;
+    if (old && old.wait) clearTimeout(old.wait);
+    this._pairing = {
+      run: ((old && old.run) || 0) + 1,
+      active: false,
+      opening: false,
+      subscribed: false,
+      ownsPermit: false,
+      closing: false,
+      pairing: null,
+      target: null,
+      phase: 'idle',
+      supported: null,
+      definition: null,
+      logs: [],
+      error: null,
+      notice: null,
+      setup: { saving: false, completed: false, device: null },
+      wait: null,
     };
   }
 
@@ -224,6 +247,7 @@ class Z2MPanel extends HTMLElement {
   }
 
   disconnectedCallback() {
+    this._leavePairing();
     Object.keys(this._subs).forEach((k) => this._unsub(k));
     this._stopTicker();
     if (this._logTimer) {
@@ -232,49 +256,48 @@ class Z2MPanel extends HTMLElement {
     }
   }
 
-  async _boot() {
+  _boot() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
-    await this._warmUp();
-    await this._refresh();
-    // Push updates: the backend fires on every retained bridge topic change.
+
+    // Paint before any network or helper work. A cold panel is useful immediately,
+    // even while the individual feeds are still being read.
+    this._render();
+    this._warmUp();
+
+    // Retained feeds make command responses authoritative without a guessed delay.
+    // They stay independent: one unavailable bridge topic never blanks the others.
     this._sub('summary', { type: 'z2m/subscribe' }, (ev) => {
       if (!ev || !ev.summary) return;
-      this._summary = ev.summary;
-      // The map and log views own their DOM; re-rendering would throw away the
-      // operator's graph layout or scroll position for a header line they cannot see.
-      if (this._view.name === 'map' || this._view.name === 'logs') return;
-      this._render();
-    });
+      this._applyFeed('info', ev.summary);
+    }).catch((err) => this._failFeed('info', err));
+    this._sub('devices', { type: 'z2m/devices/subscribe' }, (ev) => {
+      this._receiveDevices(ev);
+    }).catch((err) => this._failFeed('devices', err));
+    this._sub('groups', { type: 'z2m/groups/subscribe' }, (ev) => {
+      this._receiveGroups(ev);
+    }).catch((err) => this._failFeed('groups', err));
+    this._refresh();
   }
 
   /**
-   * Give HA's components a chance to be defined before the first paint, then render
-   * regardless. The wait is per element and in parallel, so one missing element costs
-   * its own timeout and nothing else, and it can never stop the page from rendering.
-   *
-   * `loadCardHelpers` is the documented warm-up hook, but it is installed by the
-   * Lovelace bundle -- measured absent on a cold load of this URL -- so it is called
-   * opportunistically and its absence is not a failure and gates nothing.
+   * Warm-up must be wholly nonblocking. Late component definitions simply request a
+   * new render; neither a missing custom element nor a never-settling card-helper
+   * promise is allowed to stand between the operator and the panel.
    */
-  async _warmUp() {
+  _warmUp() {
     try {
-      const warm = typeof window !== 'undefined' && window.loadCardHelpers && window.loadCardHelpers();
-      if (warm && typeof warm.then === 'function') await warm;
+      const warm =
+        typeof window !== 'undefined' && window.loadCardHelpers && window.loadCardHelpers();
+      Promise.resolve(warm).catch(() => {});
     } catch (_) {
-      /* opportunistic only */
+      /* helper warm-up is optional */
     }
-    await Promise.all(
-      HA_ELEMENTS.map((name) =>
-        Promise.race([
-          customElements.whenDefined(name),
-          new Promise((r) => setTimeout(r, READY_TIMEOUT_MS)),
-        ])
-      )
-    );
-    // Anything that arrives later still upgrades the page in place: _render is
-    // memoised on its own markup, so this costs one comparison per late arrival.
     HA_ELEMENTS.forEach((name) => {
-      if (!this._has(name)) customElements.whenDefined(name).then(() => this._render());
+      Promise.resolve(customElements.whenDefined(name))
+        .then(() => {
+          if (this._hass) this._render();
+        })
+        .catch(() => {});
     });
   }
 
@@ -288,7 +311,18 @@ class Z2MPanel extends HTMLElement {
 
   _sub(key, msg, cb) {
     this._unsub(key);
-    this._subs[key] = this._hass.connection.subscribeMessage(cb, msg);
+    try {
+      const subscription = Promise.resolve(this._hass.connection.subscribeMessage(cb, msg));
+      this._subs[key] = subscription;
+      return subscription;
+    } catch (err) {
+      const failed = Promise.reject(err);
+      // Keep a rejected subscription observable to callers without letting a
+      // fire-and-forget global feed create an unhandled rejection.
+      failed.catch(() => {});
+      this._subs[key] = failed;
+      return failed;
+    }
   }
 
   _unsub(key) {
@@ -300,21 +334,68 @@ class Z2MPanel extends HTMLElement {
       .catch(() => {});
   }
 
-  async _refresh() {
+  _feedMessage(err, fallback) {
+    return (err && (err.message || err.code)) || fallback;
+  }
+
+  _applyFeed(key, value) {
+    if (key === 'info') this._summary = value || null;
+    else if (key === 'devices') this._devices = Array.isArray(value) ? value : [];
+    else if (key === 'groups') this._groups = Array.isArray(value) ? value : [];
+    this._feedVersions[key] += 1;
+    this._feedErrors[key] = null;
+    this._renderFeedUpdate();
+  }
+
+  _failFeed(key, err) {
+    this._feedErrors[key] = this._feedMessage(err, `Could not load ${key}`);
+    this._renderFeedUpdate();
+  }
+
+  _renderFeedUpdate() {
+    // The map and standalone log viewer own live DOM that a feed refresh cannot
+    // improve. Pairing and group views, on the other hand, need retained updates.
+    if (this._view.name !== 'map' && this._view.name !== 'logs') this._render();
+  }
+
+  _arrayPayload(ev, key) {
+    if (Array.isArray(ev)) return ev;
+    return ev && Array.isArray(ev[key]) ? ev[key] : null;
+  }
+
+  _receiveDevices(ev) {
+    const devices = this._arrayPayload(ev, 'devices');
+    if (!devices) return;
+    this._applyFeed('devices', devices);
+    this._onPairDevices(devices);
+  }
+
+  _receiveGroups(ev) {
+    const groups = this._arrayPayload(ev, 'groups');
+    if (!groups) return;
+    this._applyFeed('groups', groups);
+    if (this._groupStatus) this._groupStatus = null;
+  }
+
+  _refresh() {
+    return Promise.allSettled([
+      this._refreshFeed('info', 'z2m/info'),
+      this._refreshFeed('devices', 'z2m/devices'),
+      this._refreshFeed('groups', 'z2m/groups'),
+    ]);
+  }
+
+  async _refreshFeed(key, type) {
+    const request = ++this._feedRequests[key];
+    const version = this._feedVersions[key];
     try {
-      const [summary, devices, groups] = await Promise.all([
-        this._call('z2m/info'),
-        this._call('z2m/devices'),
-        this._call('z2m/groups'),
-      ]);
-      this._summary = summary;
-      this._devices = devices || [];
-      this._groups = groups || [];
-      this._error = null;
+      const value = await this._call(type);
+      if (request !== this._feedRequests[key] || version !== this._feedVersions[key]) return;
+      this._applyFeed(key, value);
     } catch (err) {
-      this._error = (err && (err.message || err.code)) || 'Unknown error';
+      if (request !== this._feedRequests[key] || version !== this._feedVersions[key]) return;
+      this._failFeed(key, err);
     }
-    this._render();
   }
 
   /* ---------------------------------------------------------------- helpers */
@@ -352,116 +433,133 @@ class Z2MPanel extends HTMLElement {
   /* ----------------------------------------------------------------- styles */
 
   _styles() {
-    // Shadow DOM does not inherit HA's shared `haStyle`, so the two classes HA's
-    // cards rely on (.card-header/.card-content) are restated here using HA's own
-    // spacing tokens. Everything else is HA custom properties, so theming, dark mode,
-    // density and touch target sizing are inherited rather than reimplemented.
+    // This shadow root deliberately uses HA's public design tokens instead of a
+    // panel-local palette. That keeps density, contrast, type and dark mode aligned
+    // with the surrounding Settings surfaces.
     return `
-      /* overflow:auto matters only on the fallback-chrome path: with hass-subpage
-         nothing here overflows, because it owns its own scroll container. */
       :host { display:block; height:100%; overflow:auto;
               background:var(--primary-background-color);
               color:var(--primary-text-color);
-              font-family:var(--ha-font-family-body, var(--paper-font-body1_-_font-family, Roboto, sans-serif)); }
-      .container { padding:var(--ha-space-2,8px) var(--ha-space-4,16px)
-                   calc(var(--ha-space-20,80px) + var(--safe-area-inset-bottom,0px)); }
-      ha-card { display:block; margin:auto; margin-top:var(--ha-space-4,16px); max-width:600px; }
-      .card-header { font-size:var(--ha-font-size-2xl,24px); font-weight:var(--ha-font-weight-normal,400);
-                     line-height:var(--ha-line-height-condensed,1.2); padding:12px 16px 16px;
-                     color:var(--ha-card-header-color,var(--primary-text-color)); }
-      .card-content { padding:16px; }
+              font-family:var(--ha-font-family-body, var(--paper-font-body1_-_font-family, sans-serif)); }
+      .container { padding:var(--ha-space-2, 8px) var(--ha-space-4, 16px)
+                   calc(var(--ha-space-16, 64px) + var(--safe-area-inset-bottom, 0px)); }
+      ha-card { display:block; max-width:600px; margin:var(--ha-space-4, 16px) auto 0; }
       .nav-card { overflow:hidden; }
-      .nav-card .card-header { padding-bottom:var(--ha-space-2,8px); justify-content:space-between;
-                               align-items:center; display:flex; gap:8px; }
+      .card-header { display:flex; align-items:center; justify-content:space-between;
+                     gap:var(--ha-space-2, 8px); padding:var(--ha-space-3, 12px) var(--ha-space-4, 16px);
+                     color:var(--ha-card-header-color, var(--primary-text-color));
+                     font-size:var(--ha-font-size-xl, 20px);
+                     font-weight:var(--ha-font-weight-normal, 400);
+                     line-height:var(--ha-line-height-condensed, 1.2); }
+      .nav-card > .card-header { padding-bottom:var(--ha-space-2, 8px); }
+      .card-content { padding:var(--ha-space-4, 16px); }
       .nav-card .card-content { padding:0; }
-      ha-md-list, .mdlist { background:none; padding:0; display:block; }
+      ha-md-list, .mdlist { display:block; padding:0; background:none; }
       ha-md-list-item { --md-item-overflow:visible; }
-      .network-status .heading { align-items:center; column-gap:var(--ha-space-4,16px); display:flex; }
-      .network-status .heading .icon { border-radius:var(--ha-border-radius-2xl,28px);
-              --icon-color:var(--primary-color); flex-shrink:0; justify-content:center;
-              align-items:center; width:40px; height:40px; display:flex; position:relative;
-              overflow:hidden; }
-      .network-status .heading .icon.success { --icon-color:var(--success-color,#0f9d58); }
-      .network-status .heading .icon.error { --icon-color:var(--error-color,#db4437); }
-      .network-status .heading .icon:before { content:""; background-color:var(--icon-color);
-              opacity:.2; display:block; position:absolute; inset:0; }
-      .network-status .heading .icon ha-svg-icon { color:var(--icon-color); width:24px; height:24px; }
-      .network-status .details { font-size:var(--ha-font-size-xl,20px); flex:1;
-              line-height:var(--ha-line-height-condensed,1.2); color:var(--primary-text-color); }
-      .network-status small { font-size:var(--ha-font-size-m,14px); letter-spacing:.25px;
-              line-height:var(--ha-line-height-condensed,1.2); color:var(--secondary-text-color); }
-      .network-status small.offline { color:var(--error-color,#db4437); }
-      .network-status .version { font-size:var(--ha-font-size-m,14px); align-self:flex-start;
-              color:var(--secondary-text-color); white-space:nowrap; }
-      ha-alert { display:block; }
-      .kv { display:flex; gap:16px; padding:10px 16px; font-size:var(--ha-font-size-m,14px); }
-      .kv + .kv { border-top:1px solid var(--divider-color); }
-      .kv .k { color:var(--secondary-text-color); flex:0 0 45%; }
-      .kv .v { flex:1; word-break:break-word; font-family:var(--ha-font-family-code,monospace); }
-      .empty { padding:32px 16px; text-align:center; color:var(--secondary-text-color); }
-      .note { padding:12px 16px; font-size:var(--ha-font-size-m,14px); color:var(--secondary-text-color); }
-      .actions { display:flex; justify-content:flex-end; gap:8px; padding:8px 16px 16px; }
-      .search { display:flex; align-items:center; gap:12px; padding:8px 16px;
-                border-bottom:1px solid var(--divider-color); }
-      .search input { flex:1; min-width:0; border:0; outline:none; background:transparent;
-                font-size:var(--ha-font-size-l,16px); color:var(--primary-text-color);
-                font-family:inherit; padding:8px 0; }
-      .search .grow { flex:1; font-size:var(--ha-font-size-m,14px); }
+      ha-alert { display:block; margin-bottom:var(--ha-space-3, 12px); }
+      .header-actions { display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-end;
+                        gap:var(--ha-space-2, 8px); }
+      .network-status .heading { display:flex; align-items:center; column-gap:var(--ha-space-4, 16px); }
+      .network-status .heading .icon { display:flex; align-items:center; justify-content:center;
+              position:relative; flex-shrink:0; width:var(--ha-touch-target-min-size, 40px);
+              height:var(--ha-touch-target-min-size, 40px); overflow:hidden;
+              border-radius:var(--ha-border-radius-2xl, 28px); --icon-color:var(--primary-color); }
+      .network-status .heading .icon.success { --icon-color:var(--success-color); }
+      .network-status .heading .icon.error { --icon-color:var(--error-color); }
+      .network-status .heading .icon:before { position:absolute; inset:0; display:block;
+              content:""; background-color:var(--icon-color); opacity:var(--ha-opacity-disabled, .2); }
+      .network-status .heading .icon ha-svg-icon { z-index:1; width:var(--ha-icon-size-m, 24px);
+              height:var(--ha-icon-size-m, 24px); color:var(--icon-color); }
+      .network-status .details { flex:1; min-width:0; color:var(--primary-text-color);
+              font-size:var(--ha-font-size-xl, 20px); line-height:var(--ha-line-height-condensed, 1.2); }
+      .network-status small, .supporting { color:var(--secondary-text-color);
+              font-size:var(--ha-font-size-m, 14px); line-height:var(--ha-line-height-condensed, 1.2); }
+      .network-status small.offline { color:var(--error-color); }
+      .network-status .version { align-self:flex-start; color:var(--secondary-text-color);
+              font-size:var(--ha-font-size-m, 14px); white-space:nowrap; }
+      .kv { display:flex; gap:var(--ha-space-4, 16px); padding:var(--ha-space-3, 12px) var(--ha-space-4, 16px);
+            font-size:var(--ha-font-size-m, 14px); }
+      .kv + .kv { border-top:var(--ha-border-width, 1px) solid var(--divider-color); }
+      .kv .k { flex:0 0 45%; color:var(--secondary-text-color); }
+      .kv .v { flex:1; min-width:0; overflow-wrap:anywhere; font-family:var(--ha-font-family-code, monospace); }
+      .empty { padding:var(--ha-space-8, 32px) var(--ha-space-4, 16px); text-align:center;
+               color:var(--secondary-text-color); }
+      .note { padding:var(--ha-space-3, 12px) var(--ha-space-4, 16px);
+              color:var(--secondary-text-color); font-size:var(--ha-font-size-m, 14px); }
+      .actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:var(--ha-space-2, 8px);
+                 padding:var(--ha-space-2, 8px) var(--ha-space-4, 16px) var(--ha-space-4, 16px); }
+      .search { display:flex; align-items:center; gap:var(--ha-space-3, 12px);
+                padding:var(--ha-space-2, 8px) var(--ha-space-4, 16px);
+                border-bottom:var(--ha-border-width, 1px) solid var(--divider-color); }
+      .search input { flex:1; min-width:0; padding:var(--ha-space-2, 8px) 0; border:0; outline:0;
+                background:transparent; color:var(--primary-text-color); font:inherit;
+                font-size:var(--ha-font-size-l, 16px); }
+      .search .grow { flex:1; font-size:var(--ha-font-size-m, 14px); }
       .search ha-svg-icon { color:var(--secondary-text-color); }
-      .chip { display:inline-block; font-size:var(--ha-font-size-xs,11px); line-height:18px;
-              padding:0 8px; border-radius:9px; background:var(--secondary-background-color);
-              color:var(--secondary-text-color); white-space:nowrap; }
-      .chip.off { background:var(--error-color,#db4437); color:#fff; }
-      .chip.warn { background:var(--warning-color,#ffa600); color:#000; }
-      .chip.ok { background:var(--success-color,#0f9d58); color:#fff; }
+      .chip { display:inline-block; padding:0 var(--ha-space-2, 8px); border:var(--ha-border-width, 1px) solid;
+              border-radius:var(--ha-border-radius-pill, 999px); color:var(--secondary-text-color);
+              font-size:var(--ha-font-size-xs, 12px); line-height:var(--ha-line-height-normal, 1.5);
+              white-space:nowrap; }
+      .chip.off { color:var(--error-color); }
+      .chip.warn { color:var(--warning-color); }
+      .chip.ok { color:var(--success-color); }
       .chip[hidden] { display:none; }
-      input[type=text], input[type=number], select {
-              font-size:var(--ha-font-size-m,14px); padding:8px; border-radius:8px;
-              font-family:inherit; border:1px solid var(--divider-color);
-              background:var(--card-background-color); color:var(--primary-text-color);
-              max-width:220px; }
-      input[type=checkbox] { width:20px; height:20px; accent-color:var(--primary-color); }
-      /* The map owns everything below the page header: it renders its own age,
-         progress, Re-scan control, legend and node detail as overlays inside its
-         canvas, so there is no row above or below it to subtract. Both chromes put
-         exactly one --header-height band above this element -- hass-subpage's own
-         toolbar on the normal path, the sticky .toolbar below on the fallback path --
-         so one rule serves both, and the wrapper contributes no padding. */
+      input[type=text], input[type=number], select { box-sizing:border-box; max-width:var(--ha-control-max-width, 220px);
+              min-height:var(--ha-touch-target-min-size, 40px); padding:var(--ha-space-2, 8px);
+              border:var(--ha-border-width, 1px) solid var(--divider-color);
+              border-radius:var(--ha-border-radius-md, 8px); background:var(--card-background-color);
+              color:var(--primary-text-color); font:inherit; font-size:var(--ha-font-size-m, 14px); }
+      input[type=checkbox] { width:var(--ha-touch-target-min-size, 20px);
+              height:var(--ha-touch-target-min-size, 20px); accent-color:var(--primary-color); }
+      input:focus-visible, select:focus-visible, ha-button:focus-visible, ha-icon-button:focus-visible {
+              outline:var(--ha-outline-width, 2px) solid var(--primary-color);
+              outline-offset:var(--ha-space-1, 4px); }
+      .form-row { display:flex; align-items:center; gap:var(--ha-space-3, 12px);
+                  padding:var(--ha-space-3, 12px) var(--ha-space-4, 16px); }
+      .form-row > label { flex:1; min-width:0; color:var(--secondary-text-color);
+                          font-size:var(--ha-font-size-m, 14px); }
+      .form-row > input, .form-row > select { flex:1; min-width:0; }
+      .pair-state { display:grid; gap:var(--ha-space-2, 8px); padding:var(--ha-space-4, 16px); }
+      .pair-identity { padding:var(--ha-space-3, 12px) var(--ha-space-4, 16px);
+                       border-top:var(--ha-border-width, 1px) solid var(--divider-color); }
+      .pair-identity strong, .pair-identity code { display:block; overflow-wrap:anywhere; }
+      .pair-log { max-height:var(--ha-log-max-height, 240px); overflow:auto;
+                  border-top:var(--ha-border-width, 1px) solid var(--divider-color); }
+      .pair-log .log { padding-inline:var(--ha-space-4, 16px); }
+      .recovery { border-top:var(--ha-border-width, 1px) solid var(--divider-color); }
       .container.mapview { padding:0; }
       .stage { height:calc(100vh - var(--header-height,56px)); min-height:360px; }
-      .logwrap { height:calc(100vh - 320px); min-height:280px; overflow:auto;
-                 border-top:1px solid var(--divider-color); }
-      .log { display:flex; gap:8px; padding:2px 16px; font-size:var(--ha-font-size-s,12px);
-             font-family:var(--ha-font-family-code,monospace); white-space:pre-wrap;
-             word-break:break-word; }
-      .log .t { color:var(--secondary-text-color); flex:0 0 auto; }
-      .log .l { flex:0 0 60px; text-transform:uppercase; }
-      .log.error .l { color:var(--error-color,#db4437); }
-      .log.warning .l { color:var(--warning-color,#ffa600); }
-      .log.info .l { color:var(--info-color,var(--primary-color)); }
+      .logwrap { min-height:280px; height:calc(100vh - 320px); overflow:auto;
+                 border-top:var(--ha-border-width, 1px) solid var(--divider-color); }
+      .log { display:flex; gap:var(--ha-space-2, 8px); padding:var(--ha-space-1, 4px) var(--ha-space-4, 16px);
+             font-family:var(--ha-font-family-code, monospace); font-size:var(--ha-font-size-s, 12px);
+             white-space:pre-wrap; overflow-wrap:anywhere; }
+      .log .t { flex:0 0 auto; color:var(--secondary-text-color); }
+      .log .l { flex:0 0 var(--ha-log-level-width, 60px); text-transform:uppercase; }
+      .log.error .l { color:var(--error-color); }
+      .log.warning .l { color:var(--warning-color); }
+      .log.info .l { color:var(--info-color, var(--primary-color)); }
       .log.debug .l { color:var(--secondary-text-color); }
-      .log .m { flex:1; }
-      /* Fallback chrome, used only when hass-subpage's chunk has not been fetched.
-         Same header tokens HA's own toolbar uses, so it sits in the theme. */
-      .toolbar { display:flex; align-items:center; gap:8px; height:var(--header-height,56px);
-                 position:sticky; top:0; z-index:2;
-                 padding:8px 12px; box-sizing:border-box;
-                 background-color:var(--app-header-background-color,var(--primary-color));
-                 color:var(--app-header-text-color,#fff);
-                 border-bottom:var(--app-header-border-bottom,none); }
-      .toolbar ha-icon-button { color:var(--app-header-text-color,#fff); }
-      .maintitle { flex:1; min-width:0; font-size:var(--ha-font-size-xl,20px);
-                   font-weight:var(--ha-font-weight-normal,400);
-                   line-height:var(--ha-line-height-normal,1.4); overflow-wrap:break-word;
-                   margin-inline-start:var(--ha-space-2,8px); }
-      .fabwrap { position:fixed; z-index:1;
-                 right:calc(16px + var(--safe-area-inset-right,0px));
-                 bottom:calc(16px + var(--safe-area-inset-bottom,0px)); }
+      .log .m { flex:1; min-width:0; }
+      .toolbar { position:sticky; top:0; z-index:2; display:flex; align-items:center;
+                 gap:var(--ha-space-2, 8px); box-sizing:border-box; height:var(--header-height, 56px);
+                 padding:var(--ha-space-2, 8px) var(--ha-space-3, 12px);
+                 background-color:var(--app-header-background-color, var(--primary-color));
+                 color:var(--app-header-text-color, var(--primary-text-color));
+                 border-bottom:var(--app-header-border-bottom, none); }
+      .toolbar ha-icon-button { color:var(--app-header-text-color, var(--primary-text-color)); }
+      .maintitle { flex:1; min-width:0; margin-inline-start:var(--ha-space-2, 8px);
+                   overflow-wrap:anywhere; font-size:var(--ha-font-size-xl, 20px);
+                   font-weight:var(--ha-font-weight-normal, 400); line-height:var(--ha-line-height-normal, 1.4); }
       @media (max-width:600px) {
-        .container { padding:var(--ha-space-1,4px) var(--ha-space-2,8px) 40px; }
-        .kv { flex-direction:column; gap:2px; }
+        .container { padding:var(--ha-space-1, 4px) var(--ha-space-2, 8px)
+                     calc(var(--ha-space-12, 48px) + var(--safe-area-inset-bottom, 0px)); }
+        .card-header { align-items:flex-start; }
+        .header-actions { justify-content:flex-start; }
+        .kv { flex-direction:column; gap:var(--ha-space-1, 4px); }
         .kv .k { flex:none; }
-        input[type=text], input[type=number], select { max-width:140px; }
+        .form-row { align-items:stretch; flex-direction:column; }
+        input[type=text], input[type=number], select { max-width:none; width:100%; }
         .logwrap { height:calc(100vh - 280px); }
       }
     `;
@@ -520,7 +618,7 @@ class Z2MPanel extends HTMLElement {
     this._enter();
   }
 
-  /** HA's own page chrome: header, back arrow, toolbar action and FAB slot. */
+  /** HA's own page chrome: header, back arrow and refresh action. */
   _subpageChrome(body, top) {
     return `<hass-subpage id="page" header="${esc(this._title())}"${top ? ' main-page' : ''}${
       this._narrow ? ' narrow' : ''
@@ -528,15 +626,13 @@ class Z2MPanel extends HTMLElement {
         <ha-icon-button id="reload" slot="toolbar-icon" data-act="refresh"
           data-path="${MDI.refresh}" data-label="Refresh"></ha-icon-button>
         ${body}
-        ${top ? this._fab(true) : ''}
       </hass-subpage>`;
   }
 
   /**
    * Chrome for a cold load straight onto the panel URL, where hass-subpage's chunk
-   * has not been fetched. Plainer chrome is an honest degradation: the content is
-   * unchanged, the back and refresh affordances are still HA's own ha-icon-button,
-   * and it uses HA's header tokens so it sits in the theme.
+   * has not been fetched. The content and action hierarchy stay the same; only the
+   * native page shell is temporarily unavailable.
    */
   _plainChrome(body, top) {
     return `<div class="toolbar">
@@ -550,19 +646,7 @@ class Z2MPanel extends HTMLElement {
         <ha-icon-button id="reload" data-act="refresh" data-path="${MDI.refresh}"
           data-label="Refresh"></ha-icon-button>
       </div>
-      ${body}
-      ${top ? `<div class="fabwrap">${this._fab(false)}</div>` : ''}`;
-  }
-
-  _fab(slotted) {
-    const open = (this._summary || {}).permit_join;
-    const left = this._joinLeft();
-    return `<ha-button${slotted ? ' slot="fab"' : ' appearance="filled"'} size="l" data-act="permit">
-        ${icon(open ? MDI.check : MDI.plus)}
-        <span id="fabtext">${
-          open ? `Close network${left ? ` (${left}s)` : ''}` : 'Add device'
-        }</span>
-      </ha-button>`;
+      ${body}`;
   }
 
   _title() {
@@ -573,6 +657,10 @@ class Z2MPanel extends HTMLElement {
         return (this._dev(this._view.ieee) || {}).friendly_name || 'Device';
       case 'groups':
         return 'Groups';
+      case 'group':
+        return (this._group(this._view.group) || {}).friendly_name || 'Group';
+      case 'pairing':
+        return 'Add device';
       case 'network':
         return 'Network information';
       case 'ota':
@@ -598,6 +686,10 @@ class Z2MPanel extends HTMLElement {
         return this._deviceView(this._view.ieee);
       case 'groups':
         return this._groupsView();
+      case 'group':
+        return this._groupView(this._view.group);
+      case 'pairing':
+        return this._pairingView();
       case 'network':
         return this._networkView();
       case 'ota':
@@ -638,8 +730,11 @@ class Z2MPanel extends HTMLElement {
     r.querySelectorAll('[data-ieee]').forEach((el) => {
       el.onclick = () => this._go({ name: 'device', ieee: el.dataset.ieee });
     });
+    r.querySelectorAll('[data-group]').forEach((el) => {
+      el.onclick = () => this._go({ name: 'group', group: el.dataset.group });
+    });
     r.querySelectorAll('[data-act]').forEach((el) => {
-      el.onclick = () => this._dispatch(el.dataset.act);
+      el.onclick = () => this._dispatch(el.dataset.act, el);
     });
     r.querySelectorAll('[data-change]').forEach((el) => {
       el.onchange = () => this._change(el.dataset.change, el);
@@ -677,6 +772,7 @@ class Z2MPanel extends HTMLElement {
 
   _back() {
     if (this._view.name === 'device') this._go({ name: 'devices' });
+    else if (this._view.name === 'group') this._go({ name: 'groups' });
     else this._go({ name: 'dashboard' });
   }
 
@@ -691,6 +787,7 @@ class Z2MPanel extends HTMLElement {
   /** Tear down whatever the view being left had running. */
   _leave() {
     if (this._view.name === 'logs') this._unsub('logs');
+    if (this._view.name === 'pairing') this._leavePairing();
     if (this._view.name === 'map') {
       this._unsub('map');
       this._unsub('scan');
@@ -703,6 +800,7 @@ class Z2MPanel extends HTMLElement {
   /** Start whatever the freshly rendered view needs. */
   _enter() {
     if (this._view.name === 'logs' && !this._subs.logs) this._openLogs();
+    if (this._view.name === 'pairing' && !this._pairing.active) this._openPairing();
     // Re-hosting on every render matters: the element instance is retained, so a
     // render caused by (say) a scan error has to put it back where it was.
     if (this._view.name === 'map') {
@@ -717,6 +815,7 @@ class Z2MPanel extends HTMLElement {
   /** One second tick, only while something on screen actually counts. */
   _needsTicker() {
     if (this._view.name === 'map') return true;
+    if (this._view.name === 'pairing') return !!this._pairing.active;
     return this._view.name === 'dashboard' && !!(this._summary || {}).permit_join;
   }
 
@@ -738,11 +837,8 @@ class Z2MPanel extends HTMLElement {
     if (!r) return;
     const join = r.getElementById('joinstate');
     if (join) join.textContent = this._joinText();
-    const fab = r.getElementById('fabtext');
-    if (fab) {
-      const left = this._joinLeft();
-      fab.textContent = left ? `Close network (${left}s)` : 'Close network';
-    }
+    const pairTime = r.getElementById('pairtime');
+    if (pairTime) pairTime.textContent = this._pairingCountdown();
     if (this._view.name === 'map') this._syncScan();
   }
 

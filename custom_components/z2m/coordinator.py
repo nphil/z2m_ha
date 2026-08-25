@@ -75,11 +75,15 @@ from .const import (
     SCAN_CONCURRENCY,
     SCAN_DEVICE_TIMEOUT,
     SCAN_MIN_INTERVAL,
+    SIGNAL_DEVICE_LIST,
     SIGNAL_DEVICES,
+    SIGNAL_GROUPS,
     SIGNAL_LOG,
     SIGNAL_MAP,
+    SIGNAL_PAIRING,
     SIGNAL_UPDATE,
     TOPIC_DEVICES,
+    TOPIC_EVENT,
     TOPIC_EXTENSIONS,
     TOPIC_GROUPS,
     TOPIC_HEALTH,
@@ -95,6 +99,16 @@ _LOGGER = logging.getLogger(__package__)
 # none, so asking one costs a round trip and returns nothing; it still reaches the
 # map, as a row in its parent's table.
 PROBED_TYPES = ("Coordinator", "Router")
+
+# bridge/devices uses herdsman's enum names while bridge/event uses lower-case
+# interview statuses. Both normalize to the panel's four phases.
+INTERVIEW_PHASES = {
+    "pending": "joined",
+    "in_progress": "interview_started",
+    "started": "interview_started",
+    "successful": "successful",
+    "failed": "failed",
+}
 
 # Some Xiaomi devices report this instead of their own address in a neighbour table.
 ZERO_IEEE = "0x0000000000000000"
@@ -124,16 +138,27 @@ def _extension_source() -> tuple[str, str]:
 
 
 @callback
-def ieee_from_identifiers(identifiers: Iterable[tuple[str, str]]) -> str | None:
+def ieee_from_identifiers(identifiers: Iterable[tuple[str, ...]]) -> str | None:
     """The Zigbee ieee address behind a device's MQTT identifier, if it has one.
 
     Matches both `zigbee2mqtt_0x...` (a device) and `zigbee2mqtt_bridge_0x...` (the
     coordinator). Group identifiers are `zigbee2mqtt_<base topic>_<n>` and have no
     `0x`, so they are correctly ignored, as is every other <thing>2mqtt bridge
     sharing the `mqtt` identifier domain.
+
+    MQTT device identifiers may carry discovery metadata after the domain and
+    identifier. Home Assistant 2026.8 uses three-item tuples for some entries, so
+    only the first two fields are structural here.
     """
-    for domain, ident in identifiers:
-        if domain != MQTT_IDENT_DOMAIN or not ident.startswith(MQTT_IDENT_PREFIX):
+    for identifier in identifiers:
+        if len(identifier) < 2:
+            continue
+        domain, ident = identifier[0], identifier[1]
+        if (
+            domain != MQTT_IDENT_DOMAIN
+            or not isinstance(ident, str)
+            or not ident.startswith(MQTT_IDENT_PREFIX)
+        ):
             continue
         _, _, tail = ident.rpartition("_")
         if tail.startswith("0x"):
@@ -272,6 +297,9 @@ class Z2MData:
         self.health: dict[str, Any] = {}
         self.bridge_state: str | None = None
         self.availability: dict[str, str] = {}
+        # Latest normalized join/interview state per IEEE address. bridge/event is
+        # not retained, so bridge/devices also reconciles this cache on reload.
+        self._pairing_sessions: dict[str, dict[str, Any]] = {}
         # Set by Z2MLabels once the label is resolved, and surfaced in summary() so
         # the panel can deep-link into HA's own tables with ?label=<id>.
         self.label_id: str | None = None
@@ -297,6 +325,9 @@ class Z2MData:
         # is everything the install decision needs.
         self._bridge_seen = asyncio.Event()
         self._pending: dict[str, _Pending] = {}
+        # Read requests may deliberately coalesce by path; writes must not. A
+        # per-path lock gives every mutation its own transaction and response.
+        self._mutation_locks: dict[str, asyncio.Lock] = {}
         # Neighbour-table replies all land on one topic with several requests
         # outstanding, so they are matched by transaction, not by path.
         self._lqi_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
@@ -330,6 +361,13 @@ class Z2MData:
         self._unsubs.append(
             await mqtt.async_subscribe(
                 self.hass, f"{self.base_topic}/{TOPIC_LOGGING}", self._on_logging, 0
+            )
+        )
+        # Join/interview lifecycle is non-retained. Keep one standing subscription
+        # and reconcile terminal state from retained bridge/devices on reload.
+        self._unsubs.append(
+            await mqtt.async_subscribe(
+                self.hass, f"{self.base_topic}/{TOPIC_EVENT}", self._on_event, 0
             )
         )
 
@@ -389,14 +427,26 @@ class Z2MData:
             payload = msg.payload
 
         devices_changed = False
+        groups_changed = False
+        pairing_window_changed = False
         if suffix == TOPIC_INFO and isinstance(payload, dict):
+            previous_window = (
+                self.info.get("permit_join"),
+                self.info.get("permit_join_end"),
+            )
             self.info = payload
+            pairing_window_changed = previous_window != (
+                self.info.get("permit_join"),
+                self.info.get("permit_join_end"),
+            )
             self._check_bridge_seen()
         elif suffix == TOPIC_DEVICES and isinstance(payload, list):
             self.devices = payload
+            self._reconcile_pairing_devices()
             devices_changed = True
         elif suffix == TOPIC_GROUPS and isinstance(payload, list):
             self.groups = payload
+            groups_changed = True
         elif suffix == TOPIC_HEALTH and isinstance(payload, dict):
             self.health = payload
         elif suffix == TOPIC_STATE:
@@ -408,11 +458,125 @@ class Z2MData:
             return
 
         async_dispatcher_send(self.hass, SIGNAL_UPDATE)
+        if pairing_window_changed:
+            async_dispatcher_send(self.hass, SIGNAL_PAIRING, self.pairing_message())
         if devices_changed:
-            # Z2M republishes this retained topic only when a device joins, leaves
-            # or is renamed, which makes it the cheap and precise hook for keeping
-            # the label in step.
+            # Only the retained inventory signal reaches label reconciliation.
+            # The projection signal also covers availability-only changes.
             async_dispatcher_send(self.hass, SIGNAL_DEVICES)
+            async_dispatcher_send(self.hass, SIGNAL_DEVICE_LIST)
+        if groups_changed:
+            async_dispatcher_send(self.hass, SIGNAL_GROUPS)
+    @callback
+    def _on_event(self, msg: mqtt.ReceiveMessage) -> None:
+        """Normalize one non-retained join/interview event."""
+        try:
+            payload = json.loads(msg.payload)
+        except ValueError:
+            return
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+            return
+
+        event_type = payload.get("type")
+        source = payload["data"]
+        if event_type == "device_joined":
+            phase = "joined"
+        elif event_type == "device_interview":
+            status = source.get("status")
+            phase = (
+                INTERVIEW_PHASES.get(status.lower())
+                if isinstance(status, str)
+                else None
+            )
+        else:
+            return
+
+        ieee = source.get("ieee_address")
+        if not isinstance(ieee, str) or phase is None:
+            return
+        event: dict[str, Any] = {
+            "type": event_type,
+            "ieee_address": ieee,
+            "friendly_name": source.get("friendly_name"),
+            "phase": phase,
+        }
+        if "supported" in source:
+            event["supported"] = source["supported"]
+        if "definition" in source:
+            event["definition"] = source["definition"]
+        self._store_pairing_event(event)
+
+    @callback
+    def _reconcile_pairing_devices(self) -> None:
+        """Recover current interview phases from retained bridge/devices."""
+        for device in self.devices:
+            state = device.get("interview_state")
+            if not isinstance(state, str):
+                continue
+            phase = INTERVIEW_PHASES.get(state.lower())
+            ieee = device.get("ieee_address")
+            if phase is None or not isinstance(ieee, str):
+                continue
+            event: dict[str, Any] = {
+                "type": "device_joined" if phase == "joined" else "device_interview",
+                "ieee_address": ieee,
+                "friendly_name": device.get("friendly_name"),
+                "phase": phase,
+            }
+            if "supported" in device:
+                event["supported"] = device["supported"]
+            if "definition" in device:
+                event["definition"] = device["definition"]
+            self._store_pairing_event(event)
+
+    @callback
+    def _store_pairing_event(self, event: dict[str, Any]) -> None:
+        ieee = event["ieee_address"]
+        if self._pairing_sessions.get(ieee) == event:
+            return
+        self._pairing_sessions[ieee] = event
+        async_dispatcher_send(
+            self.hass, SIGNAL_PAIRING, {"kind": "event", "event": dict(event)}
+        )
+
+    @callback
+    def pairing_snapshot(self) -> dict[str, Any]:
+        return {
+            "permit_join": self.info.get("permit_join"),
+            "permit_join_end": self.info.get("permit_join_end"),
+            "sessions": [dict(event) for event in self._pairing_sessions.values()],
+        }
+
+    @callback
+    def pairing_message(self) -> dict[str, Any]:
+        return {"kind": "snapshot", "pairing": self.pairing_snapshot()}
+
+    @callback
+    def async_clear_pairing_sessions(self) -> None:
+        """Begin a UI-owned positive permit window with an empty session list."""
+        self._pairing_sessions.clear()
+        async_dispatcher_send(self.hass, SIGNAL_PAIRING, self.pairing_message())
+    @callback
+    def _on_availability(self, msg: mqtt.ReceiveMessage) -> None:
+        # <base>/<friendly name>/availability -- the name may itself contain slashes.
+        name = msg.topic[len(self.base_topic) + 1 : -len("/availability")]
+        try:
+            payload = json.loads(msg.payload)
+            state = payload.get("state") if isinstance(payload, dict) else str(payload)
+        except ValueError:
+            state = msg.payload
+
+        previous = self.availability.get(name)
+        if state:
+            if state == previous:
+                return
+            self.availability[name] = state
+        elif previous is not None:
+            del self.availability[name]
+        else:
+            return
+        async_dispatcher_send(self.hass, SIGNAL_UPDATE)
+        async_dispatcher_send(self.hass, SIGNAL_DEVICE_LIST)
 
     @callback
     def _on_extensions(self, msg: mqtt.ReceiveMessage) -> None:
@@ -443,18 +607,6 @@ class Z2MData:
         if self.info and self._extensions is not None:
             self._bridge_seen.set()
 
-    @callback
-    def _on_availability(self, msg: mqtt.ReceiveMessage) -> None:
-        # <base>/<friendly name>/availability -- the name may itself contain slashes.
-        name = msg.topic[len(self.base_topic) + 1 : -len("/availability")]
-        try:
-            payload = json.loads(msg.payload)
-            state = payload.get("state") if isinstance(payload, dict) else str(payload)
-        except ValueError:
-            state = msg.payload
-        if state:
-            self.availability[name] = state
-            async_dispatcher_send(self.hass, SIGNAL_UPDATE)
 
     @callback
     def _on_logging(self, msg: mqtt.ReceiveMessage) -> None:
