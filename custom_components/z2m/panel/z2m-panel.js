@@ -49,6 +49,7 @@ const MDI = {
   rename: 'M20.71,7.04C21.1,6.65 21.1,6 20.71,5.63L18.37,3.29C18,2.9 17.35,2.9 16.96,3.29L15.12,5.12L18.87,8.87M3,17.25V21H6.75L17.81,9.93L14.06,6.18L3,17.25Z',
   remove: 'M19,4H15.5L14.5,3H9.5L8.5,4H5V6H19M6,19A2,2 0 0,0 8,21H16A2,2 0 0,0 18,19V7H6V19Z',
   wrench: 'M22.7,19L13.6,9.9C14.5,7.6 14,4.9 12.1,3C10.1,1 7.1,0.6 4.7,1.7L9,6L6,9L1.6,4.7C0.4,7.1 0.9,10.1 2.9,12.1C4.8,14 7.5,14.5 9.8,13.6L18.9,22.7C19.3,23.1 19.9,23.1 20.3,22.7L22.6,20.4C23.1,20 23.1,19.3 22.7,19Z',
+  link: 'M10.59,13.41C11,13.8 11,14.44 10.59,14.83C10.2,15.22 9.56,15.22 9.17,14.83C7.22,12.88 7.22,9.71 9.17,7.76V7.76L12.71,4.22C14.66,2.27 17.83,2.27 19.78,4.22C21.73,6.17 21.73,9.34 19.78,11.29L18.29,12.78C18.3,11.96 18.17,11.14 17.89,10.36L18.36,9.88C19.54,8.71 19.54,6.81 18.36,5.64C17.19,4.46 15.29,4.46 14.12,5.64L10.59,9.17C9.41,10.34 9.41,12.24 10.59,13.41M13.41,9.17C13.8,8.78 14.44,8.78 14.83,9.17C16.78,11.12 16.78,14.29 14.83,16.24V16.24L11.29,19.78C9.34,21.73 6.17,21.73 4.22,19.78C2.27,17.83 2.27,14.66 4.22,12.71L5.71,11.22C5.7,12.04 5.83,12.86 6.11,13.65L5.64,14.12C4.46,15.29 4.46,17.19 5.64,18.36C6.81,19.54 8.71,19.54 9.88,18.36L13.41,14.83C14.59,13.66 14.59,11.76 13.41,10.59C13,10.2 13,9.56 13.41,9.17Z',
   radar: 'M19.07,4.93L17.66,6.34C19.1,7.79 20,9.79 20,12A8,8 0 0,1 12,20A8,8 0 0,1 4,12C4,7.92 7.05,4.56 11,4.07V6.09C8.16,6.57 6,9.03 6,12A6,6 0 0,0 12,18A6,6 0 0,0 18,12C18,10.34 17.33,8.84 16.24,7.76L14.83,9.17C15.55,9.9 16,10.9 16,12A4,4 0 0,1 12,16A4,4 0 0,1 8,12C8,10.14 9.28,8.59 11,8.14V10.28C10.4,10.63 10,11.26 10,12A2,2 0 0,0 12,14A2,2 0 0,0 14,12C14,11.26 13.6,10.62 13,10.28V2H12A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12C22,9.24 20.88,6.74 19.07,4.93Z',
   health: 'M7.5,4A5.5,5.5 0 0,0 2,9.5C2,10 2.09,10.5 2.22,11H6.3L7.57,7.63C7.87,6.83 9.05,6.75 9.43,7.63L11.5,13L12.09,11.58C12.22,11.25 12.57,11 13,11H21.78C21.91,10.5 22,10 22,9.5A5.5,5.5 0 0,0 16.5,4C14.64,4 13,4.93 12,6.34C11,4.93 9.36,4 7.5,4V4M3,12.5A1,1 0 0,0 2,13.5A1,1 0 0,0 3,14.5H5.44L11,20C12,20.9 12,20.9 13,20L18.56,14.5H21A1,1 0 0,0 22,13.5A1,1 0 0,0 21,12.5H13.4L12.47,14.8C12.07,15.81 10.92,15.67 10.55,14.83L8.5,9.5L7.54,11.83C7.39,12.21 7.05,12.5 6.6,12.5H3Z',
   unlinked: 'M4,1C2.89,1 2,1.89 2,3V7C2,8.11 2.89,9 4,9H1V11H13V9H10C11.11,9 12,8.11 12,7V3C12,1.89 11.11,1 10,1H4M4,3H10V7H4V3M14,13C12.89,13 12,13.89 12,15V19C12,20.11 12.89,21 14,21H11V23H23V21H20C21.11,21 22,20.11 22,19V15C22,13.89 21.11,13 20,13H14M3.88,13.46L2.46,14.88L4.59,17L2.46,19.12L3.88,20.54L6,18.41L8.12,20.54L9.54,19.12L7.41,17L9.54,14.88L8.12,13.46L6,15.59L3.88,13.46M14,15H20V19H14V15Z',
@@ -151,6 +152,47 @@ const list = (rows) =>
 const fwVersion = (v) =>
   v === null || v === undefined || String(v) === '-1' ? '\u2014' : esc(String(v));
 
+/**
+ * Plain English for the Zigbee cluster names, which are the vocabulary of binding and
+ * reporting and are otherwise unreadable.
+ *
+ * The identifier is always shown as well: it is what Zigbee2MQTT, the device's own
+ * documentation and every forum post use, so hiding it would make the screen harder
+ * to act on, not easier.
+ */
+const CLUSTER_NAMES = {
+  genOnOff: 'On/off',
+  genLevelCtrl: 'Brightness',
+  genScenes: 'Scenes',
+  genGroups: 'Groups',
+  genIdentify: 'Identify',
+  genPowerCfg: 'Battery and power',
+  genBasic: 'Device information',
+  genOta: 'Firmware updates',
+  lightingColorCtrl: 'Colour',
+  closuresWindowCovering: 'Covers',
+  closuresDoorLock: 'Locks',
+  hvacThermostat: 'Thermostat',
+  hvacFanCtrl: 'Fan',
+  msIlluminanceMeasurement: 'Light level',
+  msTemperatureMeasurement: 'Temperature',
+  msRelativeHumidity: 'Humidity',
+  msPressureMeasurement: 'Pressure',
+  msOccupancySensing: 'Occupancy',
+  msSoilMoisture: 'Soil moisture',
+  msCO2: 'CO\u2082',
+  ssIasZone: 'Alarms',
+  seMetering: 'Energy metering',
+  haElectricalMeasurement: 'Electrical measurement',
+  touchlink: 'Touchlink',
+};
+
+/** A cluster as the operator should read it: what it does, and what it is called. */
+const clusterLabel = (c) => {
+  const friendly = CLUSTER_NAMES[c];
+  return friendly ? `${friendly} (${c})` : c;
+};
+
 const card = (body, cls = 'nav-card') =>
   `<ha-card class="${cls}"><div class="card-content">${body}</div></ha-card>`;
 
@@ -181,6 +223,8 @@ class Z2MPanel extends HTMLElement {
     this._logTimer = null;
     this._resetMap();
     this._resetPairing();
+    this._resetBinds();
+
     this._diag = { health: null, routers: null, error: null, checked: false };
     this._ticker = null;
     this._counts = '';
@@ -222,6 +266,274 @@ class Z2MPanel extends HTMLElement {
     // operator has not typed into it.
     if (!spec.touched && (o.value || '') !== spec.data.value) spec.data = { value: o.value || '' };
     return `<ha-form data-form="${esc(key)}"></ha-form>`;
+  }
+
+  /* ------------------------------------------------------------- bindings */
+  //
+  // A bind is what makes a remote control a light directly, radio to radio, without
+  // the coordinator relaying anything. Zigbee2MQTT reports binds per SOURCE ENDPOINT,
+  // so that is how they are shown: an endpoint is the thing that owns a bind.
+
+  _resetBinds() {
+    this._binds = {
+      ieee: null,
+      loading: false,
+      error: null,
+      notice: null,
+      // Z2M's answer to a bind can be a partial success: some clusters bound, others
+      // refused. `failed` is that list, and it has to stay on screen.
+      failed: [],
+      clusters: null,
+      binds: null,
+      busy: false,
+    };
+  }
+
+  async _openBinds(ieee) {
+    const b = this._binds;
+    if (b.loading) return;
+    b.ieee = ieee;
+    b.loading = true;
+    b.error = null;
+    this._render();
+    try {
+      const [clusters, binds] = await Promise.all([
+        this._call('z2m/device/clusters', { device: ieee }),
+        this._call('z2m/device/binds', { device: ieee }),
+      ]);
+      if (this._binds.ieee !== ieee) return;
+      b.clusters = clusters;
+      b.binds = binds;
+    } catch (err) {
+      if (this._binds.ieee !== ieee) return;
+      b.error = this._feedMessage(err, 'Could not read this device\u2019s bindings');
+    } finally {
+      if (this._binds.ieee === ieee) {
+        b.loading = false;
+        this._render();
+      }
+    }
+  }
+
+  /** Re-read after a write: Z2M is the authority on what is actually bound now. */
+  async _reloadBinds() {
+    const ieee = this._binds.ieee;
+    if (!ieee) return;
+    try {
+      const [clusters, binds] = await Promise.all([
+        this._call('z2m/device/clusters', { device: ieee }),
+        this._call('z2m/device/binds', { device: ieee }),
+      ]);
+      if (this._binds.ieee !== ieee) return;
+      this._binds.clusters = clusters;
+      this._binds.binds = binds;
+    } catch (_) {
+      /* the write already reported its own outcome; a stale list is not a new error */
+    }
+    this._render();
+  }
+
+  /** Everything a bind can point at: the coordinator, a group, or another endpoint. */
+  _bindTargets() {
+    const self = this._binds.ieee;
+    const out = [];
+    (this._groups || []).forEach((g) => {
+      out.push({ value: `g:${g.id}`, label: `${g.friendly_name || `Group ${g.id}`} (group)` });
+    });
+    this._devices.forEach((d) => {
+      if (d.ieee_address === self) return;
+      const eps = (d.endpoints || []).length ? d.endpoints : [1];
+      const coordinator = d.type === 'Coordinator';
+      eps.forEach((ep) => {
+        const epId = typeof ep === 'object' ? ep.endpoint : ep;
+        out.push({
+          value: `d:${d.ieee_address}:${epId}`,
+          label: `${d.friendly_name || d.ieee_address}${
+            coordinator ? ' (coordinator)' : eps.length > 1 ? ` \u2014 endpoint ${epId}` : ''
+          }`,
+        });
+      });
+    });
+    return out;
+  }
+
+  _bindsView(ieee) {
+    const b = this._binds;
+    const d = this._dev(ieee) || {};
+    if (b.error) {
+      return `<ha-alert alert-type="error">${esc(b.error)}</ha-alert>` +
+        card('<div class="note">Nothing was changed.</div>');
+    }
+    if (!b.clusters || !b.binds) {
+      return card('<div class="note">Reading this device\u2019s endpoints\u2026</div>');
+    }
+
+    const endpoints = b.clusters.endpoints || [];
+    const existing = b.binds.binds || [];
+
+    // Grouped by source endpoint, because that is what owns the bind.
+    const groupsHtml = endpoints
+      .map((ep) => {
+        const mine = existing.filter((x) => x.endpoint === ep.endpoint);
+        if (!mine.length && !(ep.bindable || []).length) return '';
+        const rows = mine.length
+          ? list(
+              mine
+                .map((x) => {
+                  const t = x.target || {};
+                  const target =
+                    t.type === 'group'
+                      ? `${t.name || `Group ${t.id}`} (group)`
+                      : `${t.name || t.ieee_address}${t.coordinator ? ' (coordinator)' : ''}${
+                          t.endpoint && !t.coordinator ? ` \u2014 endpoint ${t.endpoint}` : ''
+                        }`;
+                  return row({
+                    icon: MDI.link,
+                    headline: esc(clusterLabel(x.cluster)),
+                    text: `to ${esc(target)}${t.name === null ? ' \u2014 target no longer known' : ''}`,
+                    end: `<ha-button slot="end" appearance="plain" size="s" data-act="unbind"
+                            data-endpoint="${esc(String(ep.endpoint))}"
+                            data-cluster="${esc(x.cluster)}"
+                            data-target="${esc(
+                              t.type === 'group' ? `g:${t.id}` : `d:${t.ieee_address}:${t.endpoint}`
+                            )}">Remove</ha-button>`,
+                  });
+                })
+                .join('')
+            )
+          : '<div class="note">Nothing bound from this endpoint.</div>';
+        return `<div class="ota-group">Endpoint ${esc(String(ep.endpoint))}${
+          ep.name && ep.name !== String(ep.endpoint) ? ` \u00b7 ${esc(ep.name)}` : ''
+        }</div>${rows}`;
+      })
+      .join('');
+
+    return (
+      (b.notice ? `<ha-alert alert-type="success">${esc(b.notice)}</ha-alert>` : '') +
+      (b.failed.length
+        ? `<ha-alert alert-type="warning">Zigbee2MQTT reported the bind as done, but these
+           clusters were refused: ${esc(b.failed.map(clusterLabel).join(', '))}. That usually
+           means the device does not speak them, or it was asleep.</ha-alert>`
+        : '') +
+      `<ha-card class="nav-card">
+         <div class="card-header">Bindings for ${esc(d.friendly_name || ieee)}</div>
+         <div class="note">A bind sends this device\u2019s commands straight to another device
+         or group, without Home Assistant or the coordinator in the path \u2014 so it keeps
+         working when either is down, and it responds faster.</div>
+         ${groupsHtml}
+       </ha-card>` +
+      this._bindCreateCard(endpoints)
+    );
+  }
+
+  _bindCreateCard(endpoints) {
+    const b = this._binds;
+    const bindable = endpoints.filter((ep) => (ep.bindable || []).length);
+    if (!bindable.length) {
+      return card(
+        `<div class="note">None of this device\u2019s endpoints expose a cluster that can be
+         bound. Sensors that only report values are the usual case.</div>`
+      );
+    }
+
+    const key = `bind:${b.ieee}`;
+    const spec = this._formSpec(key, () => ({
+      schema: [],
+      data: { endpoint: String(bindable[0].endpoint), target: '', clusters: [] },
+      label: (s) =>
+        ({ endpoint: 'From endpoint', target: 'To', clusters: 'Clusters' })[s.name],
+      helper: (s) =>
+        ({
+          endpoint: 'The endpoint on this device whose commands will be sent',
+          target: 'The device, group or the coordinator that should receive them',
+          clusters: 'Only what this endpoint can actually bind is offered',
+        })[s.name],
+    }));
+
+    const chosen =
+      bindable.find((ep) => String(ep.endpoint) === String(spec.data.endpoint)) || bindable[0];
+    spec.schema = [
+      {
+        name: 'endpoint',
+        selector: {
+          select: {
+            mode: 'dropdown',
+            options: bindable.map((ep) => ({
+              value: String(ep.endpoint),
+              label: `Endpoint ${ep.endpoint}${
+                ep.name && ep.name !== String(ep.endpoint) ? ` \u00b7 ${ep.name}` : ''
+              }`,
+            })),
+          },
+        },
+      },
+      {
+        name: 'target',
+        selector: { select: { mode: 'dropdown', options: this._bindTargets() } },
+      },
+      {
+        name: 'clusters',
+        selector: {
+          select: {
+            multiple: true,
+            options: (chosen.bindable || []).map((c) => ({ value: c, label: clusterLabel(c) })),
+          },
+        },
+      },
+    ];
+
+    return `<ha-card class="nav-card">
+        <div class="card-header">Add a binding</div>
+        <div class="card-content"><ha-form data-form="${esc(key)}"></ha-form></div>
+        <div class="note">A sleeping battery device cannot be bound until it wakes, so a
+        refusal here often just means "try again while pressing a button on it".</div>
+        <div class="actions">
+          <ha-button appearance="filled" size="s" data-act="bind"${
+            b.busy ? ' disabled' : ''
+          }>${b.busy ? 'Binding\u2026' : 'Bind'}</ha-button>
+        </div>
+      </ha-card>`;
+  }
+
+  /** One bind or unbind, with Z2M's partial-failure list kept. */
+  async _bindWrite(type, payload) {
+    const b = this._binds;
+    if (b.busy) return;
+    b.busy = true;
+    b.error = null;
+    b.notice = null;
+    b.failed = [];
+    this._render();
+    try {
+      const res = await this._call(type, payload);
+      const failed = (res && res.failed) || [];
+      const done = (res && res.clusters) || [];
+      b.failed = failed;
+      if (done.length) {
+        b.notice = `${type === 'z2m/device/bind' ? 'Bound' : 'Unbound'} ${done
+          .map(clusterLabel)
+          .join(', ')}.`;
+      } else if (!failed.length) {
+        b.notice = 'Zigbee2MQTT reported no change.';
+      }
+    } catch (err) {
+      b.error = this._feedMessage(err, 'Zigbee2MQTT refused the change');
+    } finally {
+      b.busy = false;
+      await this._reloadBinds();
+    }
+  }
+
+  /**
+   * Turn a picker value back into Zigbee2MQTT's own addressing.
+   *
+   * A group target is the group id and takes no endpoint; a device target is an ieee
+   * address plus the endpoint on that device that should receive the commands.
+   */
+  _bindTarget(value) {
+    const [kind, a, b] = String(value || '').split(':');
+    if (kind === 'g') return { to: Number(a) };
+    return { to: a, to_endpoint: Number(b) };
   }
 
   /** What the operator typed into a one-field form, trimmed. */
@@ -912,6 +1224,8 @@ class Z2MPanel extends HTMLElement {
         return 'Network map';
       case 'logs':
         return 'Logs';
+      case 'binds':
+        return 'Bindings';
       case 'diagnostics':
         return 'Diagnostics';
       case 'options':
@@ -939,6 +1253,8 @@ class Z2MPanel extends HTMLElement {
         return this._mapView();
       case 'logs':
         return this._logsView();
+      case 'binds':
+        return this._bindsView(this._view.ieee);
       case 'diagnostics':
         return this._diagView();
       case 'options':
@@ -1076,6 +1392,7 @@ class Z2MPanel extends HTMLElement {
 
   _back() {
     if (this._view.name === 'device') this._go({ name: 'devices' });
+    else if (this._view.name === 'binds') this._go({ name: 'device', ieee: this._view.ieee });
     else if (this._view.name === 'group') this._go({ name: 'groups' });
     else this._go({ name: 'dashboard' });
   }
@@ -1113,6 +1430,9 @@ class Z2MPanel extends HTMLElement {
       else this._openMap();
     }
     if (this._view.name === 'diagnostics' && !this._diag.checked) this._runCoordinatorCheck();
+    if (this._view.name === 'binds' && this._binds.ieee !== this._view.ieee) {
+      this._openBinds(this._view.ieee);
+    }
   }
 
   /* ---------------------------------------------------------------- ticker */
@@ -1440,6 +1760,13 @@ class Z2MPanel extends HTMLElement {
       <ha-card class="nav-card">
         <div class="card-header">Maintenance</div>
         <div class="card-content">${list(
+          row({
+            icon: MDI.link,
+            headline: 'Bindings',
+            text: 'Send this device\u2019s commands straight to another device or group',
+            act: 'openbinds',
+            tap: true,
+          }) +
           row({
             icon: MDI.wrench,
             headline: 'Reconfigure',
@@ -3449,6 +3776,34 @@ class Z2MPanel extends HTMLElement {
 
       case 'fwunsched':
         return this._act('z2m/ota/unschedule', { device });
+
+      case 'openbinds':
+        return this._go({ name: 'binds', ieee: device });
+
+      case 'bind': {
+        const spec = (this._forms || {})[`bind:${this._binds.ieee}`];
+        if (!spec) return undefined;
+        const { endpoint, target, clusters } = spec.data;
+        if (!target || !(clusters || []).length) {
+          this._binds.error = 'Choose a target and at least one cluster first.';
+          this._render();
+          return undefined;
+        }
+        return this._bindWrite('z2m/device/bind', {
+          from: this._binds.ieee,
+          from_endpoint: Number(endpoint),
+          ...this._bindTarget(target),
+          clusters,
+        });
+      }
+
+      case 'unbind':
+        return this._bindWrite('z2m/device/unbind', {
+          from: this._binds.ieee,
+          from_endpoint: Number(el.dataset.endpoint),
+          ...this._bindTarget(el.dataset.target),
+          clusters: [el.dataset.cluster],
+        });
 
       case 'configure':
         return this._act('z2m/device/configure', { device });

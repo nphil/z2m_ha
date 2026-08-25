@@ -493,5 +493,161 @@
     "scenes": [],
     "update_entity": null,
     "device_id": "dev_paired"
+  },
+  "clusters": {
+    "ieee_address": "0x0000000000000001",
+    "friendly_name": "Hallway Dimmer",
+    "type": "Router",
+    "endpoints": [
+      {
+        "endpoint": 1,
+        "name": "1",
+        "input": [
+          "genBasic",
+          "genIdentify",
+          "genGroups",
+          "genScenes",
+          "genOnOff",
+          "genLevelCtrl",
+          "haElectricalMeasurement",
+          "seMetering"
+        ],
+        "output": [
+          "genOta"
+        ],
+        "bindable": [
+          "genScenes",
+          "genOnOff",
+          "genLevelCtrl"
+        ],
+        "bindings": [],
+        "configured_reportings": [
+          {
+            "cluster": "genOnOff",
+            "attribute": "onOff",
+            "minimum_report_interval": 0,
+            "maximum_report_interval": 3600,
+            "reportable_change": 0
+          },
+          {
+            "cluster": "manuSpecificInovelli",
+            "attribute": 16389,
+            "minimum_report_interval": 1,
+            "maximum_report_interval": 3600,
+            "reportable_change": 1
+          }
+        ]
+      },
+      {
+        "endpoint": 2,
+        "name": "2",
+        "input": [
+          "genIdentify",
+          "genGroups",
+          "genScenes",
+          "genOnOff"
+        ],
+        "output": [],
+        "bindable": [
+          "genScenes",
+          "genOnOff"
+        ],
+        "bindings": [],
+        "configured_reportings": []
+      },
+      {
+        "endpoint": 242,
+        "name": null,
+        "input": [],
+        "output": [
+          "greenPower"
+        ],
+        "bindable": [],
+        "bindings": [],
+        "configured_reportings": []
+      }
+    ],
+    "bindable_clusters": [
+      "genScenes",
+      "genOnOff",
+      "genLevelCtrl",
+      "lightingColorCtrl",
+      "closuresWindowCovering",
+      "hvacThermostat",
+      "msIlluminanceMeasurement",
+      "msTemperatureMeasurement",
+      "msRelativeHumidity",
+      "msSoilMoisture",
+      "msCO2"
+    ]
+  },
+  "binds": {
+    "ieee_address": "0x0000000000000001",
+    "friendly_name": "Hallway Dimmer",
+    "binds": [
+      {
+        "endpoint": 1,
+        "endpoint_name": "1",
+        "cluster": "genOnOff",
+        "target": {
+          "type": "endpoint",
+          "ieee_address": "0x00124b0039db98bf",
+          "endpoint": 1,
+          "name": "Coordinator",
+          "endpoint_name": null,
+          "coordinator": true
+        }
+      },
+      {
+        "endpoint": 1,
+        "endpoint_name": "1",
+        "cluster": "seMetering",
+        "target": {
+          "type": "endpoint",
+          "ieee_address": "0x00124b0039db98bf",
+          "endpoint": 1,
+          "name": "Coordinator",
+          "endpoint_name": null,
+          "coordinator": true
+        }
+      },
+      {
+        "endpoint": 1,
+        "endpoint_name": "1",
+        "cluster": "genLevelCtrl",
+        "target": {
+          "type": "endpoint",
+          "ieee_address": "0x00158d00ffdeadbe",
+          "endpoint": 1,
+          "name": null,
+          "endpoint_name": null,
+          "coordinator": false
+        }
+      },
+      {
+        "endpoint": 2,
+        "endpoint_name": "2",
+        "cluster": "genOnOff",
+        "target": {
+          "type": "group",
+          "id": 5,
+          "name": "Kitchen",
+          "default_bind_group": false
+        }
+      },
+      {
+        "endpoint": 2,
+        "endpoint_name": "2",
+        "cluster": "manuSpecificInovelli",
+        "target": {
+          "type": "endpoint",
+          "ieee_address": "0x00124b0039db98bf",
+          "endpoint": 1,
+          "name": "Coordinator",
+          "endpoint_name": null,
+          "coordinator": true
+        }
+      }
+    ]
   }
 }

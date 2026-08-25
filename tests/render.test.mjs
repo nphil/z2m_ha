@@ -394,6 +394,25 @@ const hass = {
             group: String(msg.group),
             endpoint: msg.endpoint,
           });
+        // Bindings and clusters are projections over the retained inventory, so the
+        // fixture answers them the way the backend does: per endpoint, with the
+        // bindable set already intersected, and targets resolved to names.
+        case 'z2m/device/clusters':
+          return Promise.resolve(fx.clusters);
+        case 'z2m/device/binds':
+          return Promise.resolve(fx.binds);
+        // Z2M answers a bind with what it managed and what it refused. A partial
+        // failure arrives as SUCCESS, which is the whole reason `failed` is rendered.
+        case 'z2m/device/bind':
+        case 'z2m/device/unbind':
+          return Promise.resolve({
+            from: msg.from,
+            from_endpoint: msg.from_endpoint,
+            to: msg.to,
+            to_endpoint: msg.to_endpoint,
+            clusters: (msg.clusters || []).filter((c) => c !== 'genScenes'),
+            failed: (msg.clusters || []).filter((c) => c === 'genScenes'),
+          });
         case 'config/device_registry/update':
           return Promise.resolve({ id: msg.device_id });
         default:
@@ -927,6 +946,7 @@ hass.states[upEntity] = fx.states[upEntity];
 // is indistinguishable from nothing having happened.
 p.hass = { ...hass, states: { ...hass.states } };
 go('ota');
+
 
 console.log('=== firmware: commands ===');
 p._go({ name: 'device', ieee: '0x0000000000000001' });
@@ -1707,6 +1727,93 @@ check('registering the element twice is not fatal', (() => {
     return false;
   }
 })());
+
+/* ================================================================ bindings */
+console.log('=== bindings: what is bound, and to what ===');
+p._go({ name: 'binds', ieee: '0x0000000000000001' });
+await tick(60);
+check('reads the device\u2019s endpoints and binds', !!p._binds.clusters && !!p._binds.binds);
+check('titled Bindings', html().includes('header="Bindings"'));
+check('says what a bind actually does', html().includes('without Home Assistant or'));
+check('groups binds by the endpoint that owns them',
+  html().includes('Endpoint 1') && html().includes('Endpoint 2'));
+// The jargon is unavoidable -- it is what Z2M and the device docs use -- so both the
+// plain name and the identifier have to be on screen.
+check('every cluster is named in English and by its identifier',
+  html().includes('On/off (genOnOff)') && html().includes('Energy metering (seMetering)'));
+check('a manufacturer cluster with no plain name still shows its identifier',
+  html().includes('>manuSpecificInovelli<'));
+check('the coordinator is named as the coordinator',
+  html().includes('Coordinator (coordinator)'));
+check('a group target is named as a group', html().includes('Kitchen (group)'));
+check('a bind whose target has left the network is still shown',
+  html().includes('target no longer known'));
+// Endpoint 242 is the green-power endpoint: nothing bound, nothing bindable. Showing
+// it would be noise the operator can do nothing with.
+check('an endpoint that can bind nothing is left out entirely',
+  !html().includes('Endpoint 242'));
+const bindSpec = p._forms['bind:0x0000000000000001'];
+check('the create form is an ha-form with three fields',
+  html().includes('<ha-form data-form="bind:') &&
+  bindSpec.schema.map((s) => s.name).join(',') === 'endpoint,target,clusters');
+check('endpoint 242 is not offered as a source: it can bind nothing',
+  !bindSpec.schema[0].selector.select.options.some((o) => o.value === '242'));
+check('clusters are the endpoint\u2019s bindable set, not everything it speaks',
+  bindSpec.schema[2].selector.select.options.map((o) => o.value).join(',')
+    === 'genScenes,genOnOff,genLevelCtrl');
+check('clusters can be chosen several at a time',
+  bindSpec.schema[2].selector.select.multiple === true);
+check('targets include groups and the other devices',
+  bindSpec.schema[1].selector.select.options.some((o) => o.label.includes('(group)')) &&
+  bindSpec.schema[1].selector.select.options.some((o) => o.value.startsWith('d:')));
+check('the device never offers itself as its own target',
+  !bindSpec.schema[1].selector.select.options.some((o) =>
+    o.value.includes('0x0000000000000001')));
+// Choosing endpoint 2 must narrow the cluster list: it speaks fewer of them.
+bindSpec.data = { ...bindSpec.data, endpoint: '2' };
+p._render();
+check('changing endpoint re-narrows the clusters',
+  p._forms['bind:0x0000000000000001'].schema[2].selector.select.options
+    .map((o) => o.value).join(',') === 'genScenes,genOnOff');
+
+console.log('=== bindings: writing, and the partial failure Z2M calls success ===');
+bindSpec.data = { endpoint: '1', target: 'g:5', clusters: ['genOnOff', 'genScenes'] };
+sent.length = 0;
+await act('bind');
+await tick(60);
+const bindMsg = sent.find((m) => m.type === 'z2m/device/bind');
+check('binds with the chosen endpoint, target and clusters', !!bindMsg
+  && bindMsg.from === '0x0000000000000001' && bindMsg.from_endpoint === 1
+  && bindMsg.to === 5 && bindMsg.to_endpoint === undefined
+  && bindMsg.clusters.join(',') === 'genOnOff,genScenes');
+check('a group target carries no endpoint', !('to_endpoint' in bindMsg));
+check('what succeeded is reported', html().includes('On/off (genOnOff)'));
+// The fixture refuses genScenes, exactly as a sleeping or unsupported device does.
+check('and what Z2M refused is NOT hidden behind a tick',
+  html().includes('were refused') && html().includes('Scenes (genScenes)'));
+check('the refusal explains the usual cause', html().includes('asleep'));
+check('the list is re-read from Zigbee2MQTT afterwards',
+  sent.filter((m) => m.type === 'z2m/device/binds').length >= 1);
+
+console.log('=== bindings: removing one cluster ===');
+sent.length = 0;
+await act('unbind');
+await tick(60);
+const unbindMsg = sent.find((m) => m.type === 'z2m/device/unbind');
+check('unbinds exactly the cluster on the row', !!unbindMsg
+  && unbindMsg.clusters.length === 1);
+check('and addresses the target that bind pointed at', !!unbindMsg
+  && (unbindMsg.to === '0x00124b0039db98bf' || typeof unbindMsg.to === 'number'));
+check('nothing is written without a target and a cluster', (() => {
+  p._forms['bind:0x0000000000000001'].data = { endpoint: '1', target: '', clusters: [] };
+  sent.length = 0;
+  return true;
+})());
+await act('bind');
+check('an incomplete form is refused locally, not by the radio',
+  !sent.some((m) => m.type === 'z2m/device/bind')
+    && html().includes('Choose a target and at least one cluster'));
+p._go({ name: 'device', ieee: '0x0000000000000001' });
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) =>
