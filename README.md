@@ -127,6 +127,57 @@ title: Zigbee mesh # optional
 No resource registration is needed — the integration serves the file and registers it
 with the frontend itself. The card reads the cached scan and will never trigger one.
 
+## Contributed device fixes (`contrib/`)
+
+Not installed by the integration. These are Zigbee2MQTT **external converters** for
+specific devices whose upstream definition is incomplete, kept here so the fix is
+versioned rather than living only in a runtime config directory that a rebuild would
+wipe. Install one with:
+
+```bash
+mosquitto_pub -t zigbee2mqtt/bridge/request/converter/save \
+  -m "$(jq -Rn --rawfile c contrib/external_converters/wyze_lock_state.js \
+        '{name:"wyze_lock_state.js", code:$c}')"
+```
+
+…or paste it into `<z2m config>/external_converters/`. Requires
+`advanced.enable_external_js: true`.
+
+### `wyze_lock_state.js` — Wyze WLCKG1 lock never reports state
+
+**Symptom.** Commands appear to work but `state` stays `null` forever, so Home
+Assistant shows the lock as `unknown`. Re-pairing, re-interviewing and reconfiguring
+all change nothing, because none of them are the problem.
+
+**Cause.** The upstream definition declares `exposes: [e.lock(), e.battery()]` — which
+is what [the device page](https://www.zigbee2mqtt.io/devices/WLCKG1.html) is generated
+from, and why it tells you to read state with `{"state": ""}` — but its inbound list is
+`[fz.battery, fzLocal.wyzeLockRaw]`, with no `fz.lock`. Nothing consumes the standard
+`closuresDoorLock` replies. Captured at debug level on a real device:
+
+```
+No converter available for 'WLCKG1' with cluster 'closuresDoorLock'
+  and type 'readResponse' and data '{"lockState":1}'
+No converter available for 'WLCKG1' with cluster 'closuresDoorLock'
+  and type 'commandLockDoorRsp' and data '{"status":0}'
+```
+
+The lock answers correctly, including `status: 0` for a successful lock command. Z2M
+discards both. The doc page cannot show this, because the generator reads `exposes`
+and never inspects `fromZigbee`.
+
+**Fix.** Import the built-in definition and **append** `fz.lock`. It deliberately does
+not rewrite `fromZigbee`: `fzLocal.wyzeLockRaw` handles the manufacturer cluster
+(`64512`), which is the likely path for keypad and manual operation, and on a door lock
+that signal matters more than an on-demand read. Both parsers stay live and handle
+different clusters.
+
+**Caveat.** This lock refuses reporting configuration (`bindRsp` times out), so state
+refreshes when something asks, not by itself. Check whether physical operation emits a
+raw frame before adding a poll. Separately, if the device re-announces frequently it
+will take a new network address each time and commands sent to the cached one will time
+out — that is a mesh problem (put a router near it), not this one.
+
 ## Design notes
 
 **No polling.** Zigbee2MQTT publishes `bridge/info`, `bridge/devices`, `bridge/groups`
