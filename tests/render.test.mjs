@@ -216,10 +216,18 @@ const HA_ELEMENTS = [
   'ha-md-list-item',
   'ha-svg-icon',
   'ha-icon-next',
-  'ha-icon-button',
-  'ha-alert',
   'ha-button',
   'ha-dialog',
+  // Measured on HA 2026.8.3: ha-form and its selector components are registered in
+  // the bundle this panel loads into, and ha-textfield is NOT -- it never becomes
+  // defined, so a page that depends on it renders an empty row forever. The fixture
+  // keeps that asymmetry, because it is the whole reason the forms are ha-form.
+  'ha-form',
+  'ha-settings-row',
+  'ha-select',
+  'ha-list-item',
+  'ha-icon-button',
+  'ha-alert',
   'hass-subpage',
 ];
 const defined = new Map();
@@ -570,6 +578,18 @@ const withoutElement = (name, fn) => {
   }
 };
 
+/** The mirror image: an element the frontend does not register today, but might. */
+const withElement = (name, fn) => {
+  customElements.define(name, class {});
+  p._render();
+  try {
+    fn();
+  } finally {
+    defined.delete(name);
+    p._render();
+  }
+};
+
 withoutElement('ha-md-list', () => {
   check('ha-md-list missing: page still renders', html().length > 800);
   check('ha-md-list missing: neutral role=list container',
@@ -605,13 +625,35 @@ withoutElement('hass-subpage', () => {
 });
 check('hass-subpage present: HA chrome is used again', html().includes('<hass-subpage'));
 
-// ha-fab and ha-textfield are the other two missing cold. The page never asks for
-// either: actions are ordinary ha-buttons inside their card, and text entry is a
-// native input.
+// Every control the operator edits is one of Home Assistant's own components. The
+// previous policy was the opposite -- bare inputs, to survive a cold load -- and it is
+// what broke the layout on a phone: a hand-rolled control in HA's row slot took the
+// whole row and collapsed its own label. Cold-load safety comes from waiting for the
+// component, which this page already does, not from avoiding it.
 check('never depends on ha-fab', !src.includes('ha-fab'));
-check('never depends on ha-textfield', !src.includes('ha-textfield'));
-check('text entry is a native input', html().includes('<input id="q"')
-  || (() => { p._go({ name: 'devices' }); return html().includes('<input id="q"'); })());
+check('device options are rendered by ha-form', src.includes('<ha-form data-form='));
+check('label-and-control rows use ha-settings-row', src.includes('<ha-settings-row'));
+check('no view renders a bare control except the search fallback', (() => {
+  const offenders = [];
+  for (const name of ['dashboard', 'devices', 'groups', 'options', 'logs', 'network', 'ota']) {
+    p._go({ name });
+    const bare = (html().match(/<(?:input|select)\b[^>]*/g) || [])
+      .filter((t) => !t.includes('id="q"'));
+    if (bare.length) offenders.push(`${name}: ${bare.join(' ')}`);
+  }
+  p._go({ name: 'devices' });
+  return !offenders.length;
+})());
+// ha-textfield is never registered by the frontend this panel loads into, so the
+// search box has to keep working without it -- and has to switch to it the moment it
+// does appear, rather than being stuck on a substitute forever.
+check('search falls back to a styled native input while ha-textfield is missing',
+  html().includes('<input id="q" class="fallback"'));
+withElement('ha-textfield', () => {
+  p._go({ name: 'devices' });
+  check('and uses ha-textfield as soon as HA registers it',
+    html().includes('<ha-textfield id="q"'));
+});
 p._go({ name: 'dashboard' });
 
 console.log('=== first paint waits for nothing ===');
@@ -711,10 +753,34 @@ check('titled after the device', html().includes(`header="${esc(withOpts.friendl
 check('shows IEEE', html().includes(withOpts.ieee_address));
 check('shows vendor/model', html().includes(esc(withOpts.model)));
 check('generated settings form', html().includes('Device settings'));
-const rendered = (withOpts.options || []).filter((o) =>
-  ['numeric', 'binary', 'enum', 'text'].includes(o.type));
-check(`rendered ${rendered.length} option fields`,
-  rendered.every((o) => html().includes(`data-prop="${o.property}"`)));
+// The form is HA's own `ha-form`, driven by a selector schema rather than by markup:
+// what matters is that every option Z2M declares becomes a field with the right
+// selector, and that the operator's current value is what the field starts on.
+const optSpec = p._forms[`opts:${withOpts.ieee_address}`];
+const rendered = (withOpts.options || []).filter((o) => o && o.property);
+check('the form is rendered by ha-form', html().includes('<ha-form data-form='));
+check(`every declared option is a field (${rendered.length})`,
+  rendered.every((o) => optSpec.schema.some((s) => s.name === o.property)));
+const selectorFor = (prop) =>
+  Object.keys((optSpec.schema.find((s) => s.name === prop) || {}).selector || {})[0];
+check('binary options use a boolean selector', rendered
+  .filter((o) => o.type === 'binary')
+  .every((o) => selectorFor(o.property) === 'boolean'));
+check('enum options use a select selector', rendered
+  .filter((o) => o.type === 'enum')
+  .every((o) => selectorFor(o.property) === 'select'));
+check('numeric options use a number selector, with the declared bounds', rendered
+  .filter((o) => o.type === 'numeric')
+  .every((o) => {
+    const n = (optSpec.schema.find((s) => s.name === o.property) || {}).selector.number;
+    return n && (o.value_min === undefined || n.min === o.value_min)
+      && (o.value_max === undefined || n.max === o.value_max);
+  }));
+check('labels and helpers come from Z2M\u2019s own schema', rendered.every((o) => {
+  const s = optSpec.schema.find((x) => x.name === o.property);
+  return optSpec.label(s) === (o.label || o.name || o.property)
+    && optSpec.helper(s) === o.description;
+}));
 check('has rename', !!find('data-act', 'rename'));
 check('has reconfigure', !!find('data-act', 'configure'));
 check('has re-interview', !!find('data-act', 'interview'));
@@ -729,7 +795,7 @@ check('back from a device returns to the list', (() => {
 
 console.log('=== device commands ===');
 sent.length = 0;
-p.shadowRoot.getElementById('rn').value = 'Hallway Dimmer 2';
+p._forms[`rename:${withOpts.ieee_address}`].data = { value: 'Hallway Dimmer 2' };
 await act('rename');
 check('Rename -> z2m/device/rename', sent.some((m) => m.type === 'z2m/device/rename'
   && m.from === withOpts.friendly_name && m.to === 'Hallway Dimmer 2'));
@@ -746,13 +812,20 @@ await act('remove');
 check('Remove -> z2m/device/remove with force', sent.some((m) => m.type === 'z2m/device/remove'
   && m.device === withOpts.ieee_address && m.force === true));
 sent.length = 0;
-p.shadowRoot.querySelectorAll('[data-prop]').forEach((el) => {
-  if (el.dataset.kind === 'binary') el.checked = true;
-});
+// Only what the operator actually changed is written: Save on an untouched form must
+// not push every option back at Zigbee2MQTT.
+await act('options');
+check('an untouched form writes nothing', !sent.some((m) => m.type === 'z2m/device/options'));
+const binaryOpt = rendered.find((o) => o.type === 'binary');
+optSpec.data = { ...optSpec.data, [binaryOpt.property]: true };
 await act('options');
 check('Save settings -> z2m/device/options', sent.some((m) => m.type === 'z2m/device/options'
-  && m.device === withOpts.ieee_address && typeof m.options === 'object'
-  && Object.keys(m.options).length > 0));
+  && m.device === withOpts.ieee_address
+  && m.options[binaryOpt.property] === true));
+check('and writes only the changed field', (() => {
+  const msg = sent.find((m) => m.type === 'z2m/device/options');
+  return Object.keys(msg.options).length === 1;
+})());
 
 console.log('=== every device detail renders ===');
 let bad = [];
@@ -857,8 +930,14 @@ p.hass = hass;
 console.log('=== options view ===');
 go('options');
 check('titled Options', html().includes('header="Options"'));
-check('has a log level control', html().includes('id="loglevel"'));
-check('preselects the current level', html().includes(`value="${fx.info.log_level}" selected`));
+check('the log level is an ha-select in an ha-settings-row',
+  html().includes('<ha-settings-row>') && html().includes('<ha-select id="loglevel"'));
+check('every level is an ha-list-item', ['error', 'warning', 'info', 'debug']
+  .every((l) => html().includes(`<ha-list-item value="${l}">`)));
+check('starts on the current level', (() => {
+  const el = p.shadowRoot.getElementById('loglevel');
+  return el.dataset.value === fx.info.log_level && el.value === fx.info.log_level;
+})());
 check('offers permit joining', html().includes('Permit joining'));
 check('offers restart', !!find('data-act', 'restart'));
 check('links the integration entry',
@@ -866,8 +945,13 @@ check('links the integration entry',
     e.attrs.href === '/config/integrations/integration/z2m'));
 sent.length = 0;
 const level = p.shadowRoot.getElementById('loglevel');
+// ha-select reports through `selected`, and it fires that when the value is assigned
+// from here too -- so a change is only a change when the value actually differs.
+level.emit('selected');
+check('assigning the same level asks for nothing',
+  !sent.some((m) => m.type === 'z2m/log_level'));
 level.value = 'debug';
-level.onchange();
+level.emit('selected');
 await tick();
 check('level change -> z2m/log_level', sent.some((m) => m.type === 'z2m/log_level' && m.value === 'debug'));
 sent.length = 0;
@@ -919,11 +1003,11 @@ check('live push is appended', loglist().includes('live line arrived'));
 check('auto-scrolls while pinned', p.shadowRoot.getElementById('logscroll').scrollTop > 0);
 const logmin = p.shadowRoot.getElementById('logmin');
 logmin.value = 'warning';
-logmin.onchange();
+logmin.emit('selected');
 check('level filter drops lower levels', !loglist().includes('Received Zigbee message'));
 check('level filter keeps higher levels', loglist().includes('Publish to zigbee2mqtt/x failed'));
 logmin.value = 'all';
-logmin.onchange();
+logmin.emit('selected');
 const scroll = p.shadowRoot.getElementById('logscroll');
 scroll.scrollTop = 0;
 scroll.onscroll();
@@ -1207,18 +1291,27 @@ p._devices = fx.devices.concat([
     endpoints: [1], exposes: [], options: [], scenes: [] },
 ]);
 p._paintPairDialog();
-check('offers any router by default', dlg().includes('Any router') && p._pairing.via === null);
 const routers = p._pairRouters();
+const routeOptions = () =>
+  (p._forms.pair.schema.find((s) => s.name === 'via') || {}).selector.select.options;
+const timeOptions = () =>
+  (p._forms.pair.schema.find((s) => s.name === 'duration') || {}).selector.select.options;
 check('offers the mains-powered devices as routes', routers.length > 1
-  && routers.every((r) => dlg().includes(r.name)));
+  && routers.every((r) => routeOptions().some((o) => o.value === r.ieee)));
 check('never offers a sleeping device as a route',
   !routers.some((r) => (p._dev(r.ieee) || {}).type === 'EndDevice'));
-check('the coordinator is named as such', dlg().includes('(coordinator)'));
+check('the coordinator is named as such',
+  routeOptions().some((o) => o.label.includes('(coordinator)')));
 check('the window length is capped at what Z2M accepts',
-  dlg().includes('254 seconds (max)'));
-// Choosing a router, then a shorter window, then starting.
-p._change('pairvia', { value: routers.find((r) => !r.coordinator).ieee });
-p._change('pairdur', { value: '60' });
+  timeOptions().some((o) => o.label === '254 seconds (max)'));
+// Choosing a router, then a shorter window, then starting. The two choices are
+// `ha-form` fields, so they arrive as one value-changed payload rather than as two
+// separate control changes.
+const pairSpec = p._forms.pair;
+check('the dialog\u2019s choices are an ha-form', dlg().includes('<ha-form data-form="pair">')
+  && pairSpec.schema.map((s) => s.name).join(',') === 'via,duration');
+check('and both are select selectors', pairSpec.schema.every((s) => !!s.selector.select));
+pairSpec.changed({ via: routers.find((r) => !r.coordinator).ieee, duration: '60' });
 sent.length = 0;
 await act('pairstart');
 await tick(60);
@@ -1345,15 +1438,16 @@ console.log('=== add device: name and area, through HA\u2019s own registry ===')
 // The retained inventory catching up is what supplies the HA device id.
 p._devices = fx.devices.concat([fx.paired_device]);
 p._paintPairDialog();
-check('offers a name field', dlg().includes('id="pairname"'));
-check('offers every HA area', Object.values(fx.registry.areas)
-  .every((a) => dlg().includes(a.name)));
+const pairSetup = p._forms[`pairsetup:${fx.pairing.successful.ieee_address}`];
+check('offers a name field', dlg().includes('<ha-form data-form="pairsetup:')
+  && pairSetup.schema.some((s) => s.name === 'name' && s.selector.text));
+check('the area field is HA\u2019s own area picker',
+  pairSetup.schema.some((s) => s.name === 'area' && s.selector.area));
 check('saving is the closing action', !!find('data-act', 'pairsave')
   && dlg().includes('Save and close'));
 check('and adding another is offered beside it', !!find('data-act', 'pairagain'));
 sent.length = 0;
-p.shadowRoot.getElementById('pairname').value = 'Nursery Climate';
-p.shadowRoot.getElementById('pairarea').value = 'hallway';
+pairSetup.data = { name: 'Nursery Climate', area: 'hallway' };
 await act('pairsave');
 await tick(80);
 check('renames in Zigbee2MQTT by ieee, not by name', sent.some((m) =>
@@ -1438,7 +1532,7 @@ check('Create stays reachable', !!find('data-act', 'groupadd'));
 check('lists existing groups', html().includes(esc(fx.groups[0].friendly_name)));
 check('group rows open the group', !!find('data-group', String(fx.groups[0].id)));
 sent.length = 0;
-p.shadowRoot.getElementById('gname').value = 'Kitchen downlights';
+p._forms.gcreate.data = { value: 'Kitchen downlights' };
 await act('groupadd');
 await tick(40);
 check('Create -> z2m/group/add with a name', sent.some((m) =>
@@ -1454,7 +1548,7 @@ check('lists members by name, not just address',
 check('names the endpoint, because membership is per endpoint',
   html().includes('Endpoint 1'));
 sent.length = 0;
-p.shadowRoot.getElementById('grn').value = 'Lounge lights';
+p._forms[`grename:${fx.groups[0].id}`].data = { value: 'Lounge lights' };
 await act('grouprename');
 await tick(40);
 check('Rename -> z2m/group/rename', sent.some((m) =>
@@ -1465,7 +1559,8 @@ check('Rename -> z2m/group/rename', sent.some((m) =>
 // Read the rendered markup: the stub indexes elements, it does not reflow their
 // children into innerHTML, so the select's own innerHTML proves nothing here.
 const offered = Array.from(
-  /<select id="gmember">([\s\S]*?)<\/select>/.exec(html())[1].matchAll(/value="([^"]*)"/g)
+  /<ha-select id="gmember"[\s\S]*?>([\s\S]*?)<\/ha-select>/.exec(html())[1]
+    .matchAll(/value="([^"]*)"/g)
 ).map((m) => m[1]);
 check('an endpoint already in the group is not offered again',
   !offered.includes('0x0000000000000001|1'), offered.join(', '));
@@ -1497,7 +1592,7 @@ console.log('=== groups: a refusal is local and readable ===');
 p._groupError = null;
 sent.length = 0;
 failFeed = 'z2m/group/rename';
-p.shadowRoot.getElementById('grn').value = 'Duplicate name';
+p._forms[`grename:${fx.groups[0].id}`].data = { value: 'Duplicate name' };
 await act('grouprename');
 await tick(40);
 failFeed = null;

@@ -67,6 +67,14 @@ const HA_ELEMENTS = [
   'ha-alert',
   'ha-button',
   'ha-dialog',
+  // Form furniture. Every control the operator types into is one of HA's own, because
+  // a hand-rolled input hosted in HA's row component is exactly what broke on a phone:
+  // the trailing slot took the whole row and the label collapsed to nothing.
+  'ha-form',
+  'ha-settings-row',
+  'ha-select',
+  'ha-list-item',
+  'ha-textfield',
   'hass-subpage',
 ];
 
@@ -172,6 +180,71 @@ class Z2MPanel extends HTMLElement {
     this._diag = { health: null, routers: null, error: null, checked: false };
     this._ticker = null;
     this._counts = '';
+  }
+
+  /**
+   * Live `ha-form` state, keyed by what the form is editing.
+   *
+   * The form owns the operator's edits between renders -- a retained push arriving
+   * mid-typing must not reset a field -- so the spec, including its `data`, outlives
+   * the markup that hosts it. Keys carry the subject (`opts:<ieee>`) so moving to
+   * another device is a different form, not the same one with stale values.
+   */
+  _formSpec(key, make) {
+    if (!this._forms) this._forms = {};
+    if (!this._forms[key]) this._forms[key] = make();
+    return this._forms[key];
+  }
+
+  /**
+   * One text field, rendered by `ha-form`.
+   *
+   * `ha-textfield` is NOT registered in the frontend bundle this panel loads into --
+   * measured on 2026.8.3, where `customElements.get('ha-textfield')` is undefined and
+   * stays that way, so a page built on it renders an empty row. `ha-form` IS
+   * registered, and it brings its own text field with HA's metrics and its own
+   * narrow-screen behaviour, so a one-field form is the reliable native control.
+   */
+  _textField(key, o) {
+    const spec = this._formSpec(key, () => ({
+      schema: [{ name: 'value', selector: { text: {} } }],
+      data: { value: o.value || '' },
+      label: () => o.label,
+      helper: () => o.helper,
+    }));
+    spec.label = () => o.label;
+    spec.helper = () => o.helper;
+    // A value that arrived from the bridge replaces what is on screen only while the
+    // operator has not typed into it.
+    if (!spec.touched && (o.value || '') !== spec.data.value) spec.data = { value: o.value || '' };
+    return `<ha-form data-form="${esc(key)}"></ha-form>`;
+  }
+
+  /** What the operator typed into a one-field form, trimmed. */
+  _textValue(key) {
+    const spec = (this._forms || {})[key];
+    return spec ? String(spec.data.value || '').trim() : '';
+  }
+
+  /** Home Assistant selectors for one Zigbee2MQTT option, from Z2M's own schema. */
+  _optionSelector(o) {
+    if (o.type === 'binary') return { boolean: {} };
+    if (o.type === 'enum') {
+      return {
+        select: {
+          mode: 'dropdown',
+          options: (o.values || []).map((v) => ({ value: String(v), label: String(v) })),
+        },
+      };
+    }
+    if (o.type === 'numeric') {
+      const number = { mode: 'box', step: o.value_step === undefined ? 'any' : o.value_step };
+      if (o.value_min !== undefined) number.min = o.value_min;
+      if (o.value_max !== undefined) number.max = o.value_max;
+      if (o.unit) number.unit_of_measurement = o.unit;
+      return { number };
+    }
+    return { text: {} };
   }
 
   /**
@@ -522,21 +595,30 @@ class Z2MPanel extends HTMLElement {
       .chip.warn { color:var(--warning-color); }
       .chip.ok { color:var(--success-color); }
       .chip[hidden] { display:none; }
-      input[type=text], input[type=number], select { box-sizing:border-box; max-width:var(--ha-control-max-width, 220px);
-              min-height:var(--ha-touch-target-min-size, 40px); padding:var(--ha-space-2, 8px);
+      /* The only bare control left: the device search, and only while HA has not
+       * registered ha-textfield. Metrics copied from HA's own text field so the
+       * substitution is not visible. */
+      input.fallback { box-sizing:border-box; flex:1; min-width:0;
+              min-height:var(--ha-touch-target-min-size, 40px);
+              padding:var(--ha-space-2, 8px);
               border:var(--ha-border-width, 1px) solid var(--divider-color);
-              border-radius:var(--ha-border-radius-md, 8px); background:var(--card-background-color);
-              color:var(--primary-text-color); font:inherit; font-size:var(--ha-font-size-m, 14px); }
-      input[type=checkbox] { width:var(--ha-touch-target-min-size, 20px);
-              height:var(--ha-touch-target-min-size, 20px); accent-color:var(--primary-color); }
-      input:focus-visible, select:focus-visible, ha-button:focus-visible, ha-icon-button:focus-visible {
+              border-radius:var(--ha-border-radius-md, 8px);
+              background:var(--card-background-color); color:var(--primary-text-color);
+              font:inherit; font-size:var(--ha-font-size-m, 14px); }
+      input.fallback:focus-visible { outline:var(--ha-outline-width, 2px) solid var(--primary-color);
+              outline-offset:var(--ha-space-1, 4px); }
+      /* Every control the operator edits is one of HA's own components, which brings
+       * its own metrics, focus ring and narrow-screen behaviour. Hand-rolled controls
+       * in HA's row slot are what collapsed the labels and inflated the rows. */
+      ha-form { display:block; }
+      /* Deliberately NO width on HA's controls. Forcing a full-width control inside
+       * ha-settings-row collapses the row's heading to zero -- the same fault that
+       * made these screens unusable on a phone, one component later. HA's own
+       * components size themselves, and the row is told when it is narrow. */
+      ha-settings-row { padding:0; }
+      ha-button:focus-visible, ha-icon-button:focus-visible {
               outline:var(--ha-outline-width, 2px) solid var(--primary-color);
               outline-offset:var(--ha-space-1, 4px); }
-      .form-row { display:flex; align-items:center; gap:var(--ha-space-3, 12px);
-                  padding:var(--ha-space-3, 12px) var(--ha-space-4, 16px); }
-      .form-row > label { flex:1; min-width:0; color:var(--secondary-text-color);
-                          font-size:var(--ha-font-size-m, 14px); }
-      .form-row > input, .form-row > select { flex:1; min-width:0; }
       .pair-identity { padding:var(--ha-space-3, 12px) var(--ha-space-4, 16px);
                        border:var(--ha-border-width, 1px) solid var(--divider-color);
                        border-radius:var(--ha-border-radius-md, 8px); }
@@ -851,6 +933,45 @@ class Z2MPanel extends HTMLElement {
     r.querySelectorAll('[data-path]').forEach((el) => {
       el.path = el.dataset.path;
       if (el.dataset.label) el.label = el.dataset.label;
+    });
+
+    // `ha-form` is driven entirely by properties -- hass, schema, data and the two
+    // label callbacks -- so markup can only mark the spot. `_forms` is rebuilt by
+    // whichever view is being rendered, and holds the live value: the form owns the
+    // operator's edits between renders, and Save reads them from here.
+    r.querySelectorAll('[data-form]').forEach((el) => {
+      const spec = this._forms[el.dataset.form];
+      if (!spec) return;
+      el.hass = this._hass;
+      el.schema = spec.schema;
+      el.data = spec.data;
+      el.computeLabel = spec.label || ((s) => s.name);
+      el.computeHelper = spec.helper || (() => undefined);
+      if (el._z2mForm) return;
+      el._z2mForm = true;
+      el.addEventListener('value-changed', (ev) => {
+        ev.stopPropagation();
+        // Typed-in values outrank anything the bridge republishes underneath them.
+        spec.touched = true;
+        spec.data = { ...spec.data, ...(ev.detail || {}).value };
+        el.data = spec.data;
+        if (spec.changed) spec.changed(spec.data);
+      });
+    });
+
+    // ha-select and ha-textfield take their value as a property too, and ha-select
+    // fires `selected` when the menu closes -- including when the value was set from
+    // here, which is why the handler compares before acting.
+    r.querySelectorAll('[data-value]').forEach((el) => {
+      el.value = el.dataset.value;
+    });
+    r.querySelectorAll('[data-selected]').forEach((el) => {
+      if (el._z2mSelect) return;
+      el._z2mSelect = true;
+      el.addEventListener('selected', () => {
+        if (String(el.value) === String(el.dataset.value)) return;
+        this._change(el.dataset.selected, el);
+      });
     });
     r.querySelectorAll('[data-go]').forEach((el) => {
       el.onclick = () => this._go({ name: el.dataset.go });
@@ -1229,8 +1350,17 @@ class Z2MPanel extends HTMLElement {
 
     return `<ha-card class="nav-card">
         <div class="search">${icon(MDI.search, '')}
-          <input id="q" type="text" placeholder="Search ${this._devices.length} devices"
-            value="${esc(this._filter)}">
+          ${
+            this._has('ha-textfield')
+              ? `<ha-textfield id="q" type="search" data-value="${esc(this._filter)}"
+                   placeholder="Search ${this._devices.length} devices"></ha-textfield>`
+              : // Live filtering is not a settings field, and `ha-form` would put a
+                // label and a helper around it. `ha-textfield` is the right component
+                // and it is used the moment the frontend registers it; until then this
+                // is a search box that works, styled to HA's own metrics.
+                `<input id="q" class="fallback" type="search" value="${esc(this._filter)}"
+                   placeholder="Search ${this._devices.length} devices">`
+          }
         </div>
         <div class="card-content">${
           rows
@@ -1246,9 +1376,7 @@ class Z2MPanel extends HTMLElement {
     const d = this._dev(ieee);
     if (!d) return `<div class="empty">Device not found.</div>`;
 
-    const opts = (d.options || []).filter((o) =>
-      ['numeric', 'binary', 'enum', 'text'].includes(o.type)
-    );
+
 
     return `
       <ha-card class="nav-card">${this._kvs([
@@ -1268,33 +1396,19 @@ class Z2MPanel extends HTMLElement {
 
       <ha-card class="nav-card">
         <div class="card-header">Rename</div>
-        <div class="card-content">${list(
-          row({
-            icon: MDI.rename,
-            headline: 'Friendly name',
-            text: 'Changes the MQTT topic, so Home Assistant entity IDs regenerate',
-            end: `<input slot="end" id="rn" type="text" value="${esc(d.friendly_name || '')}">`,
-          })
-        )}</div>
+        <div class="card-content">
+          ${this._textField(`rename:${d.ieee_address}`, {
+            label: 'Friendly name',
+            helper: 'Changes the MQTT topic, so Home Assistant entity IDs regenerate',
+            value: d.friendly_name || '',
+          })}
+        </div>
         <div class="actions">
           <ha-button appearance="filled" size="s" data-act="rename">Rename</ha-button>
         </div>
       </ha-card>
 
-      ${
-        opts.length
-          ? `<ha-card class="nav-card">
-               <div class="card-header">Device settings</div>
-               <div class="card-content">${list(
-                 opts.map((o) => this._optionField(o)).join('')
-               )}</div>
-               <div class="note">Written straight to Zigbee2MQTT.</div>
-               <div class="actions">
-                 <ha-button appearance="filled" size="s" data-act="options">Save settings</ha-button>
-               </div>
-             </ha-card>`
-          : ''
-      }
+      ${this._optionsForm(d)}
 
       <ha-card class="nav-card"><div id="fwbox">${this._fwInner(d)}</div></ha-card>
 
@@ -1335,39 +1449,45 @@ class Z2MPanel extends HTMLElement {
   }
 
   /**
-   * Z2M ships an `options` schema per device, so the form is generated from it rather
-   * than hard-coded per model. The controls are plain form controls hosted in HA's own
-   * row component: HA ships no form-control set a non-Lit panel can drive without
-   * importing Lit, and a hand-rolled imitation of one would drift.
+   * Z2M ships an options schema per device, so the form is generated from it rather
+   * than hard-coded per model. It is rendered by `ha-form`, which is what Home
+   * Assistant's own config pages use: it lays out and validates every selector type,
+   * and it is responsive without a single line of CSS here.
+   *
+   * The previous version hosted bare `<input>`/`<select>` in the trailing slot of
+   * HA's list row. On a phone the control took the whole row, the label collapsed to
+   * zero width, and the row grew to several hundred pixels of empty space.
    */
-  _optionField(o) {
-    const attrs = ` id="opt_${esc(o.property)}" slot="end" data-prop="${esc(o.property)}"`;
-    let control;
-    if (o.type === 'binary') {
-      control = `<input${attrs} data-kind="binary" type="checkbox">`;
-    } else if (o.type === 'enum') {
-      const values = (o.values || [])
-        .map((v) => `<option value="${esc(String(v))}">${esc(String(v))}</option>`)
-        .join('');
-      control = `<select${attrs} data-kind="enum"><option value=""></option>${values}</select>`;
-    } else if (o.type === 'numeric') {
-      control =
-        `<input${attrs} data-kind="numeric" type="number"` +
-        `${o.value_min !== undefined ? ` min="${esc(o.value_min)}"` : ''}` +
-        `${o.value_max !== undefined ? ` max="${esc(o.value_max)}"` : ''}` +
-        `${o.value_step !== undefined ? ` step="${esc(o.value_step)}"` : ''}>`;
-    } else {
-      control = `<input${attrs} data-kind="text" type="text">`;
-    }
-    const range =
-      o.type === 'numeric' && o.value_min !== undefined && o.value_max !== undefined
-        ? ` (${esc(o.value_min)}\u2013${esc(o.value_max)})`
-        : '';
-    return row({
-      headline: `${esc(o.label || o.name || o.property)}${range}`,
-      text: o.description ? esc(o.description) : '',
-      end: control,
+  _optionsForm(d) {
+    const opts = (d.options || []).filter((o) => o && o.property);
+    if (!opts.length) return '';
+    const key = `opts:${d.ieee_address}`;
+    const spec = this._formSpec(key, () => ({
+      schema: opts.map((o) => ({ name: o.property, selector: this._optionSelector(o) })),
+      // Z2M reports the device's current option values separately from the schema.
+      data: { ...(d.option_values || {}) },
+      label: (s) => {
+        const o = opts.find((x) => x.property === s.name) || {};
+        return o.label || o.name || s.name;
+      },
+      helper: (s) => (opts.find((x) => x.property === s.name) || {}).description,
+    }));
+    // Values that arrived after the form was built, for fields the operator has not
+    // touched, still belong on screen.
+    Object.entries(d.option_values || {}).forEach(([k, v]) => {
+      if (!(k in spec.data)) spec.data[k] = v;
     });
+
+    return `<ha-card class="nav-card">
+        <div class="card-header">Device settings</div>
+        <div class="card-content">
+          <ha-form data-form="${esc(key)}"></ha-form>
+        </div>
+        <div class="note">Written straight to Zigbee2MQTT.</div>
+        <div class="actions">
+          <ha-button appearance="filled" size="s" data-act="options">Save settings</ha-button>
+        </div>
+      </ha-card>`;
   }
 
   /* --------------------------------------------------------------- firmware */
@@ -1610,10 +1730,11 @@ class Z2MPanel extends HTMLElement {
             )}New group</ha-button>
           </span>
         </div>
-        <div class="form-row">
-          <label for="gname">Name</label>
-          <input id="gname" type="text" placeholder="Kitchen downlights">
-        </div>
+        ${this._textField('gcreate', {
+          label: 'Name',
+          helper: 'What the group will be called in Home Assistant',
+          value: '',
+        })}
         <div class="card-content">${
           rows ? list(rows) : '<div class="empty">No Zigbee groups yet.</div>'
         }</div>
@@ -1651,9 +1772,9 @@ class Z2MPanel extends HTMLElement {
     const options = candidates
       .map(
         (c) =>
-          `<option value="${esc(`${c.device.ieee_address}|${c.endpoint}`)}">${esc(
+          `<ha-list-item value="${esc(`${c.device.ieee_address}|${c.endpoint}`)}">${esc(
             c.device.friendly_name || c.device.ieee_address
-          )}${(c.device.endpoints || []).length > 1 ? ` \u2014 endpoint ${esc(String(c.endpoint))}` : ''}</option>`
+          )}${(c.device.endpoints || []).length > 1 ? ` \u2014 endpoint ${esc(String(c.endpoint))}` : ''}</ha-list-item>`
       )
       .join('');
 
@@ -1669,10 +1790,11 @@ class Z2MPanel extends HTMLElement {
           ['Group ID', g.id],
           ['Members', members.length],
         ])}
-        <div class="form-row">
-          <label for="grn">Name</label>
-          <input id="grn" type="text" value="${esc(g.friendly_name || '')}">
-        </div>
+        ${this._textField(`grename:${g.id}`, {
+          label: 'Name',
+          helper: 'Renames the group and its MQTT topic',
+          value: g.friendly_name || '',
+        })}
         <div class="actions">
           <ha-button appearance="plain" size="s" data-act="grouprename">Rename</ha-button>
         </div>
@@ -1684,9 +1806,13 @@ class Z2MPanel extends HTMLElement {
         }</div>
         ${
           candidates.length
-            ? `<div class="form-row">
-                 <label for="gmember">Add</label>
-                 <select id="gmember">${options}</select>
+            ? `<ha-settings-row${this._narrow ? ' narrow' : ''}>
+                 <span slot="heading">Add a member</span>
+                 <span slot="description">Membership is per endpoint</span>
+                 <ha-select id="gmember" naturalMenuWidth fixedMenuPosition
+                   data-value="${esc(`${candidates[0].device.ieee_address}|${candidates[0].endpoint}`)}">${options}</ha-select>
+               </ha-settings-row>
+               <div class="actions">
                  <ha-button appearance="filled" size="s" data-act="memberadd">Add</ha-button>
                </div>`
             : '<div class="note">Every device endpoint is already in this group.</div>'
@@ -2171,39 +2297,55 @@ class Z2MPanel extends HTMLElement {
   _pairSetupStep() {
     const p = this._pairing;
     const routers = this._pairRouters();
-    const options = routers
-      .map(
-        (r) =>
-          `<option value="${esc(r.ieee)}"${r.ieee === p.via ? ' selected' : ''}>${esc(
-            r.name
-          )}${r.coordinator ? ' (coordinator)' : ''}</option>`
-      )
-      .join('');
-    const times = [60, 120, PAIR_OPEN_SECONDS]
-      .map(
-        (t) =>
-          `<option value="${t}"${t === p.duration ? ' selected' : ''}>${
-            t === PAIR_OPEN_SECONDS ? `${t} seconds (max)` : `${t} seconds`
-          }</option>`
-      )
-      .join('');
+    const spec = this._formSpec('pair', () => ({
+      schema: [],
+      // 'any' rather than an empty string: an empty value renders as an empty select,
+      // and "any router" is a real choice the operator makes, not the absence of one.
+      data: { via: 'any', duration: String(PAIR_OPEN_SECONDS) },
+      label: (s) => (s.name === 'via' ? 'Join through' : 'Open for'),
+      helper: (s) =>
+        s.name === 'via'
+          ? 'A device that refuses to join often pairs first time through a router sitting next to it, instead of whichever one answers first from across the house.'
+          : 'How long the network stays open. 254 seconds is Zigbee2MQTT\u2019s maximum.',
+      changed: (data) => {
+        p.via = data.via && data.via !== 'any' ? data.via : null;
+        p.duration = Number(data.duration) || PAIR_OPEN_SECONDS;
+      },
+    }));
+    // The router list is live: a device that joined a moment ago is a valid route now.
+    spec.schema = [
+      {
+        name: 'via',
+        selector: {
+          select: {
+            mode: 'dropdown',
+            options: [{ value: 'any', label: 'Any router' }].concat(
+              routers.map((r) => ({
+                value: r.ieee,
+                label: `${r.name}${r.coordinator ? ' (coordinator)' : ''}`,
+              }))
+            ),
+          },
+        },
+      },
+      {
+        name: 'duration',
+        selector: {
+          select: {
+            mode: 'dropdown',
+            options: [60, 120, PAIR_OPEN_SECONDS].map((t) => ({
+              value: String(t),
+              label: t === PAIR_OPEN_SECONDS ? `${t} seconds (max)` : `${t} seconds`,
+            })),
+          },
+        },
+      },
+    ];
+    spec.data = { via: p.via || 'any', duration: String(p.duration) };
 
     return `<div class="dlg-lead">The network stays closed until you press Start. Have the
         device ready: joining is usually a long press, or power-cycling it a few times.</div>
-      <div class="form-row">
-        <label for="pairvia">Join through</label>
-        <select id="pairvia" data-change="pairvia">
-          <option value=""${p.via ? '' : ' selected'}>Any router</option>
-          ${options}
-        </select>
-      </div>
-      <div class="dlg-hint">A device that refuses to join often pairs first time through a
-        router sitting next to it, instead of whichever one answers first from across the
-        house.</div>
-      <div class="form-row">
-        <label for="pairdur">Open for</label>
-        <select id="pairdur" data-change="pairdur">${times}</select>
-      </div>`;
+      <ha-form data-form="pair"></ha-form>`;
   }
 
   /** The window is open and nothing has joined yet. */
@@ -2276,7 +2418,6 @@ class Z2MPanel extends HTMLElement {
     const p = this._pairing;
     const done = p.phase === 'successful';
     const dev = this._pairDevice();
-    const areas = Object.values((this._hass && this._hass.areas) || {});
 
     return (
       `<div class="pair-hero${done ? ' ok' : ''}">
@@ -2299,31 +2440,37 @@ class Z2MPanel extends HTMLElement {
         ? `<ha-alert alert-type="error">Re-interview it from its device page, or pair it
            closer to a mains-powered device.</ha-alert>`
         : '') +
-      (done && p.target
-        ? `<div class="form-row">
-             <label for="pairname">Name</label>
-             <input id="pairname" type="text" value="${esc(
-               (dev && dev.friendly_name) || (p.event && p.event.friendly_name) || ''
-             )}">
-           </div>
-           <div class="form-row">
-             <label for="pairarea">Area</label>
-             <select id="pairarea">
-               <option value="">No area</option>
-               ${areas
-                 .map(
-                   (a) =>
-                     `<option value="${esc(a.area_id)}"${
-                       dev && dev.device_id && a.area_id === this._deviceArea(dev.device_id)
-                         ? ' selected'
-                         : ''
-                     }>${esc(a.name)}</option>`
-                 )
-                 .join('')}
-             </select>
-           </div>
-           ${p.setup.completed ? '<ha-alert alert-type="success">Saved.</ha-alert>' : ''}`
-        : '')
+      (done && p.target ? this._pairSetupForm(dev) : '')
+    );
+  }
+
+  /**
+   * Name and place the device that just joined.
+   *
+   * The area field is HA's own `area` selector, so it offers the same picker -- and
+   * the same create-an-area affordance -- as every other Home Assistant screen,
+   * instead of a list of areas this panel assembled itself.
+   */
+  _pairSetupForm(dev) {
+    const p = this._pairing;
+    const spec = this._formSpec(`pairsetup:${p.target}`, () => ({
+      schema: [
+        { name: 'name', selector: { text: {} } },
+        { name: 'area', selector: { area: {} } },
+      ],
+      data: {
+        name: (dev && dev.friendly_name) || (p.event && p.event.friendly_name) || '',
+        area: (dev && dev.device_id && this._deviceArea(dev.device_id)) || undefined,
+      },
+      label: (s) => (s.name === 'name' ? 'Name' : 'Area'),
+      helper: (s) =>
+        s.name === 'name'
+          ? 'Used for the Zigbee friendly name and the Home Assistant display name'
+          : 'Where the device is, in Home Assistant\u2019s own areas',
+    }));
+    return (
+      `<ha-form data-form="${esc(`pairsetup:${p.target}`)}"></ha-form>` +
+      (p.setup.completed ? '<ha-alert alert-type="success">Saved.</ha-alert>' : '')
     );
   }
 
@@ -2404,12 +2551,10 @@ class Z2MPanel extends HTMLElement {
    * ids are deliberately left alone -- they belong to MQTT discovery.
    */
   async _savePairSetup() {
-    const r = this.shadowRoot;
     const p = this._pairing;
-    const nameEl = r && r.getElementById('pairname');
-    const areaEl = r && r.getElementById('pairarea');
-    const name = nameEl ? String(nameEl.value || '').trim() : '';
-    const areaId = areaEl ? areaEl.value || null : null;
+    const spec = (this._forms || {})[`pairsetup:${p.target}`] || { data: {} };
+    const name = String(spec.data.name || '').trim();
+    const areaId = spec.data.area || null;
     if (!p.target) return;
 
     p.setup.saving = true;
@@ -2456,17 +2601,24 @@ class Z2MPanel extends HTMLElement {
   _optionsView() {
     const s = this._summary || {};
     const levels = LOG_LEVELS.map(
-      (l) => `<option value="${l}"${s.log_level === l ? ' selected' : ''}>${l}</option>`
+      (l) => `<ha-list-item value="${l}">${l}</ha-list-item>`
     ).join('');
     return (
       card(
+        // A label with a control beside it is what `ha-settings-row` is for: it puts
+        // the control under the label on a narrow screen instead of squeezing both
+        // onto one line, which is what went wrong when this was a bare <select> in a
+        // list row's trailing slot.
+        `<ha-settings-row${this._narrow ? ' narrow' : ''}>
+           <span slot="heading">Log level</span>
+           <span slot="description">Applied to Zigbee2MQTT immediately; debug is very
+             chatty</span>
+           <ha-select id="loglevel" naturalMenuWidth fixedMenuPosition
+             data-selected="loglevel" data-value="${esc(s.log_level || 'info')}">
+             ${levels}
+           </ha-select>
+         </ha-settings-row>` +
         list(
-          row({
-            icon: MDI.logs,
-            headline: 'Log level',
-            text: 'Applied to Zigbee2MQTT immediately; debug is very chatty',
-            end: `<select slot="end" id="loglevel" data-change="loglevel">${levels}</select>`,
-          }) +
             row({
               icon: MDI.plus,
               headline: 'Permit joining',
@@ -2597,14 +2749,15 @@ class Z2MPanel extends HTMLElement {
   _logsView() {
     const levels = ['all']
       .concat(LOG_LEVELS)
-      .map((l) => `<option value="${l}"${this._logMin === l ? ' selected' : ''}>${l}</option>`)
+      .map((l) => `<ha-list-item value="${l}">${l}</ha-list-item>`)
       .join('');
     return (
       `<ha-card class="nav-card">
         <div class="search">
           ${icon(MDI.logs, '')}
           <div class="grow">Minimum level</div>
-          <select id="logmin" data-change="logmin">${levels}</select>
+          <ha-select id="logmin" naturalMenuWidth fixedMenuPosition
+            data-selected="logmin" data-value="${esc(this._logMin || 'all')}">${levels}</ha-select>
           <span class="chip warn" id="logpaused"${this._logPinned ? ' hidden' : ''}>paused</span>
           <ha-button appearance="plain" size="s" data-act="logbottom">Latest</ha-button>
         </div>
@@ -2942,16 +3095,8 @@ class Z2MPanel extends HTMLElement {
       this._paintLogs();
       return;
     }
-    // Both of these are read again when Start is pressed, so a repaint is not
-    // needed and would only fight the operator for the open select.
-    if (name === 'pairvia') {
-      this._pairing.via = el.value || null;
-      return;
-    }
-    if (name === 'pairdur') {
-      this._pairing.duration = Number(el.value) || PAIR_OPEN_SECONDS;
-      return;
-    }
+    // Pairing's two choices are `ha-form` fields now, so they arrive through the
+    // form's own value-changed rather than as a control-by-control change.
     if (name === 'loglevel') this._act('z2m/log_level', { value: el.value });
   }
 
@@ -3054,19 +3199,19 @@ class Z2MPanel extends HTMLElement {
       }
 
       case 'groupadd': {
-        const input = r.getElementById('gname');
-        const name = input && String(input.value || '').trim();
+        const name = this._textValue('gcreate');
         if (!name) return undefined;
         return this._groupWrite('z2m/group/add', { name }, (res) => {
-          if (input) input.value = '';
+          // The field is cleared by dropping the form's state: the next render builds
+          // it again from an empty value.
+          delete this._forms.gcreate;
           if (res && res.id !== undefined) this._go({ name: 'group', group: res.id });
         });
       }
 
       case 'grouprename': {
-        const input = r.getElementById('grn');
-        const to = input && String(input.value || '').trim();
         const group = this._view.group;
+        const to = this._textValue(`grename:${group}`);
         const current = this._group(group);
         if (!to || !current || to === current.friendly_name) return undefined;
         return this._groupWrite('z2m/group/rename', { group, to });
@@ -3206,21 +3351,25 @@ class Z2MPanel extends HTMLElement {
       }
 
       case 'rename': {
-        const input = r.getElementById('rn');
-        const to = input && String(input.value || '').trim();
-        if (!to || to === d.friendly_name) return;
+        const to = this._textValue(`rename:${device}`);
+        if (!to || to === d.friendly_name) return undefined;
         return this._act('z2m/device/rename', { from: d.friendly_name, to });
       }
 
       case 'options': {
+        // The form holds the operator's edits; only what actually differs from the
+        // device's current values is written, so Save on an untouched form is a no-op
+        // rather than a pointless write to every option.
+        const spec = (this._forms || {})[`opts:${device}`];
+        if (!spec) return undefined;
+        const current = d.option_values || {};
         const options = {};
-        r.querySelectorAll('[data-prop]').forEach((input) => {
-          const kind = input.dataset.kind;
-          if (kind === 'binary') options[input.dataset.prop] = input.checked;
-          else if (input.value !== '')
-            options[input.dataset.prop] = kind === 'numeric' ? Number(input.value) : input.value;
+        Object.entries(spec.data || {}).forEach(([k, v]) => {
+          if (v === undefined || v === null || v === '') return;
+          if (String(current[k]) === String(v)) return;
+          options[k] = v;
         });
-        if (!Object.keys(options).length) return;
+        if (!Object.keys(options).length) return undefined;
         return this._act('z2m/device/options', { device, options });
       }
 

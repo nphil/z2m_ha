@@ -53,9 +53,11 @@ from homeassistant.helpers.dispatcher import (
 )
 
 from .const import (
+    BINDABLE_CLUSTERS,
     BRIDGE_TOPICS,
     CONF_LABEL_ID,
     COORDINATOR_CHECK_TIMEOUT,
+    DEFAULT_BIND_GROUP_ID,
     DOMAIN,
     EXTENSION_NAME,
     EXTENSION_SAVE_TIMEOUT,
@@ -75,11 +77,14 @@ from .const import (
     SCAN_CONCURRENCY,
     SCAN_DEVICE_TIMEOUT,
     SCAN_MIN_INTERVAL,
+    SCENE_RECALL_GRACE,
+    SCENE_TIMEOUT,
     SIGNAL_DEVICE_LIST,
     SIGNAL_DEVICES,
     SIGNAL_GROUPS,
     SIGNAL_LOG,
     SIGNAL_MAP,
+    SIGNAL_OTA,
     SIGNAL_PAIRING,
     SIGNAL_UPDATE,
     TOPIC_DEVICES,
@@ -342,6 +347,16 @@ class Z2MData:
         # only this side is guaranteed to be told when a client disappears.
         self._verbose_users = 0
         self._verbose_restore: str | None = None
+        # Last OTA state seen per IEEE address, and how many firmware views are
+        # watching. The device state topics that carry firmware progress are NOT
+        # retained -- Z2M publishes them with `retain` taken from the device's own
+        # options, which defaults to false -- so there is nothing to read back on
+        # connect and the subscription has to be live. It is refcounted and taken out
+        # only while somebody is looking, because it is a wildcard over every device
+        # topic on the base topic: free when no firmware view is open.
+        self._ota: dict[str, dict[str, Any]] = {}
+        self._ota_users = 0
+        self._ota_unsub: Callable[[], None] | None = None
         # Set by Z2MLabels once the label is resolved, and surfaced in summary() so
         # the panel can deep-link into HA's own tables with ?label=<id>.
         self.label_id: str | None = None
@@ -440,6 +455,13 @@ class Z2MData:
         for unsub in self._unsubs:
             unsub()
         self._unsubs.clear()
+        # The firmware mirror is not in _unsubs: it comes and goes with the views
+        # watching it, so it has to be dropped here explicitly. Zeroing the refcount
+        # too, or a view that outlives the entry would leave it permanently held.
+        if self._ota_unsub is not None:
+            self._ota_unsub()
+            self._ota_unsub = None
+        self._ota_users = 0
         scan = self._scan
         if scan is not None and scan.task is not None and not scan.task.done():
             scan.task.cancel()
@@ -655,6 +677,151 @@ class Z2MData:
         """Begin a UI-owned positive permit window with an empty session list."""
         self._pairing_sessions.clear()
         async_dispatcher_send(self.hass, SIGNAL_PAIRING, self.pairing_message())
+
+    # ---------------------------------------------------------------------- ota
+    #
+    # Firmware progress is the one thing in this integration that is NOT on a bridge
+    # topic. Z2M publishes it as an `update` key on the DEVICE's own state topic,
+    # `<base>/<friendly_name>`, from otaUpdate.ts's publishEntityState calls -- there
+    # is no bridge/response and no retained snapshot, because that topic is published
+    # with `retain` taken from the device's options and that defaults to false.
+    #
+    # So: a live wildcard subscription, taken out only while a firmware view is
+    # watching and dropped when the last one goes, exactly like the pairing view's
+    # log level. Held here rather than in the browser for the same reason -- a tab
+    # that is closed, reloaded or loses Wi-Fi never runs its own cleanup, but Home
+    # Assistant always tears a websocket subscription down.
+
+    async def async_ota_acquire(self) -> None:
+        """Start mirroring device OTA state, if nobody is already doing it."""
+        self._ota_users += 1
+        if self._ota_users > 1 or self._ota_unsub is not None:
+            return
+        # A wildcard rather than 42 per-device subscriptions: a friendly name may
+        # itself contain slashes, so no fixed-depth pattern can match every device,
+        # and a rename would invalidate the whole set anyway.
+        self._ota_unsub = await mqtt.async_subscribe(
+            self.hass, f"{self.base_topic}/#", self._on_device_state, 0
+        )
+        _LOGGER.debug("Firmware view subscribed to %s device state", self.base_topic)
+
+    @callback
+    def async_ota_release(self) -> None:
+        """Drop the mirror once the last firmware view has gone."""
+        self._ota_users = max(0, self._ota_users - 1)
+        if self._ota_users or self._ota_unsub is None:
+            return
+        self._ota_unsub()
+        self._ota_unsub = None
+        _LOGGER.debug("Firmware view unsubscribed from %s device state", self.base_topic)
+
+    @callback
+    def _on_device_state(self, msg: mqtt.ReceiveMessage) -> None:
+        """Pick firmware progress out of one device state publish.
+
+        The wildcard also delivers the bridge topics, availability and any `set`/`get`
+        echo, so the cheap prefix and suffix tests come before the JSON parse: this
+        runs for every state change of every device while a firmware view is open.
+        """
+        suffix = msg.topic[len(self.base_topic) + 1 :]
+        if not suffix or suffix.startswith("bridge/"):
+            return
+        tail = suffix.rsplit("/", 1)[-1]
+        if tail in ("availability", "set", "get") or "/set/" in suffix or "/get/" in suffix:
+            return
+        try:
+            payload = json.loads(msg.payload)
+        except ValueError:
+            return
+        if not isinstance(payload, dict):
+            return
+        update = payload.get("update")
+        if not isinstance(update, dict):
+            return
+        # The topic carries the friendly name; the panel addresses devices by ieee.
+        ieee = self._ieee_of(suffix)
+        if ieee is None:
+            return
+        self._store_ota(ieee, update, suffix)
+
+    @callback
+    def _store_ota(
+        self, ieee: str, update: dict[str, Any], name: str | None = None
+    ) -> None:
+        """Normalize one OTA state and push it, if it actually changed.
+
+        `progress` and `remaining` are present only while a transfer is running --
+        Z2M deletes them from its cached state the moment one ends, and on its own
+        restart -- so they are carried through as absent rather than as zero. A
+        stale 97% is worse than no number at all.
+        """
+        event: dict[str, Any] = {
+            "ieee_address": ieee,
+            "friendly_name": name if name is not None else self._name_of(ieee),
+            # "updating" | "idle" | "available" | "scheduled", per otaUpdate.ts.
+            "state": update.get("state"),
+            "installed_version": update.get("installed_version"),
+            "latest_version": update.get("latest_version"),
+            "latest_source": update.get("latest_source"),
+            "latest_release_notes": update.get("latest_release_notes"),
+        }
+        for key in ("progress", "remaining"):
+            if update.get(key) is not None:
+                event[key] = update[key]
+        # A failure Z2M has already reported for this device stays attached until its
+        # state moves on, so the operator is not left with a silent stall.
+        previous = self._ota.get(ieee)
+        if previous is not None and previous.get("error") and event["state"] == previous.get("state"):
+            event["error"] = previous["error"]
+        if previous == event:
+            return
+        self._ota[ieee] = event
+        async_dispatcher_send(self.hass, SIGNAL_OTA, dict(event))
+
+    @callback
+    def _store_ota_error(self, name: str, message: str) -> None:
+        """Attach a failure Z2M logged to whichever device it names.
+
+        The `update` payload has no error field: when a transfer fails, Z2M publishes
+        state `available` again and says why only on bridge/logging. Without this the
+        panel would show a firmware update that simply stopped, with the reason
+        sitting in a log the operator has to go and find.
+        """
+        ieee = self._ieee_of(name)
+        if ieee is None:
+            return
+        event = dict(self._ota.get(ieee) or {"ieee_address": ieee, "state": None})
+        event["friendly_name"] = name
+        event["error"] = message
+        event.pop("progress", None)
+        event.pop("remaining", None)
+        if self._ota.get(ieee) == event:
+            return
+        self._ota[ieee] = event
+        async_dispatcher_send(self.hass, SIGNAL_OTA, dict(event))
+
+    @callback
+    def ota_snapshot(self) -> list[dict[str, Any]]:
+        """Every OTA state seen since the entry loaded, newest value per device.
+
+        Deliberately not the whole fleet: the state topics are not retained, so a
+        device that has not published since load has no OTA state we could honestly
+        report. The panel already carries `update_entity` per device, which is where
+        installed and latest version come from when this is silent.
+        """
+        return [dict(event) for event in self._ota.values()]
+
+    @callback
+    def _ieee_of(self, name: str) -> str | None:
+        """The ieee behind a friendly name, or the name itself if it IS an ieee."""
+        for device in self.devices:
+            if device.get("friendly_name") == name:
+                ieee = device.get("ieee_address")
+                return ieee if isinstance(ieee, str) else None
+        if any(device.get("ieee_address") == name for device in self.devices):
+            return name
+        return None
+
     @callback
     def _on_availability(self, msg: mqtt.ReceiveMessage) -> None:
         # <base>/<friendly name>/availability -- the name may itself contain slashes.
@@ -730,6 +897,30 @@ class Z2MData:
         }
         self.logs.append(entry)
         async_dispatcher_send(self.hass, SIGNAL_LOG, entry)
+        # An OTA failure exists ONLY as a log line -- the `update` payload Z2M
+        # republishes afterwards just says `available` again, with no reason. Costs
+        # nothing when no firmware view is open, which is the normal case.
+        if self._ota_users and entry["level"] == "error":
+            self._capture_ota_error(entry["message"])
+
+    @callback
+    def _capture_ota_error(self, message: str) -> None:
+        """Attribute an OTA error line to its device, if this is one.
+
+        Both texts are read off 2.13.0's otaUpdate.ts rather than guessed:
+          "OTA update of '<name>' failed (<reason>)"      -- the transfer threw
+          "Update of '<name>' failed (No image currently available)"
+        Anything else is left alone; a log line we cannot attribute is not turned
+        into a firmware error against an arbitrary device.
+        """
+        for prefix in ("OTA update of '", "Update of '"):
+            if not message.startswith(prefix):
+                continue
+            rest = message[len(prefix) :]
+            name, sep, _ = rest.rpartition("' failed")
+            if sep and name:
+                self._store_ota_error(name, message)
+            return
 
     @callback
     def _on_response(self, msg: mqtt.ReceiveMessage) -> None:
@@ -834,7 +1025,7 @@ class Z2MData:
         return await self._async_wait(path, pending, timeout)
 
     async def async_request_mutation(
-        self, path: str, payload: Any, timeout: float
+        self, path: str, payload: Any, timeout: float, lock: str | None = None
     ) -> dict[str, Any]:
         """Publish a WRITE and return its own answer, never somebody else's.
 
@@ -845,12 +1036,47 @@ class Z2MData:
         caller would be handed the first one's result and the second command would
         never be sent. Serializing per path gives every mutation its own
         transaction, its own publish and its own response.
+
+        `lock` overrides the key those writes queue on, for the case where several
+        DIFFERENT paths contend for one piece of hardware. Touchlink is the reason it
+        exists: herdsman refuses a second touchlink operation outright with
+        "Touchlink operation already in progress", and scan, identify and
+        factory_reset are three separate paths that would otherwise not see each
+        other at all.
         """
-        lock = self._mutation_locks.get(path)
-        if lock is None:
-            lock = self._mutation_locks[path] = asyncio.Lock()
-        async with lock:
+        key = lock if lock is not None else path
+        wait = self._mutation_locks.get(key)
+        if wait is None:
+            wait = self._mutation_locks[key] = asyncio.Lock()
+        async with wait:
             return await self.async_request_response(path, payload, timeout)
+
+    async def async_request_refusal(
+        self, path: str, payload: Any, window: float
+    ) -> dict[str, Any] | None:
+        """Publish a write and wait only long enough to catch a REFUSAL.
+
+        For the one endpoint whose success reply is useless to wait for:
+        bridge/response/device/ota_update/update is terminal, published only once the
+        whole firmware transfer has finished, carrying the from/to file versions.
+        That is minutes. Awaiting it on any sane timeout would report a failure for
+        every update that actually worked.
+
+        Z2M's refusals for that endpoint, on the other hand, are published before it
+        touches the radio -- unknown device, update already in progress, device does
+        not support OTA -- so a short window separates "no" from "working on it"
+        cleanly.
+
+        Returns the answer if one arrived inside the window, or None for "not
+        refused, still running". Raises Z2MError only for an actual refusal. The
+        pending slot is released when the window closes, so the terminal reply that
+        lands minutes later is dropped rather than being credited to a later request.
+        """
+        try:
+            return await self.async_request_mutation(path, payload, window)
+        except _NoAnswer:
+            _LOGGER.debug("No refusal of %s within %gs; treating as accepted", path, window)
+            return None
 
     async def _async_wait(
         self, path: str, pending: _Pending, timeout: float
@@ -863,7 +1089,10 @@ class Z2MData:
                 # away, must not cancel the future its fellow riders still hold.
                 response = await asyncio.shield(pending.future)
         except TimeoutError:
-            raise Z2MError(
+            # _NoAnswer, not a bare Z2MError: silence and a refusal are different
+            # facts, and async_request_refusal is built on being able to tell them
+            # apart. Still a Z2MError, so every existing caller is unaffected.
+            raise _NoAnswer(
                 f"Zigbee2MQTT did not answer {path} within {timeout:g}s"
             ) from None
         finally:
@@ -892,6 +1121,410 @@ class Z2MData:
             {"ieee": router.get("ieee_address"), "name": router.get("friendly_name")}
             for router in data.get("missing_routers") or []
         ]
+
+    # --------------------------------------------------------- retained projections
+    #
+    # Binds, clusters, configured reportings and scenes are ALL already in the
+    # retained bridge/devices and bridge/groups payloads -- per endpoint, keyed by
+    # numeric endpoint id (see Zigbee2MQTTDeviceEndpoint in 2.13.0's lib/types/api.ts).
+    # Nothing below costs an MQTT round trip, let alone radio time; these are pure
+    # reshapes of state the mirror is holding anyway.
+    #
+    # They are reshapes rather than passthroughs because the raw payload makes the
+    # frontend do work it should not: endpoints arrive as an object keyed by a
+    # stringified number (so iteration order is not endpoint order), bind targets
+    # carry an ieee with no name, and "which clusters can I bind" is a rule living in
+    # Z2M's source rather than a field.
+
+    @callback
+    def _device_entry(self, ieee: str) -> dict[str, Any] | None:
+        """One retained device entry, by ieee address or by friendly name."""
+        for device in self.devices:
+            if device.get("ieee_address") == ieee:
+                return device
+        for device in self.devices:
+            if device.get("friendly_name") == ieee:
+                return device
+        return None
+
+    @callback
+    def _group_entry(self, target: Any) -> dict[str, Any] | None:
+        """One retained group entry, by numeric id or by friendly name."""
+        text = str(target)
+        for group in self.groups:
+            if str(group.get("id")) == text or group.get("friendly_name") == text:
+                return group
+        return None
+
+    @callback
+    def _sorted_endpoints(self, device: dict[str, Any]) -> list[tuple[int, dict]]:
+        """A device's endpoints as (id, payload) pairs in endpoint order.
+
+        Z2M keys `endpoints` by endpoint id, which survives JSON as a STRING key, so
+        the natural iteration order is lexical: 1, 10, 2. Sorting numerically here is
+        what stops a multi-endpoint device listing its endpoints in nonsense order.
+        """
+        raw = device.get("endpoints")
+        if not isinstance(raw, dict):
+            return []
+        out: list[tuple[int, dict]] = []
+        for key, value in raw.items():
+            try:
+                number = int(key)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(value, dict):
+                out.append((number, value))
+        out.sort(key=lambda pair: pair[0])
+        return out
+
+    @callback
+    def _bind_target(self, target: Any) -> dict[str, Any] | None:
+        """Name a bind target, so the UI shows a device rather than an address.
+
+        Z2M's target is a discriminated union on `type`: "endpoint" carries
+        ieee_address + endpoint, "group" carries id. Neither carries a name, and a
+        bind list rendered as raw ieee addresses is unreadable -- which is the whole
+        reason this resolves them. A target we cannot name is still returned, with
+        `name` left None: a bind to a device that has since been removed is exactly
+        what the operator needs to see in order to clean it up.
+        """
+        if not isinstance(target, dict):
+            return None
+        kind = target.get("type")
+        if kind == "group":
+            group_id = target.get("id")
+            group = self._group_entry(group_id) if group_id is not None else None
+            return {
+                "type": "group",
+                "id": group_id,
+                "name": (group or {}).get("friendly_name"),
+                # Z2M's own internal bind group, not something the operator made.
+                "default_bind_group": group_id == DEFAULT_BIND_GROUP_ID,
+            }
+        if kind == "endpoint":
+            ieee = target.get("ieee_address")
+            endpoint = target.get("endpoint")
+            device = self._device_entry(ieee) if isinstance(ieee, str) else None
+            names = dict(self._sorted_endpoints(device)) if device else {}
+            return {
+                "type": "endpoint",
+                "ieee_address": ieee,
+                "endpoint": endpoint,
+                "name": (device or {}).get("friendly_name"),
+                "endpoint_name": (names.get(endpoint) or {}).get("name"),
+                "coordinator": (device or {}).get("type") == "Coordinator",
+            }
+        return None
+
+    @callback
+    def device_binds(self, ieee: str) -> dict[str, Any]:
+        """Every bind currently programmed into one device, flattened.
+
+        One row per (endpoint, cluster, target) because that is the unit the operator
+        deletes: Z2M's unbind takes exactly that triple. Nesting them under endpoints
+        would make the common case -- a device with one endpoint and three binds --
+        two levels deep for no gain.
+
+        Costs nothing on the radio. This is the retained inventory reshaped; Z2M
+        republishes bridge/devices itself after every bind, unbind and reporting
+        write, so it is never stale for longer than one broker round trip.
+        """
+        device = self._device_entry(ieee)
+        if device is None:
+            raise Z2MError(f"Zigbee2MQTT does not know a device called '{ieee}'")
+        binds: list[dict[str, Any]] = []
+        for number, endpoint in self._sorted_endpoints(device):
+            for entry in endpoint.get("bindings") or []:
+                if not isinstance(entry, dict):
+                    continue
+                target = self._bind_target(entry.get("target"))
+                if target is None:
+                    continue
+                binds.append(
+                    {
+                        "endpoint": number,
+                        "endpoint_name": endpoint.get("name"),
+                        "cluster": entry.get("cluster"),
+                        "target": target,
+                    }
+                )
+        return {
+            "ieee_address": device.get("ieee_address"),
+            "friendly_name": device.get("friendly_name"),
+            "binds": binds,
+        }
+
+    @callback
+    def device_clusters(self, ieee: str) -> dict[str, Any]:
+        """What each endpoint of one device speaks, and what it can be bound on.
+
+        `bindable` is the part the frontend must not try to work out for itself. Z2M
+        attempts only the eleven clusters in its own ALL_CLUSTER_CANDIDATES list, and
+        only where the SOURCE endpoint supports the cluster as input or output
+        (lib/extension/bind.ts, `sourceValid`). Offering anything else produces a
+        request that comes back "Nothing to bind" every single time, which reads as a
+        broken panel rather than an impossible bind.
+
+        The direction rule for the far end is deliberately NOT applied here: whether a
+        given cluster pairs up depends on the target, which the operator has not
+        picked yet at the point this list is drawn. Groups and the coordinator accept
+        any cluster the source has, so filtering by target would be wrong as often as
+        it was right.
+
+        Costs nothing on the radio -- entirely from the retained inventory.
+        """
+        device = self._device_entry(ieee)
+        if device is None:
+            raise Z2MError(f"Zigbee2MQTT does not know a device called '{ieee}'")
+        endpoints: list[dict[str, Any]] = []
+        for number, endpoint in self._sorted_endpoints(device):
+            clusters = endpoint.get("clusters")
+            clusters = clusters if isinstance(clusters, dict) else {}
+            supported_in = [c for c in clusters.get("input") or [] if isinstance(c, str)]
+            supported_out = [c for c in clusters.get("output") or [] if isinstance(c, str)]
+            speaks = set(supported_in) | set(supported_out)
+            endpoints.append(
+                {
+                    "endpoint": number,
+                    "name": endpoint.get("name"),
+                    "input": supported_in,
+                    "output": supported_out,
+                    # Kept in Z2M's own candidate order, not alphabetical: that order
+                    # runs from the clusters operators actually bind (scenes, on/off,
+                    # level) to the rare ones, which is the right order to offer them.
+                    "bindable": [c for c in BINDABLE_CLUSTERS if c in speaks],
+                    "bindings": [
+                        {
+                            "cluster": entry.get("cluster"),
+                            "target": self._bind_target(entry.get("target")),
+                        }
+                        for entry in endpoint.get("bindings") or []
+                        if isinstance(entry, dict)
+                        and self._bind_target(entry.get("target")) is not None
+                    ],
+                    # Passed through as Z2M reports it. `attribute` is the herdsman
+                    # attribute NAME when it knows one and the numeric id when it does
+                    # not, so the UI must be able to render either.
+                    "configured_reportings": [
+                        entry
+                        for entry in endpoint.get("configured_reportings") or []
+                        if isinstance(entry, dict)
+                    ],
+                }
+            )
+        return {
+            "ieee_address": device.get("ieee_address"),
+            "friendly_name": device.get("friendly_name"),
+            "type": device.get("type"),
+            "endpoints": endpoints,
+            # The full candidate list, so a UI can say "this device supports 3 of the
+            # 11 bindable clusters" without hardcoding Z2M's list a second time.
+            "bindable_clusters": list(BINDABLE_CLUSTERS),
+        }
+
+    @callback
+    def scenes_for(self, target: Any) -> dict[str, Any]:
+        """Scenes stored on one device or group, from the retained inventory.
+
+        The asymmetry here is Z2M's, not ours. A GROUP carries its scenes at the top
+        level of its bridge/groups entry. A DEVICE does not carry them at all: they
+        live per endpoint, because that is where the Zigbee scene table lives, and a
+        two-gang switch can genuinely hold different scenes on each gang.
+
+        So a device answer gives both -- `endpoints` for the truth, and `scenes` as
+        the union, because the overwhelmingly common device has exactly one endpoint
+        and a flat list is what its UI wants. Where two endpoints hold the same scene
+        id, the union keeps the first name seen and `endpoints` still shows both.
+
+        Costs nothing on the radio.
+        """
+        group = self._group_entry(target)
+        if group is not None:
+            return {
+                "target": group.get("id"),
+                "kind": "group",
+                "friendly_name": group.get("friendly_name"),
+                "scenes": [s for s in group.get("scenes") or [] if isinstance(s, dict)],
+                "endpoints": [],
+            }
+
+        device = self._device_entry(str(target))
+        if device is None:
+            raise Z2MError(
+                f"Zigbee2MQTT does not know a device or group called '{target}'"
+            )
+        endpoints: list[dict[str, Any]] = []
+        union: dict[Any, dict[str, Any]] = {}
+        for number, endpoint in self._sorted_endpoints(device):
+            scenes = [s for s in endpoint.get("scenes") or [] if isinstance(s, dict)]
+            endpoints.append(
+                {"endpoint": number, "name": endpoint.get("name"), "scenes": scenes}
+            )
+            for scene in scenes:
+                union.setdefault(scene.get("id"), scene)
+        return {
+            "target": device.get("ieee_address"),
+            "kind": "device",
+            "friendly_name": device.get("friendly_name"),
+            "scenes": list(union.values()),
+            "endpoints": endpoints,
+        }
+
+    @callback
+    def _scene_ids(self, target: Any) -> set[Any] | None:
+        """The scene ids currently stored for a target, or None if it is unknown."""
+        try:
+            known = self.scenes_for(target)
+        except Z2MError:
+            return None
+        return {scene.get("id") for scene in known["scenes"]}
+
+    # ------------------------------------------------------------------- scenes
+    #
+    # Scenes are the one part of this API that is NOT a bridge request. They are
+    # zigbee-herdsman-converters `toZigbee` converters driven through the ordinary
+    # publish path, so they go to `<base>/<target>/set` and NOTHING answers them on
+    # any bridge/response topic. A publish is not a confirmation, so the two things
+    # that ARE observable are used instead:
+    #
+    #  1. Z2M republishes the retained inventory after any scene MUTATION. Its
+    #     publish extension emits `scenesChanged` for scene_store / scene_add /
+    #     scene_remove / scene_remove_all / scene_rename, and the bridge extension
+    #     answers that by republishing both bridge/devices and bridge/groups.
+    #  2. A converter that throws is logged on bridge/logging at level error, as
+    #     "Publish 'set' '<key>' to '<name>' failed: '<reason>'" -- the only place the
+    #     reason exists at all.
+    #
+    # Crucially (1) alone is NOT success: the publish extension sets its scenesChanged
+    # flag after the try/except, so a FAILED store republishes too. What distinguishes
+    # them is whether the republished inventory actually reflects the request, which
+    # is what `expect` below checks. Radio cost is one ZCL scene command.
+
+    async def async_scene_write(
+        self,
+        target: Any,
+        endpoint: Any,
+        key: str,
+        value: Any,
+        expect: Callable[[set[Any]], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Publish one scene command and wait for something that proves it landed.
+
+        `expect` is a predicate over the target's scene ids after Z2M has
+        republished. Pass None for scene_recall, which stores nothing and therefore
+        changes no inventory -- there the only available signal is the absence of a
+        converter failure, and that is what is waited for.
+
+        Raises Z2MError carrying Zigbee2MQTT's own words when the converter failed,
+        and a specific description when the inventory came back without the change.
+        """
+        group = self._group_entry(target)
+        entity = group if group is not None else self._device_entry(str(target))
+        if entity is None:
+            raise Z2MError(
+                f"Zigbee2MQTT does not know a device or group called '{target}'"
+            )
+        # The log line names the entity by FRIENDLY NAME however it was addressed, so
+        # a caller that passed an ieee still gets its error matched.
+        name = entity.get("friendly_name") or str(target)
+
+        # One event woken by either signal, plus the state each one records. A single
+        # event keeps this to one wait with no per-iteration task creation, and makes
+        # the lost-wakeup window explicit rather than accidental.
+        progress = asyncio.Event()
+        failure: list[str] = []
+        republishes = 0
+        marker = f"Publish 'set' '{key}' to '{name}' failed"
+
+        @callback
+        def _on_log(entry: dict[str, Any]) -> None:
+            if entry.get("level") != "error":
+                return
+            message = entry.get("message") or ""
+            if marker in message:
+                failure.append(message)
+                progress.set()
+
+        @callback
+        def _on_inventory(*_: Any) -> None:
+            nonlocal republishes
+            republishes += 1
+            progress.set()
+
+        detaches = [async_dispatcher_connect(self.hass, SIGNAL_LOG, _on_log)]
+        if expect is not None:
+            detaches.append(
+                async_dispatcher_connect(self.hass, SIGNAL_DEVICES, _on_inventory)
+            )
+            detaches.append(
+                async_dispatcher_connect(self.hass, SIGNAL_GROUPS, _on_inventory)
+            )
+
+        try:
+            # Listeners are attached BEFORE the publish: Z2M can answer a local
+            # broker faster than this coroutine gets rescheduled, and a signal fired
+            # before the connect would simply be missed.
+            suffix = "set" if endpoint in (None, "") else f"{endpoint}/set"
+            topic = f"{self.base_topic}/{target}/{suffix}"
+            body = json.dumps({key: value})
+            await mqtt.async_publish(self.hass, topic, body, qos=0, retain=False)
+            _LOGGER.debug("Published %s -> %s", topic, body)
+
+            if expect is None:
+                # scene_recall. Nothing is stored, so there is no inventory change to
+                # wait for and the honest answer is "sent, and Z2M did not complain".
+                try:
+                    async with asyncio.timeout(SCENE_RECALL_GRACE):
+                        while not failure:
+                            progress.clear()
+                            await progress.wait()
+                except TimeoutError:
+                    return {"sent": True, "confirmed_by": None}
+                raise Z2MError(failure[-1])
+
+            deadline = self.hass.loop.time() + SCENE_TIMEOUT
+            seen = 0
+            while True:
+                if failure:
+                    # Z2M logs the converter failure before it emits scenesChanged,
+                    # so this is reached ahead of the republish, with the real reason.
+                    raise Z2MError(failure[-1])
+                if republishes > seen:
+                    seen = republishes
+                    ids = self._scene_ids(target)
+                    if ids is None:
+                        raise Z2MError(f"Zigbee2MQTT no longer reports '{target}'")
+                    if expect(ids):
+                        return {"sent": True, "confirmed_by": "inventory"}
+                    # A republish that does not carry the change means the Zigbee
+                    # command failed. Carry on waiting in case this was somebody
+                    # else's republish arriving first; the timeout is now the answer.
+                remaining = deadline - self.hass.loop.time()
+                if remaining <= 0:
+                    break
+                progress.clear()
+                # Re-checked after the clear: a signal that landed between the checks
+                # above and the clear would otherwise be dropped and this would wait
+                # out the full timeout on state it had already been told about.
+                if failure or republishes > seen:
+                    continue
+                try:
+                    async with asyncio.timeout(remaining):
+                        await progress.wait()
+                except TimeoutError:
+                    break
+
+            if failure:
+                raise Z2MError(failure[-1])
+            raise Z2MError(
+                f"Zigbee2MQTT accepted the {key} for '{name}' but its inventory did "
+                f"not show the change within {SCENE_TIMEOUT:g}s, so the device did "
+                f"not confirm the scene command"
+            )
+        finally:
+            for detach in detaches:
+                detach()
 
     # ----------------------------------------------------------------- extension
 
@@ -1738,6 +2371,15 @@ class Z2MData:
                     # hard-coding one per device model.
                     "exposes": defn.get("exposes") or [],
                     "options": defn.get("options") or [],
+                    # The SCHEMA above describes the fields; this is what they are
+                    # currently SET to. Z2M keeps the two in different places --
+                    # `definition.options` is per model, `options` is per device --
+                    # and a settings form needs both or it renders every field
+                    # blank. Kept as separate keys because a device with no
+                    # overrides still has a schema, and vice versa.
+                    "option_values": (
+                        d["options"] if isinstance(d.get("options"), dict) else {}
+                    ),
                     "scenes": d.get("scenes") or [],
                 }
             )

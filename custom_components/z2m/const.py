@@ -42,6 +42,10 @@ SIGNAL_GROUPS = f"{DOMAIN}_groups"
 SIGNAL_PAIRING = f"{DOMAIN}_pairing"  # one normalized snapshot/event envelope
 SIGNAL_LOG = f"{DOMAIN}_log"  # one new bridge/logging line, passed as the arg
 SIGNAL_MAP = f"{DOMAIN}_map"  # network map scan phase, passed as the arg
+# One device's OTA state changed, passed as the arg. Fed from the DEVICE state
+# topics, not a bridge topic: Z2M publishes firmware progress as an `update` key on
+# `<base>/<friendly_name>` and nowhere else.
+SIGNAL_OTA = f"{DOMAIN}_ota"
 # Retained bridge topics we mirror into local state. Each is JSON except `state`,
 # which Z2M publishes as {"state": "online"|"offline"}.
 TOPIC_INFO = "bridge/info"
@@ -129,6 +133,66 @@ COORDINATOR_CHECK_TIMEOUT = 120
 BACKUP_TIMEOUT = 120
 # Everything else answers immediately.
 REQUEST_TIMEOUT = 30
+
+# Touchlink takes the radio OFF the operating channel and sweeps the InterPAN
+# channels, so it is slow AND it stalls every other Zigbee conversation while it
+# runs. Derived from zigbee-herdsman v10.8.0 (the version 2.13.0 pins),
+# src/controller/touchlink.ts: `scanChannels` is 16 channels and each one costs a
+# `setChannelInterPAN` plus a broadcast with a 500 ms timeout that is burned in full
+# when nothing answers -- 8 s of pure timeout, plus 16 channel switches and the
+# closing restore, so ~10-13 s in practice. `factoryResetFirst` walks the same 16
+# channels and adds a hard 2 s wait, so it is no faster. 60 s is that worst case with
+# room for a slow adapter, and still finite enough to report a stuck radio.
+TOUCHLINK_TIMEOUT = 60
+
+# Every touchlink operation shares ONE lock. herdsman's Touchlink.lock() throws
+# "Touchlink operation already in progress" for a second concurrent operation, and
+# scan/identify/factory_reset are three different MQTT paths -- so per-path
+# serialization is not enough and this key is what makes them queue behind each other.
+TOUCHLINK_LOCK = "touchlink"
+
+# bridge/response/device/ota_update/update is TERMINAL: Z2M answers it only once the
+# whole firmware transfer has finished, carrying the from/to file versions, which is
+# minutes. Refusals, by contrast, are published before any radio work -- unknown
+# device, update already in progress, device does not support OTA. So an update is
+# awaited only for long enough to catch a refusal, and progress then arrives on the
+# push channel. Eight seconds covers Z2M's synchronous validation plus the one ZCL
+# read it does first, without holding the operator's UI on a transfer.
+OTA_ACCEPT_WINDOW = 8
+
+# Scene writes are device `set` publishes, so nothing answers them on a response
+# topic. What IS observable is that Z2M republishes the retained inventory after any
+# scene mutation. That republish is a local round trip through the broker plus one
+# Zigbee command, so it lands quickly or not at all.
+SCENE_TIMEOUT = 20
+# scene_recall stores nothing, so there is no inventory change to wait for. All that
+# can be observed is a converter failure appearing on bridge/logging, which Z2M logs
+# synchronously as the command fails. Long enough to catch that, short enough not to
+# make a working recall feel slow.
+SCENE_RECALL_GRACE = 3.0
+
+# The clusters Zigbee2MQTT is willing to bind, copied from ALL_CLUSTER_CANDIDATES in
+# 2.13.0's lib/extension/bind.ts. Mirrored rather than guessed because Z2M attempts
+# ONLY these: offering the operator a cluster outside this list would produce a
+# request that comes back "Nothing to bind" every time.
+BINDABLE_CLUSTERS = (
+    "genScenes",
+    "genOnOff",
+    "genLevelCtrl",
+    "lightingColorCtrl",
+    "closuresWindowCovering",
+    "hvacThermostat",
+    "msIlluminanceMeasurement",
+    "msTemperatureMeasurement",
+    "msRelativeHumidity",
+    "msSoilMoisture",
+    "msCO2",
+)
+
+# Z2M's internal bind group (DEFAULT_BIND_GROUP_ID in its lib/util/utils.ts). It is
+# reported on bridge/groups like a real group but it is Z2M's own plumbing, so it is
+# filtered out of anything the operator picks a group from.
+DEFAULT_BIND_GROUP_ID = 901
 
 # The label applied to every device Z2M reports.
 LABEL_NAME = "Zigbee"

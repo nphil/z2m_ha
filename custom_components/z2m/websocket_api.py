@@ -19,13 +19,17 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from .const import (
     BACKUP_TIMEOUT,
     DOMAIN,
+    OTA_ACCEPT_WINDOW,
     REQUEST_TIMEOUT,
     SIGNAL_DEVICE_LIST,
     SIGNAL_GROUPS,
     SIGNAL_LOG,
     SIGNAL_MAP,
+    SIGNAL_OTA,
     SIGNAL_PAIRING,
     SIGNAL_UPDATE,
+    TOUCHLINK_LOCK,
+    TOUCHLINK_TIMEOUT,
 )
 from .coordinator import Z2MError, ieee_from_identifiers
 
@@ -79,6 +83,20 @@ def async_setup_websocket(hass: HomeAssistant) -> None:
         ws_ota_abort,
         ws_ota_schedule,
         ws_ota_unschedule,
+        ws_ota_subscribe,
+        ws_bind,
+        ws_unbind,
+        ws_binds,
+        ws_clusters,
+        ws_configure_reporting,
+        ws_touchlink_scan,
+        ws_touchlink_identify,
+        ws_touchlink_factory_reset,
+        ws_scenes,
+        ws_scene_store,
+        ws_scene_recall,
+        ws_scene_remove,
+        ws_scene_remove_all,
         ws_set_log_level,
         ws_restart,
     ):
@@ -766,11 +784,30 @@ async def ws_ota_check(hass, connection, msg, data) -> None:
 @websocket_api.async_response
 @_guard
 async def ws_ota_update(hass, connection, msg, data) -> None:
+    """Start streaming firmware to a device now.
+
+    Awaits a REFUSAL, not the result. bridge/response/device/ota_update/update is
+    terminal: Z2M publishes it only once the whole transfer has finished, carrying
+    the from/to file versions, and that is minutes on a real device. Awaiting it
+    would fail every update that actually worked, so this waits only long enough for
+    Z2M's fast refusals -- unknown device, an update or check already running, a
+    device with no OTA support -- and hands progress over to z2m/ota/subscribe.
+
+    Expensive on the radio, and it is the expensive one: an image is thousands of
+    block requests, it monopolises the device, and Z2M will not run two at once.
+
+    Answers {accepted: true} for "running, watch the push channel", or the terminal
+    reply itself in the unlikely event the whole update finished inside the window.
+    """
     path = "device/ota_update/update"
     if msg["downgrade"]:
         path += "/downgrade"
-    await data.async_request(path, {"id": msg["device"]})
-    connection.send_result(msg["id"])
+    result = await data.async_request_refusal(
+        path, {"id": msg["device"]}, OTA_ACCEPT_WINDOW
+    )
+    connection.send_result(
+        msg["id"], {"accepted": True} if result is None else {"accepted": True, **result}
+    )
 
 
 @websocket_api.require_admin
@@ -780,9 +817,21 @@ async def ws_ota_update(hass, connection, msg, data) -> None:
 @websocket_api.async_response
 @_guard
 async def ws_ota_abort(hass, connection, msg, data) -> None:
-    """Stop an update that is already streaming blocks to the device."""
-    await data.async_request("device/ota_update/update/abort", {"id": msg["device"]})
-    connection.send_result(msg["id"])
+    """Stop an update that is already streaming blocks to the device.
+
+    Awaited: Z2M answers as soon as it has told herdsman to abort, with no radio
+    wait, and the refusal that matters -- "No OTA in progress to abort" -- is the
+    whole reason to ask. Reporting success for an abort that was refused would leave
+    the operator believing a transfer had stopped when it is still running.
+
+    Costs nothing on the radio; it stops traffic rather than making any.
+    """
+    connection.send_result(
+        msg["id"],
+        await data.async_request_mutation(
+            "device/ota_update/update/abort", {"id": msg["device"]}, REQUEST_TIMEOUT
+        ),
+    )
 
 
 @websocket_api.require_admin
@@ -800,12 +849,22 @@ async def ws_ota_schedule(hass, connection, msg, data) -> None:
 
     This is the only workable path for battery devices, which are not listening when
     an immediate update would try to stream to them.
+
+    Awaited, and safe to await: unlike the update itself, Z2M answers this as soon as
+    it has recorded the intent -- {id, url} -- with no radio work at all, so the
+    reply really does mean "queued". The refusals are worth having: a device that
+    does not support OTA, or one already mid-update, is rejected here.
+
+    Costs nothing on the radio now. The transfer happens whenever the device next
+    talks to the coordinator.
     """
     path = "device/ota_update/schedule"
     if msg["downgrade"]:
         path += "/downgrade"
-    await data.async_request(path, {"id": msg["device"]})
-    connection.send_result(msg["id"])
+    connection.send_result(
+        msg["id"],
+        await data.async_request_mutation(path, {"id": msg["device"]}, REQUEST_TIMEOUT),
+    )
 
 
 @websocket_api.require_admin
@@ -815,8 +874,614 @@ async def ws_ota_schedule(hass, connection, msg, data) -> None:
 @websocket_api.async_response
 @_guard
 async def ws_ota_unschedule(hass, connection, msg, data) -> None:
-    await data.async_request("device/ota_update/unschedule", {"id": msg["device"]})
-    connection.send_result(msg["id"])
+    """Drop a queued update, so a waking device is left alone.
+
+    Awaited: Z2M answers immediately after clearing the intent, and a refusal here
+    means the queue was not cleared -- which the operator has to know, because the
+    device would otherwise still take the firmware next time it wakes.
+
+    Costs nothing on the radio. Z2M republishes the device's OTA state as `idle`,
+    which arrives on z2m/ota/subscribe.
+    """
+    connection.send_result(
+        msg["id"],
+        await data.async_request_mutation(
+            "device/ota_update/unschedule", {"id": msg["device"]}, REQUEST_TIMEOUT
+        ),
+    )
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): "z2m/ota/subscribe"})
+@websocket_api.async_response
+@_guard
+async def ws_ota_subscribe(hass, connection, msg, data) -> None:
+    """Push firmware state as it changes: state, percentage and seconds remaining.
+
+    Snapshot first, then one event per change, shaped
+    {ieee_address, friendly_name, state, progress?, remaining?, installed_version,
+     latest_version, latest_source, latest_release_notes, error?} where `state` is
+    Z2M's own "updating" | "idle" | "available" | "scheduled".
+
+    Where this comes from matters, because it is the one thing in this API that is
+    not on a bridge topic. Z2M publishes firmware progress as an `update` key on the
+    DEVICE's own state topic, and that topic is NOT retained -- its retain flag comes
+    from the device's options, which default to false. So there is no retained
+    snapshot to read on connect: the mirror only knows what has been published since
+    the entry loaded, and a device that has said nothing yet is legitimately absent
+    from the snapshot rather than being an error. Installed and latest version for
+    those devices are already on Home Assistant's own `update` entity, which the
+    device projection carries as `update_entity`.
+
+    `progress` and `remaining` appear only while a transfer is actually running:
+    Z2M deletes them the moment one ends, so they are omitted rather than frozen at
+    the last percentage. `error` carries the text of a failure Z2M logged, which is
+    the only place an OTA failure reason exists -- the `update` payload it publishes
+    afterwards just says `available` again, with no reason.
+
+    Refcounted, like the pairing subscription and for the same reason: the underlying
+    MQTT subscription is a wildcard over every device topic on the base topic, so it
+    is taken out only while somebody is watching. Home Assistant always runs the
+    unsubscribe -- including when the socket dies -- which a browser cannot promise.
+
+    Costs nothing on the radio.
+    """
+
+    @callback
+    def _forward(event: dict[str, Any]) -> None:
+        connection.send_message(websocket_api.event_message(msg["id"], event))
+
+    detach = async_dispatcher_connect(hass, SIGNAL_OTA, _forward)
+    await data.async_ota_acquire()
+
+    @callback
+    def _unsubscribe() -> None:
+        detach()
+        data.async_ota_release()
+
+    connection.subscriptions[msg["id"]] = _unsubscribe
+    connection.send_result(msg["id"], {"devices": data.ota_snapshot()})
+
+
+# ------------------------------------------------------------------- binding
+#
+# Two reads and three writes, and the split matters: the reads are projections over
+# the retained inventory and cost NOTHING -- Z2M already publishes every endpoint's
+# clusters, binds and configured reportings on bridge/devices, and republishes them
+# itself after every write. The writes are real Zigbee traffic to a device that may
+# be asleep.
+
+# Bind endpoints are deliberately laxer than the group ones. Z2M resolves a bind
+# endpoint through `device.endpoint(key)`, which accepts an endpoint NAME as well as
+# a number -- "left" on a two-gang switch -- and "default" for the first endpoint.
+# The group commands take ids only because group membership is addressed by id.
+_BIND_ENDPOINT = vol.Any(
+    vol.All(vol.Coerce(int), vol.Range(min=1, max=254)), vol.All(str, vol.Length(min=1))
+)
+
+
+def _bind_payload(msg: dict[str, Any]) -> dict[str, Any]:
+    """The bind/unbind request body, which is identical for both.
+
+    `from_endpoint` is always sent. Z2M defaults an omitted one to the device's first
+    endpoint, which is the wrong endpoint on a multi-endpoint device -- the same trap
+    the group commands avoid, and it binds the wrong gang rather than failing.
+
+    `clusters` is passed through untouched when given. Z2M uses its own eleven-cluster
+    candidate list ONLY when the field is absent; an explicit list bypasses that
+    filter entirely, so restricting it here would remove the ability to bind anything
+    unusual the device genuinely supports.
+    """
+    payload: dict[str, Any] = {
+        "from": msg["from"],
+        "from_endpoint": msg.get("from_endpoint", "default"),
+        "to": msg["to"],
+    }
+    if msg.get("to_endpoint") is not None:
+        payload["to_endpoint"] = msg["to_endpoint"]
+    if msg.get("clusters"):
+        payload["clusters"] = msg["clusters"]
+    return payload
+
+
+_BIND_SCHEMA = {
+    # Either an ieee or a friendly name; Z2M resolves both.
+    vol.Required("from"): vol.All(str, vol.Length(min=1)),
+    vol.Optional("from_endpoint"): _BIND_ENDPOINT,
+    # A device, a group id, a group name, or the literal "Coordinator" -- which is
+    # how a device is bound to report to the hub rather than to another device.
+    vol.Required("to"): vol.Any(vol.All(str, vol.Length(min=1)), int),
+    vol.Optional("to_endpoint"): _BIND_ENDPOINT,
+    vol.Optional("clusters"): [vol.All(str, vol.Length(min=1))],
+}
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): "z2m/device/bind", **_BIND_SCHEMA})
+@websocket_api.async_response
+@_guard
+async def ws_bind(hass, connection, msg, data) -> None:
+    """Bind clusters from one device's endpoint to a device, group or the coordinator.
+
+    Awaited, and the answer has to be READ rather than merely checked, because Z2M
+    reports a partial failure as success. It answers `status: "error"` only when it
+    attempted nothing ("Nothing to bind") or when every cluster failed ("Failed to
+    bind"); anything in between comes back ok, with the clusters that took in
+    `clusters` and the ones that did not in `failed`. A caller that shows a tick
+    without looking at `failed` is lying to the operator, so both are passed through.
+
+    Expensive on the radio, and more so than it looks: one ZDO bind request per
+    cluster, and then Z2M configures attribute reporting for the clusters that
+    succeeded. A sleeping device will fail all of them. Per-cluster reasons are not
+    in the response -- Z2M logs them -- so z2m/logs is where they can be read.
+
+    Z2M republishes bridge/devices afterwards, so z2m/devices/subscribe and
+    z2m/device/binds show the new state without another request.
+    """
+    connection.send_result(
+        msg["id"],
+        await data.async_request_mutation(
+            "device/bind", _bind_payload(msg), REQUEST_TIMEOUT
+        ),
+    )
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {vol.Required("type"): "z2m/device/unbind", **_BIND_SCHEMA}
+)
+@websocket_api.async_response
+@_guard
+async def ws_unbind(hass, connection, msg, data) -> None:
+    """Remove a binding, with the same partial-failure caveat as z2m/device/bind.
+
+    Awaited. `clusters` in the answer are the ones actually unbound and `failed` the
+    ones that refused; "Nothing to unbind" and "Failed to unbind" arrive as errors.
+
+    Expensive on the radio: one ZDO unbind per cluster, and on success Z2M then walks
+    the target's remaining binds to switch off any attribute reporting nothing needs
+    any more. That tidy-up is why an unbind can take longer than the bind did.
+    """
+    connection.send_result(
+        msg["id"],
+        await data.async_request_mutation(
+            "device/unbind", _bind_payload(msg), REQUEST_TIMEOUT
+        ),
+    )
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {vol.Required("type"): "z2m/device/binds", vol.Required("device"): str}
+)
+@websocket_api.async_response
+@_guard
+async def ws_binds(hass, connection, msg, data) -> None:
+    """What one device is currently bound to, one row per endpoint/cluster/target.
+
+    Awaits nothing and costs nothing: bridge/devices is retained and already holds
+    every endpoint's `bindings`, so this is a reshape of state in hand rather than a
+    question put to the radio. Bind targets are resolved to friendly names here,
+    because Z2M reports them as bare ieee addresses and group ids.
+
+    A target that can no longer be named is still listed, with `name` null -- a bind
+    left pointing at a removed device is exactly what the operator needs to see.
+    """
+    connection.send_result(msg["id"], data.device_binds(msg["device"]))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {vol.Required("type"): "z2m/device/clusters", vol.Required("device"): str}
+)
+@websocket_api.async_response
+@_guard
+async def ws_clusters(hass, connection, msg, data) -> None:
+    """Per-endpoint clusters, current binds and reportings, plus what can be bound.
+
+    Awaits nothing and costs nothing on the radio -- all of it is in the retained
+    inventory. Endpoints come back in numeric order, which the raw payload does not
+    give: Z2M keys them by id and JSON makes those keys strings, so the natural order
+    is 1, 10, 2.
+
+    `bindable` per endpoint is the useful part. Z2M will only ever attempt the eleven
+    clusters in its own candidate list, and only where this endpoint speaks the
+    cluster, so offering anything else produces a bind that is refused every time.
+    """
+    connection.send_result(msg["id"], data.device_clusters(msg["device"]))
+
+
+# --------------------------------------------------------- attribute reporting
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "z2m/device/configure_reporting",
+        vol.Required("device"): str,
+        vol.Required("endpoint"): _BIND_ENDPOINT,
+        vol.Required("cluster"): vol.All(str, vol.Length(min=1)),
+        vol.Required("attribute"): vol.All(str, vol.Length(min=1)),
+        # Seconds. 0 minimum means "as fast as it changes"; 65535 is the Zigbee
+        # maximum for both intervals, and a maximum of 0 means "never report".
+        vol.Required("minimum_report_interval"): vol.All(
+            vol.Coerce(int), vol.Range(min=0, max=65535)
+        ),
+        vol.Required("maximum_report_interval"): vol.All(
+            vol.Coerce(int), vol.Range(min=0, max=65535)
+        ),
+        # How much the value must move before the device bothers reporting. Z2M
+        # rejects a non-numeric one outright.
+        vol.Required("reportable_change"): vol.Coerce(int),
+    }
+)
+@websocket_api.async_response
+@_guard
+async def ws_configure_reporting(hass, connection, msg, data) -> None:
+    """Tell one attribute on one endpoint how often to report itself.
+
+    Published to bridge/request/device/reporting/configure, which is the current
+    path. `device/configure_reporting` still works in 2.13 but Z2M marks it deprecated
+    for 3.0, so it is not used here.
+
+    Awaited, and the reply is meaningful: Z2M performs both radio steps before
+    answering, so `status: ok` really does mean the device accepted the
+    configuration. A refusal carries Z2M's own text, e.g. an endpoint the device does
+    not have.
+
+    TWO radio operations, not one, and the first is a surprise worth knowing about:
+    Z2M unconditionally binds the cluster to the coordinator first, then configures
+    reporting. So this call also CREATES A BIND, which will appear in
+    z2m/device/binds afterwards. It then republishes bridge/devices, so the new
+    `configured_reportings` arrives on z2m/devices/subscribe without another request.
+
+    Reading the configuration back over the air is never needed: the retained
+    inventory already carries it, which is what z2m/device/clusters returns.
+    """
+    connection.send_result(
+        msg["id"],
+        await data.async_request_mutation(
+            "device/reporting/configure",
+            {
+                "id": msg["device"],
+                "endpoint": msg["endpoint"],
+                "cluster": msg["cluster"],
+                "attribute": msg["attribute"],
+                "minimum_report_interval": msg["minimum_report_interval"],
+                "maximum_report_interval": msg["maximum_report_interval"],
+                "reportable_change": msg["reportable_change"],
+            },
+            REQUEST_TIMEOUT,
+        ),
+    )
+
+
+# ----------------------------------------------------------------- touchlink
+#
+# Touchlink talks to a device that is NOT on the network, over InterPAN, by taking
+# the radio off the operating channel and sweeping the touchlink channels. Two
+# consequences shape everything here:
+#
+#  * It is slow. Sixteen channels, each with a 500 ms broadcast timeout that is
+#    burned in full when nothing answers.
+#  * It stalls the whole mesh while it runs, because the coordinator is not on its
+#    own channel to hear anything.
+#
+# All three commands therefore share ONE lock rather than the per-path default:
+# herdsman refuses a second concurrent touchlink operation outright, and these are
+# three different paths that would not otherwise see each other.
+
+_CHANNEL = vol.All(vol.Coerce(int), vol.Range(min=11, max=26))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): "z2m/touchlink/scan"})
+@websocket_api.async_response
+@_guard
+async def ws_touchlink_scan(hass, connection, msg, data) -> None:
+    """Sweep the touchlink channels for devices in range, answering {found: [...]}.
+
+    Each entry is {ieee_address, channel}; the channel has to be carried into
+    identify and factory_reset, because those do not search for the device again.
+    An empty list means nothing answered, which for touchlink usually means "not
+    close enough" -- it is a deliberately short-range protocol.
+
+    SLOW AND DISRUPTIVE. Derived from herdsman's own scan loop rather than guessed:
+    sixteen channels, each costing a channel switch plus a broadcast with a 500 ms
+    timeout that is spent in full when nothing replies -- 8 s of pure timeout, so
+    ~10-13 s in practice, and the timeout here is 60 s to allow for a slow adapter.
+    For the whole of that time the coordinator is off the operating channel and the
+    rest of the mesh is not being heard, so this is not something to poll.
+
+    Also note Z2M's own limitation: only the FIRST response per channel is recorded.
+    Two devices on one channel will show as one.
+    """
+    connection.send_result(
+        msg["id"],
+        await data.async_request_mutation(
+            "touchlink/scan", {}, TOUCHLINK_TIMEOUT, lock=TOUCHLINK_LOCK
+        ),
+    )
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "z2m/touchlink/identify",
+        vol.Required("ieee_address"): vol.All(str, vol.Length(min=1)),
+        vol.Required("channel"): _CHANNEL,
+    }
+)
+@websocket_api.async_response
+@_guard
+async def ws_touchlink_identify(hass, connection, msg, data) -> None:
+    """Make one touchlink device announce itself -- a bulb flashes.
+
+    This is how the operator tells which physical device they are about to factory
+    reset, so it is worth offering before the destructive one. Both fields are
+    required: Z2M rejects the request outright without them, and they come straight
+    from a z2m/touchlink/scan result.
+
+    Awaited, and quick by touchlink standards -- one channel, not sixteen, so a
+    second or two. The radio still leaves the operating channel for that time.
+    """
+    connection.send_result(
+        msg["id"],
+        await data.async_request_mutation(
+            "touchlink/identify",
+            {"ieee_address": msg["ieee_address"], "channel": msg["channel"]},
+            TOUCHLINK_TIMEOUT,
+            lock=TOUCHLINK_LOCK,
+        ),
+    )
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "z2m/touchlink/factory_reset",
+        vol.Optional("ieee_address"): vol.All(str, vol.Length(min=1)),
+        vol.Optional("channel"): _CHANNEL,
+    }
+)
+@websocket_api.async_response
+@_guard
+async def ws_touchlink_factory_reset(hass, connection, msg, data) -> None:
+    """Factory reset a touchlink device: the recovery path for a bulb that will not join.
+
+    DESTRUCTIVE. The device loses its network keys and its configuration, which is
+    the point -- it is how a bulb stuck on somebody else's network is reclaimed --
+    but it cannot be undone from here.
+
+    Two modes, and the difference is worth being explicit about in the UI:
+
+      * both `ieee_address` and `channel` -- reset exactly that device.
+      * NEITHER -- reset the first device that answers on any channel, whichever one
+        that turns out to be. Z2M's own "reset the nearest device" behaviour, and the
+        only option when a device is too broken to appear in a scan.
+
+    Passing only one of the two is refused here rather than sent. Z2M treats a
+    half-specified request as the second mode without saying so, which means a
+    request naming a device could silently reset a different one.
+
+    Slow and disruptive: with a channel it is ~3 s (identify, a 2 s pause, then the
+    reset). Without, it sweeps all sixteen channels like a scan.
+    """
+    ieee = msg.get("ieee_address")
+    channel = msg.get("channel")
+    if (ieee is None) != (channel is None):
+        connection.send_error(
+            msg["id"],
+            websocket_api.ERR_INVALID_FORMAT,
+            "Give both ieee_address and channel to reset one device, or neither to "
+            "reset the nearest one. With only one of the two, Zigbee2MQTT resets "
+            "whichever device answers first.",
+        )
+        return
+    payload: dict[str, Any] = {}
+    if ieee is not None:
+        payload = {"ieee_address": ieee, "channel": channel}
+    connection.send_result(
+        msg["id"],
+        await data.async_request_mutation(
+            "touchlink/factory_reset", payload, TOUCHLINK_TIMEOUT, lock=TOUCHLINK_LOCK
+        ),
+    )
+
+
+# -------------------------------------------------------------------- scenes
+#
+# Scenes are NOT bridge requests. They are zigbee-herdsman-converters converters
+# driven through the ordinary publish path, so they go to `<base>/<target>/set` and
+# nothing answers them on a bridge/response topic at all. A publish is therefore not
+# a confirmation, and these commands do not pretend otherwise -- see
+# Z2MData.async_scene_write for what each one actually waits for.
+#
+# A target is a device (ieee or friendly name) or a group (id or friendly name). The
+# endpoint is optional and only meaningful for a device: a two-gang switch holds a
+# separate scene table per gang.
+
+# Zigbee scene ids are a single byte.
+_SCENE_ID = vol.All(vol.Coerce(int), vol.Range(min=0, max=255))
+_SCENE_TARGET = vol.Any(vol.All(str, vol.Length(min=1)), int)
+
+
+def _scene_target(msg: dict[str, Any]) -> tuple[Any, Any]:
+    return msg["target"], msg.get("endpoint")
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {vol.Required("type"): "z2m/scenes", vol.Required("target"): _SCENE_TARGET}
+)
+@websocket_api.async_response
+@_guard
+async def ws_scenes(hass, connection, msg, data) -> None:
+    """Scenes stored on one device or group, from the retained inventory.
+
+    Awaits nothing and costs nothing on the radio.
+
+    The shape is asymmetric because Z2M's data is: a GROUP carries its scenes at the
+    top level, while a DEVICE holds them per endpoint, because that is where the
+    Zigbee scene table lives. A device answer therefore gives both -- `endpoints` for
+    the truth and `scenes` as the union across them, since the common device has one
+    endpoint and a flat list is what its UI wants.
+    """
+    connection.send_result(msg["id"], data.scenes_for(msg["target"]))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "z2m/scene/store",
+        vol.Required("target"): _SCENE_TARGET,
+        vol.Optional("endpoint"): _BIND_ENDPOINT,
+        vol.Required("id"): _SCENE_ID,
+        vol.Optional("name"): vol.All(str, vol.Length(min=1)),
+    }
+)
+@websocket_api.async_response
+@_guard
+async def ws_scene_store(hass, connection, msg, data) -> None:
+    """Save the target's CURRENT state as a scene under `id`.
+
+    Not a bridge request: this is `{"scene_store": {...}}` published to the target's
+    `set` topic, so nothing answers it. What is waited for instead is Z2M
+    republishing its retained inventory with the scene present -- Z2M does that after
+    every scene mutation, and a store that the device refused leaves the inventory
+    without the id. A converter failure is reported with Zigbee2MQTT's own words,
+    read off bridge/logging, which is the only place that reason exists.
+
+    One caveat stated plainly: re-storing an id that ALREADY exists cannot be
+    confirmed from the inventory, because the id is present either way. In that one
+    case the log is the only evidence, and a silent success is reported when Z2M
+    logged no failure.
+
+    Costs one ZCL scene command on the radio, to a device that has to be awake.
+
+    Scene id 0 is refused for a device target: the Zigbee spec reserves id 0 in group
+    0 for the OnOff cluster's global scene, and Z2M rejects it. Groups have a non-zero
+    group id, so id 0 is fine there.
+    """
+    target, endpoint = _scene_target(msg)
+    scene_id = msg["id"]
+    value: Any = {"ID": scene_id}
+    if msg.get("name"):
+        value["name"] = msg["name"]
+    connection.send_result(
+        msg["id"],
+        await data.async_scene_write(
+            target,
+            endpoint,
+            "scene_store",
+            value,
+            expect=lambda ids: scene_id in ids,
+        ),
+    )
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "z2m/scene/recall",
+        vol.Required("target"): _SCENE_TARGET,
+        vol.Optional("endpoint"): _BIND_ENDPOINT,
+        vol.Required("id"): _SCENE_ID,
+    }
+)
+@websocket_api.async_response
+@_guard
+async def ws_scene_recall(hass, connection, msg, data) -> None:
+    """Apply a stored scene, putting the lights back to how they were saved.
+
+    The one scene command with nothing to confirm against. Recall stores nothing, so
+    Z2M does not republish its inventory and there is no state change to check --
+    which is exactly why it is NOT claimed as confirmed. The answer is
+    {sent: true, confirmed_by: null}, and the only thing waited for is a converter
+    failure appearing on bridge/logging, which is reported with Z2M's own text.
+
+    The value is sent as a bare number because that is what the converter demands: it
+    asserts the payload is numeric and rejects the object form the store command uses.
+
+    Costs one ZCL scene command. The resulting light state arrives through the
+    devices' own Home Assistant entities, not through this API.
+    """
+    target, endpoint = _scene_target(msg)
+    connection.send_result(
+        msg["id"],
+        await data.async_scene_write(target, endpoint, "scene_recall", msg["id"]),
+    )
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "z2m/scene/remove",
+        vol.Required("target"): _SCENE_TARGET,
+        vol.Optional("endpoint"): _BIND_ENDPOINT,
+        vol.Required("id"): _SCENE_ID,
+    }
+)
+@websocket_api.async_response
+@_guard
+async def ws_scene_remove(hass, connection, msg, data) -> None:
+    """Delete one stored scene from the target's scene table.
+
+    Confirmed properly: the scene id has to be GONE from the retained inventory after
+    Z2M republishes it, which a failed removal cannot fake. A converter failure is
+    surfaced with Zigbee2MQTT's own text.
+
+    Sent as a bare number, as the converter requires.
+
+    Costs one ZCL scene command, to a device that has to be awake.
+    """
+    target, endpoint = _scene_target(msg)
+    scene_id = msg["id"]
+    connection.send_result(
+        msg["id"],
+        await data.async_scene_write(
+            target,
+            endpoint,
+            "scene_remove",
+            scene_id,
+            expect=lambda ids: scene_id not in ids,
+        ),
+    )
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "z2m/scene/remove_all",
+        vol.Required("target"): _SCENE_TARGET,
+        vol.Optional("endpoint"): _BIND_ENDPOINT,
+    }
+)
+@websocket_api.async_response
+@_guard
+async def ws_scene_remove_all(hass, connection, msg, data) -> None:
+    """Wipe every scene from the target's scene table.
+
+    Confirmed properly: the inventory has to come back with no scenes at all.
+
+    The payload value is ignored by the converter -- it takes the group from the
+    entity -- so an empty string is sent, which is what Z2M's own frontend does.
+
+    Costs one ZCL scene command. Destructive and not undoable from here: the saved
+    light states are gone.
+    """
+    target, endpoint = _scene_target(msg)
+    connection.send_result(
+        msg["id"],
+        await data.async_scene_write(
+            target,
+            endpoint,
+            "scene_remove_all",
+            "",
+            expect=lambda ids: not ids,
+        ),
+    )
+
 
 
 @websocket_api.require_admin
