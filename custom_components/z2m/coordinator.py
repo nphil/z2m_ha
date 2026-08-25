@@ -158,6 +158,24 @@ def _endpoint_ids(endpoints: Any) -> list[int]:
 
 
 @callback
+def _pairing_definition(definition: Any) -> dict[str, Any] | None:
+    """The three fields a pairing card shows, and nothing else.
+
+    Z2M's `definition` carries the device's whole `exposes` schema -- hundreds of
+    kilobytes across a fleet. The pairing view names the thing that just joined; it
+    does not render controls, and `z2m/devices` already carries the full schema for
+    the code that does.
+    """
+    if not isinstance(definition, dict):
+        return None
+    return {
+        "vendor": definition.get("vendor"),
+        "model": definition.get("model"),
+        "description": definition.get("description"),
+    }
+
+
+@callback
 def ieee_from_identifiers(identifiers: Iterable[tuple[str, ...]]) -> str | None:
     """The Zigbee ieee address behind a device's MQTT identifier, if it has one.
 
@@ -487,6 +505,7 @@ class Z2MData:
             async_dispatcher_send(self.hass, SIGNAL_DEVICE_LIST)
         if groups_changed:
             async_dispatcher_send(self.hass, SIGNAL_GROUPS)
+
     @callback
     def _on_event(self, msg: mqtt.ReceiveMessage) -> None:
         """Normalize one non-retained join/interview event."""
@@ -523,12 +542,19 @@ class Z2MData:
         if "supported" in source:
             event["supported"] = source["supported"]
         if "definition" in source:
-            event["definition"] = source["definition"]
+            event["definition"] = _pairing_definition(source["definition"])
         self._store_pairing_event(event)
 
     @callback
     def _reconcile_pairing_devices(self) -> None:
-        """Recover current interview phases from retained bridge/devices."""
+        """Recover in-flight interview phases from retained bridge/devices.
+
+        bridge/event is not retained, so a browser that reloads mid-pairing would
+        otherwise learn nothing about the device it was watching. Only devices that
+        are NOT finished are recovered: seeding a session for all 42 healthy devices
+        would make every snapshot a full inventory dump, and none of it describes
+        anything the operator is currently doing.
+        """
         for device in self.devices:
             state = device.get("interview_state")
             if not isinstance(state, str):
@@ -536,6 +562,11 @@ class Z2MData:
             phase = INTERVIEW_PHASES.get(state.lower())
             ieee = device.get("ieee_address")
             if phase is None or not isinstance(ieee, str):
+                continue
+            # A device that finished long ago is only carried while this run is
+            # already tracking it, so a pairing that completes still reports its
+            # terminal state to whoever was watching.
+            if phase == "successful" and ieee not in self._pairing_sessions:
                 continue
             event: dict[str, Any] = {
                 "type": "device_joined" if phase == "joined" else "device_interview",
@@ -545,8 +576,8 @@ class Z2MData:
             }
             if "supported" in device:
                 event["supported"] = device["supported"]
-            if "definition" in device:
-                event["definition"] = device["definition"]
+            if device.get("definition"):
+                event["definition"] = _pairing_definition(device["definition"])
             self._store_pairing_event(event)
 
     @callback
