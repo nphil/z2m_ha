@@ -514,14 +514,15 @@ const openMap = () => {
   el.onclick();
 };
 // Opening the map is only half of it: the element arrives after a lazy import, and
-// whatever the panel decides to do about a scan happens in that same continuation. Every
-// assertion about the map -- including the ones asserting a scan did NOT start -- is only
-// meaningful once that has settled.
+// whatever the panel decides about a scan happens synchronously right after it mounts.
+//
+// Wait on `_map.el`, NOT on `#mapstage` having a child. `_resetMap()` nulls `_map.el`
+// but leaves the previous element in the stage, so a DOM check is satisfied by the
+// STALE element and returns before the open has done anything -- which is exactly the
+// race that made this suite fail on CI roughly half the time. `_map.el` is set by
+// `_mountMap()` alone, so it cannot be satisfied by what the last open left behind.
 const settleMap = async () => {
-  await until('the map element to be hosted', () => {
-    const stage = p.shadowRoot.getElementById('mapstage');
-    return !!stage && stage.children.length > 0;
-  });
+  await until('the map to finish opening', () => !!p._map.el);
   await tick();
 };
 const headlines = () =>
@@ -1237,6 +1238,9 @@ await tick();
 p._resetMap();
 openMap();
 await settleMap();
+// This scenario feeds the stream, so the stream has to be there. Asserting it here is
+// what turns a later confusing 'nothing subscribed' into a named failure.
+await until('the streaming scan to start', () => hasSub('z2m/networkmap/scan'));
 const dumbEl = p.shadowRoot.getElementById('mapstage').children[0];
 push('z2m/networkmap/scan', { phase: 'done', generated: doneAt,
   coordinator: fx.networkmap.coordinator, nodes: fx.networkmap.nodes,
