@@ -1186,7 +1186,13 @@ console.log('=== map: no cache streams a live scan instead of waiting ===');
 p._go({ name: 'dashboard' });
 await tick();
 p._resetMap();
-p._summary = { ...fx.info, map_generated: null };
+// A stray refresh from an earlier section is entitled to land in any later tick, and it
+// rewrites `_summary` from the fixture -- which would put `map_generated` back and turn
+// this no-cache scenario into a cached one, with no scan to push into. Take the cache out
+// of the SOURCE for as long as the scenario runs, so no refresh can contradict it.
+const cachedGenerated = fx.info.map_generated;
+fx.info.map_generated = null;
+p._summary = { ...fx.info };
 sent.length = 0;
 openMap();
 await settleMap();
@@ -1253,6 +1259,7 @@ console.log('=== map: the map\u2019s own Re-scan control ===');
 p._go({ name: 'dashboard' });
 await tick();
 p._resetMap();
+fx.info.map_generated = cachedGenerated;
 p._summary = fx.info;
 sent.length = 0;
 openMap();
