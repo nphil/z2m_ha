@@ -193,7 +193,9 @@ the built-in `zwave_js` panel talks to its integration:
 | --- | --- |
 | `z2m/info` | Bridge summary |
 | `z2m/devices`, `z2m/groups` | Mirrored inventory |
-| `z2m/subscribe` | Push updates to the panel |
+| `z2m/subscribe`, `z2m/devices/subscribe`, `z2m/groups/subscribe` | Push updates to the panel |
+| `z2m/pairing`, `z2m/pairing/subscribe` | Join and interview progress, snapshot first |
+| `z2m/group/add`, `/rename`, `/remove`, `/members/add`, `/members/remove` | Group management |
 | `z2m/networkmap` | The cached topology, scanning only when stale or forced |
 | `z2m/networkmap/scan` | Runs a scan and pushes it out device by device as it happens |
 | `z2m/permit_join` | Open/close joining |
@@ -234,12 +236,43 @@ is synthetic on purpose — a public repo should not carry a real device invento
 
 CI additionally runs Home Assistant's `hassfest` and HACS validation.
 
+## Adding a device
+
+*Add device*, next to *Show map*, opens a pairing helper rather than just toggling the
+radio. It subscribes to Zigbee2MQTT's `bridge/event` stream **before** opening the
+network — those events are not retained, so a subscription made afterwards can miss
+the join it was opened for — then shows the join, the interview and the result, with
+the live Zigbee2MQTT log beside it as diagnostics. Completion is decided by the
+interview event, never by log text.
+
+The network closes as soon as a device is in, rather than staying open for the rest of
+the window, and only if this helper is what opened it. A device that pairs but has no
+Zigbee2MQTT converter is reported as paired-but-unsupported, which is a different
+thing from a failed interview.
+
+Once it is in, the same screen names it and puts it in a room: the Zigbee friendly name
+goes to Zigbee2MQTT addressed by IEEE, and the display name and area are written to
+Home Assistant's own device registry through `config/device_registry/update`. Entity ids
+are deliberately left alone — they belong to MQTT discovery.
+
+## Groups
+
+Create, rename and delete groups, and add or remove individual **endpoints**. Endpoints
+rather than devices because that is what the radio binds: a multi-endpoint device can
+have one endpoint in a group and not another, and Zigbee2MQTT's `default` is its first
+endpoint, which on such a device is the wrong load. Every write is awaited, so a
+refusal is shown; membership itself is read back from the retained `bridge/groups`
+topic, which Zigbee2MQTT publishes only after the Zigbee command has gone out.
+
+Normal deletion tells each member to leave the group first. Force deletion is offered
+separately and says what it leaves behind: the group disappears locally while the
+devices stay programmed with its address.
+
 ## Not implemented
 
-Honest list, so you know what you would be adding: OTA update progress UI, group
-create/edit/membership, binding and reporting configuration, scene management,
-touchlink, coordinator backup download, and Zigbee2MQTT's own settings editor. Device
-*settings* are covered; bridge *configuration* is not.
+Honest list, so you know what you would be adding: OTA update progress UI, binding and
+reporting configuration, scene management, touchlink, and Zigbee2MQTT's own settings
+editor. Device *settings* are covered; bridge *configuration* is not.
 
 ## License
 
