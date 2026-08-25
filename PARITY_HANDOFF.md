@@ -5,20 +5,39 @@
 
 Written **2026-08-25**. Live instance: Home Assistant **2026.8.3** at `192.168.1.146`,
 Zigbee2MQTT **2.13.0**, 42 devices. Repo `/data/home/z2m_ha`, branch `main`.
-**Deployed and live: 1.5.0.**
+**Deployed and live: 1.5.1, installed and managed by HACS.**
 
 ## How this integration is deployed
 
-Manual install, not HACS. The running copy is inside the HA container at
-`/config/custom_components/z2m`. Deploying is: push the changed file into the container,
-restart HA only if Python changed. The panel's module URL carries the manifest version
-(`?v=1.5.0`), which is what busts a cached module on the household's iPads — so **bump
-`manifest.json` whenever frontend behaviour changes**, or a phone keeps the old panel.
+**HACS owns `/config/custom_components/z2m`.** It was added as a HACS *custom
+repository* (category Integration) and downloaded at a release tag, so the update path
+is HACS's own: publish a release, HACS raises `update.zigbee_zigbee2mqtt_update`, the
+operator presses Update, HA restarts.
 
-Verify a deploy by hashing both sides, never by assuming:
+That makes **releases the unit of deployment**, not commits:
+
+1. Change code, bump `version` in `custom_components/z2m/manifest.json`, commit, push.
+2. Wait for the `Validate` workflow (hassfest + HACS + the two render suites) to pass.
+3. `gh release create vX.Y.Z --title … --notes-file …` — the tag must be `v` + the
+   manifest version, and `--target` needs the **full** commit SHA; an abbreviated one is
+   rejected as an invalid `target_commitish`.
+4. Update from HACS (or the update entity). HA restart is required for Python changes.
+
+The manifest version also rides in the panel's module URL (`?v=1.5.1`), which is what
+busts a cached module on the household's iPads — so **bump it whenever frontend
+behaviour changes**, or a phone keeps the old panel.
+
+**Do not hand-push files into `/config/custom_components/z2m` any more.** HACS deletes
+and rewrites that directory on every update, so a hand-edit is silently discarded the
+next time anyone presses Update, and until then the running code does not match any
+tag. For a fast local iteration loop, edit, then re-download the same version through
+HACS to get back to a known state.
+
+Verify what is actually running by hashing the deployed tree against the repo:
 
 ```
-docker exec homeassistant sh -c 'cd /config/custom_components/z2m && sha256sum panel/z2m-panel.js'
+ssh -i ~/.ssh/hassos_ed25519 nphilip89@192.168.1.146 \
+  'cd /config/custom_components/z2m && find . -type f ! -path "*__pycache__*" -exec sha256sum {} \;'
 ```
 
 ## Done and verified live
