@@ -66,6 +66,7 @@ const HA_ELEMENTS = [
   'ha-icon-button',
   'ha-alert',
   'ha-button',
+  'ha-dialog',
   'hass-subpage',
 ];
 
@@ -193,6 +194,9 @@ class Z2MPanel extends HTMLElement {
     if (old && old.wait) clearTimeout(old.wait);
     this._pairing = {
       run: ((old && old.run) || 0) + 1,
+      // The dialog is open, which means we are watching. The radio is a separate
+      // question: `ownsPermit` is the only field that says the network is open.
+      open: false,
       active: false,
       opening: false,
       subscribed: false,
@@ -204,8 +208,17 @@ class Z2MPanel extends HTMLElement {
       supported: null,
       definition: null,
       logs: [],
+      // Auto-scroll: on until the operator wants to read something.
+      follow: true,
+      // The log level itself is the backend's business: it is the only side that is
+      // reliably told when this view goes away, including on a closed tab.
       error: null,
       notice: null,
+      // How long to hold the window open, and which router to join through.
+      // `via` is an ieee address, or null for "any router will do".
+      duration: PAIR_OPEN_SECONDS,
+      via: null,
+      startedAt: null,
       setup: { saving: false, completed: false, device: null },
       wait: null,
     };
@@ -524,13 +537,82 @@ class Z2MPanel extends HTMLElement {
       .form-row > label { flex:1; min-width:0; color:var(--secondary-text-color);
                           font-size:var(--ha-font-size-m, 14px); }
       .form-row > input, .form-row > select { flex:1; min-width:0; }
-      .pair-state { display:grid; gap:var(--ha-space-2, 8px); padding:var(--ha-space-4, 16px); }
       .pair-identity { padding:var(--ha-space-3, 12px) var(--ha-space-4, 16px);
-                       border-top:var(--ha-border-width, 1px) solid var(--divider-color); }
+                       border:var(--ha-border-width, 1px) solid var(--divider-color);
+                       border-radius:var(--ha-border-radius-md, 8px); }
       .pair-identity strong, .pair-identity code { display:block; overflow-wrap:anywhere; }
-      .pair-log { max-height:var(--ha-log-max-height, 240px); overflow:auto;
+      .pair-log { max-height:var(--ha-log-max-height, 168px); overflow:auto;
                   border-top:var(--ha-border-width, 1px) solid var(--divider-color); }
-      .pair-log .log { padding-inline:var(--ha-space-4, 16px); }
+      .pair-log .log { padding-inline:var(--ha-space-3, 12px); }
+
+      /* ------------------------------------------------------------ dialog */
+      /* Sized in ch so the log lines wrap where they read best, and capped so the
+       * dialog never becomes the page: HA's own dialogs go full-screen on a phone,
+       * and ha-dialog does that part itself. */
+      ha-dialog { --mdc-dialog-min-width:min(92vw, 33rem);
+                  --mdc-dialog-max-width:min(92vw, 33rem); }
+      .dlg { display:grid; gap:var(--ha-space-4, 16px);
+             padding:var(--ha-space-2, 8px) 0 var(--ha-space-4, 16px); }
+      .dlg .form-row { padding:0; }
+      .dlg-lead { color:var(--primary-text-color); }
+      .dlg-hint { color:var(--secondary-text-color);
+                  font-size:var(--ha-font-size-s, 13px);
+                  line-height:var(--ha-line-height-normal, 1.5); }
+      .dlg-actions { display:flex; align-items:center; justify-content:flex-end;
+                     flex-wrap:wrap; gap:var(--ha-space-2, 8px); }
+      .dlg-actions .supporting { margin-inline-end:auto; }
+      .pair-hero { display:flex; align-items:center; gap:var(--ha-space-4, 16px); }
+      .dlg-title { margin:0; padding-inline-start:var(--ha-space-2, 8px);
+                   font-size:var(--ha-font-size-xl, 20px);
+                   font-weight:var(--ha-font-weight-normal, 400);
+                   color:var(--primary-text-color); }
+      .pair-hero ha-svg-icon { --mdc-icon-size:32px; color:var(--warning-color); }
+      .pair-hero.ok ha-svg-icon { color:var(--success-color); }
+      .pair-hero > div:nth-child(2) { flex:1; min-width:0; }
+      .pair-left { flex:none; font-variant-numeric:tabular-nums;
+                   font-size:var(--ha-font-size-2xl, 24px);
+                   color:var(--secondary-text-color); }
+      /* A ring that turns, rather than a progress bar that would imply progress we
+       * cannot measure: nothing here knows when a device will decide to join. */
+      .pair-spin { flex:none; width:28px; height:28px; border-radius:50%;
+                   border:3px solid var(--divider-color);
+                   border-top-color:var(--primary-color, #03a9f4);
+                   animation:pairspin 1s linear infinite; }
+      @keyframes pairspin { to { transform:rotate(360deg); } }
+      @media (prefers-reduced-motion: reduce) {
+        .pair-spin { animation:none; }
+      }
+      .pair-logbox { display:grid; gap:var(--ha-space-2, 8px);
+                     border:var(--ha-border-width, 1px) solid var(--divider-color);
+                     border-radius:var(--ha-border-radius-md, 8px);
+                     padding-block:var(--ha-space-2, 8px); }
+      .pair-logtop { display:flex; align-items:center; justify-content:space-between;
+                     gap:var(--ha-space-2, 8px);
+                     padding-inline:var(--ha-space-3, 12px);
+                     color:var(--secondary-text-color);
+                     font-size:var(--ha-font-size-s, 13px); }
+      .pair-logbox .dlg-hint { padding-inline:var(--ha-space-3, 12px); }
+      /* The label is two words and the control beside it is one: let the row give way
+       * before the heading breaks across lines on a phone. */
+      .pair-logtop > span:first-child { white-space:nowrap; }
+
+      /* Stand-in for ha-dialog on a cold load, before HA's components arrive. It only
+       * has to be honest and usable -- it is on screen for a moment. */
+      .pairdlg { position:fixed; inset:0; z-index:9; display:grid; place-items:center; }
+      .pairdlg-scrim { position:absolute; inset:0; background:rgba(0,0,0,.32); }
+      .pairdlg-sheet { position:relative; width:min(92vw, 33rem);
+                       max-height:86vh; overflow:auto;
+                       box-sizing:border-box; padding:var(--ha-space-5, 20px);
+                       background:var(--card-background-color, #fff);
+                       border-radius:var(--ha-border-radius-lg, 12px);
+                       box-shadow:0 8px 24px rgba(0,0,0,.28); }
+      .pairdlg-head { display:flex; align-items:center; gap:var(--ha-space-3, 12px); }
+      .pairdlg-head h2 { flex:1; margin:0;
+                         font-size:var(--ha-font-size-xl, 20px);
+                         font-weight:var(--ha-font-weight-normal, 400); }
+      .pairdlg-head .close { all:unset; cursor:pointer; padding:var(--ha-space-2, 8px);
+                             line-height:1; font-size:var(--ha-font-size-xl, 20px);
+                             color:var(--secondary-text-color); }
       .recovery { border-top:var(--ha-border-width, 1px) solid var(--divider-color); }
       .container.mapview { padding:0; }
       .stage { height:calc(100vh - var(--header-height,56px)); min-height:360px; }
@@ -539,7 +621,6 @@ class Z2MPanel extends HTMLElement {
       .log { display:flex; gap:var(--ha-space-2, 8px); padding:var(--ha-space-1, 4px) var(--ha-space-4, 16px);
              font-family:var(--ha-font-family-code, monospace); font-size:var(--ha-font-size-s, 12px);
              white-space:pre-wrap; overflow-wrap:anywhere; }
-      .log .t { flex:0 0 auto; color:var(--secondary-text-color); }
       .log .l { flex:0 0 var(--ha-log-level-width, 60px); text-transform:uppercase; }
       .log.error .l { color:var(--error-color); }
       .log.warning .l { color:var(--warning-color); }
@@ -582,7 +663,12 @@ class Z2MPanel extends HTMLElement {
    */
   _feedAlert() {
     const relevant = { info: true };
-    if (['dashboard', 'devices', 'device', 'ota', 'group', 'pairing'].includes(this._view.name))
+    // The dialog reads the inventory too: it is where the list of routers to join
+    // through comes from.
+    if (
+      this._pairing.open ||
+      ['dashboard', 'devices', 'device', 'ota', 'group'].includes(this._view.name)
+    )
       relevant.devices = true;
     if (['dashboard', 'groups', 'group'].includes(this._view.name)) relevant.groups = true;
 
@@ -596,6 +682,24 @@ class Z2MPanel extends HTMLElement {
           }">${esc(this._feedErrors[k])}</ha-alert>`
       )
       .join('');
+  }
+
+  /**
+   * The element the page is rendered into.
+   *
+   * Rendering used to replace the shadow root's contents wholesale, which also
+   * detached the pair dialog -- and `mwc-dialog` treats being detached as being
+   * hidden, so it fired `closed` and the dialog shut itself the instant any retained
+   * push caused a render. The page now lives in its own container and the dialog is
+   * its sibling, so nothing the page does can take the dialog off the tree.
+   */
+  _ensureApp() {
+    if (this._app && this._app.parentNode === this.shadowRoot) return this._app;
+    const app = document.createElement('div');
+    app.id = 'app';
+    this.shadowRoot.appendChild(app);
+    this._app = app;
+    return app;
   }
 
   _render() {
@@ -631,7 +735,7 @@ class Z2MPanel extends HTMLElement {
       caret = null; // inputs that do not support selection throw on read
     }
 
-    this.shadowRoot.innerHTML = markup;
+    this._ensureApp().innerHTML = markup;
     this._hydrate();
 
     if (focusId) {
@@ -646,6 +750,9 @@ class Z2MPanel extends HTMLElement {
       }
     }
 
+    // The dialog is retained across renders, so it has to be put back on top of the
+    // markup that just replaced it.
+    this._hostPairDialog();
     this._enter();
   }
 
@@ -690,8 +797,6 @@ class Z2MPanel extends HTMLElement {
         return 'Groups';
       case 'group':
         return (this._group(this._view.group) || {}).friendly_name || 'Group';
-      case 'pairing':
-        return 'Add device';
       case 'network':
         return 'Network information';
       case 'ota':
@@ -719,8 +824,6 @@ class Z2MPanel extends HTMLElement {
         return this._groupsView();
       case 'group':
         return this._groupView(this._view.group);
-      case 'pairing':
-        return this._pairingView();
       case 'network':
         return this._networkView();
       case 'ota':
@@ -738,23 +841,17 @@ class Z2MPanel extends HTMLElement {
     }
   }
 
-  /** Assign the JS properties and listeners markup cannot carry. */
-  _hydrate() {
-    const r = this.shadowRoot;
-
+  /**
+   * The delegations that any rendered fragment needs.
+   *
+   * Split out from `_hydrate` because the pair dialog lives outside the rendered
+   * markup and has to wire its own contents with exactly the same rules.
+   */
+  _wire(r) {
     r.querySelectorAll('[data-path]').forEach((el) => {
       el.path = el.dataset.path;
       if (el.dataset.label) el.label = el.dataset.label;
     });
-
-    const page = r.getElementById('page');
-    if (page) {
-      page.hass = this._hass;
-      // Sub-views step back through the panel's own view state. The top level has no
-      // in-panel parent, so it shows HA's menu button instead of a back arrow.
-      page.backCallback = this._view.name === 'dashboard' ? undefined : () => this._back();
-    }
-
     r.querySelectorAll('[data-go]').forEach((el) => {
       el.onclick = () => this._go({ name: el.dataset.go });
     });
@@ -770,6 +867,36 @@ class Z2MPanel extends HTMLElement {
     r.querySelectorAll('[data-change]').forEach((el) => {
       el.onchange = () => this._change(el.dataset.change, el);
     });
+
+    const pairLog = r.querySelector('#pairlog');
+    if (pairLog) {
+      // Scrolling up is itself a request to stop following; scrolling back to the
+      // bottom resumes it. The button stays as the explicit control, but the
+      // gesture should not fight it.
+      pairLog.onscroll = () => {
+        const atBottom = pairLog.scrollHeight - pairLog.scrollTop - pairLog.clientHeight < 24;
+        if (this._pairing.follow !== atBottom) {
+          this._pairing.follow = atBottom;
+          this._paintPairDialog();
+        }
+      };
+      // A repaint replaces this element, so the pin has to be re-applied.
+      if (this._pairing.follow) pairLog.scrollTop = pairLog.scrollHeight;
+    }
+  }
+
+  /** Assign the JS properties and listeners markup cannot carry. */
+  _hydrate() {
+    const r = this.shadowRoot;
+    this._wire(r);
+
+    const page = r.getElementById('page');
+    if (page) {
+      page.hass = this._hass;
+      // Sub-views step back through the panel's own view state. The top level has no
+      // in-panel parent, so it shows HA's menu button instead of a back arrow.
+      page.backCallback = this._view.name === 'dashboard' ? undefined : () => this._back();
+    }
 
     const q = r.getElementById('q');
     // _render restores focus and caret for whatever was focused, so typing here just
@@ -818,7 +945,9 @@ class Z2MPanel extends HTMLElement {
   /** Tear down whatever the view being left had running. */
   _leave() {
     if (this._view.name === 'logs') this._unsub('logs');
-    if (this._view.name === 'pairing') this._leavePairing();
+    // The dialog floats above whatever view is beneath it, and navigating out from
+    // under it would leave the network open with nothing on screen saying so.
+    if (this._pairing.open) this._closePairDialog();
     if (this._view.name === 'map') {
       this._unsub('map');
       this._unsub('scan');
@@ -831,7 +960,6 @@ class Z2MPanel extends HTMLElement {
   /** Start whatever the freshly rendered view needs. */
   _enter() {
     if (this._view.name === 'logs' && !this._subs.logs) this._openLogs();
-    if (this._view.name === 'pairing' && !this._pairing.active) this._openPairing();
     // Re-hosting on every render matters: the element instance is retained, so a
     // render caused by (say) a scan error has to put it back where it was.
     if (this._view.name === 'map') {
@@ -846,7 +974,8 @@ class Z2MPanel extends HTMLElement {
   /** One second tick, only while something on screen actually counts. */
   _needsTicker() {
     if (this._view.name === 'map') return true;
-    if (this._view.name === 'pairing') return !!this._pairing.active;
+    // The dialog counts down whatever is underneath it.
+    if (this._pairing.open) return true;
     return this._view.name === 'dashboard' && !!(this._summary || {}).permit_join;
   }
 
@@ -868,9 +997,31 @@ class Z2MPanel extends HTMLElement {
     if (!r) return;
     const join = r.getElementById('joinstate');
     if (join) join.textContent = this._joinText();
-    const pairTime = r.getElementById('pairtime');
-    if (pairTime) pairTime.textContent = this._pairingCountdown();
+    if (this._pairing.open) this._tickPairing();
     if (this._view.name === 'map') this._syncScan();
+  }
+
+  /**
+   * Count the window down, and notice when it runs out.
+   *
+   * The expiry is Zigbee2MQTT's, not ours: it closes the window by itself after the
+   * time we asked for. Watching for that is what turns a silent dead end into a
+   * screen that says nothing joined and offers to try again.
+   */
+  _tickPairing() {
+    const p = this._pairing;
+    const left = this._pairingCountdown();
+    const box = this.shadowRoot.querySelector('#pairleft');
+    if (box) box.textContent = left === null ? '' : `${left}s`;
+
+    const searching = p.phase === 'waiting' && p.ownsPermit;
+    if (searching && !(this._summary || {}).permit_join) {
+      // Z2M closed it, so there is nothing left for us to close.
+      p.ownsPermit = false;
+      p.phase = 'timeout';
+      this._paintPairDialog();
+      this._startTicker();
+    }
   }
 
   /* -------------------------------------------------------------- dashboard */
@@ -1575,13 +1726,18 @@ class Z2MPanel extends HTMLElement {
   /** Seconds left in the join window, from Z2M's own end timestamp. */
   _pairingCountdown() {
     const left = this._joinLeft();
-    if (!(this._summary || {}).permit_join) return 'closed';
-    return left ? `${left}s left` : 'open';
+    if (!(this._summary || {}).permit_join) return null;
+    return left === null ? null : left;
   }
 
   /**
-   * Subscribe FIRST, then open the radio. The events are not retained, so a
-   * subscription established after the request can miss the join it was opened for.
+   * Open the dialog and start WATCHING, without touching the radio.
+   *
+   * Deliberately two steps. The old flow opened the network the instant the button
+   * was pressed, which meant the operator was already on the clock before they had
+   * read anything, and there was no way to choose how to join. Subscribing here is
+   * still right, though: it is what turns Zigbee2MQTT up to debug and starts the
+   * log, so by the time they press Start the diagnostics are already flowing.
    */
   async _openPairing() {
     const p = this._pairing;
@@ -1606,6 +1762,26 @@ class Z2MPanel extends HTMLElement {
     }
     if (this._pairing.run !== run) return;
     p.subscribed = true;
+    p.phase = 'idle';
+    // Deliberately NOT opening the radio here. That is the Start button's job.
+    this._paintPairDialog();
+  }
+
+  /**
+   * Open joining, either network-wide or through one router.
+   *
+   * Joining through a specific router is Zigbee2MQTT's own `device` parameter on
+   * permit_join, and it is the thing to reach for when a device will not pair: it
+   * is told to join via a router that is physically near it, instead of whichever
+   * neighbour answers first from across the house.
+   */
+  async _startPairing() {
+    const p = this._pairing;
+    p.target = null;
+    p.event = null;
+    p.supported = null;
+    p.definition = null;
+    p.setup = { saving: false, completed: false, device: null };
     await this._openJoinWindow();
   }
 
@@ -1615,20 +1791,25 @@ class Z2MPanel extends HTMLElement {
     p.opening = true;
     p.error = null;
     p.notice = null;
-    this._render();
+    this._paintPairDialog();
+    const payload = { time: p.duration };
+    if (p.via) payload.device = p.via;
     try {
-      await this._call('z2m/permit_join', { time: PAIR_OPEN_SECONDS });
+      await this._call('z2m/permit_join', payload);
       if (this._pairing.run !== run) return;
       // Only a window this helper opened is a window this helper may close.
       p.ownsPermit = true;
       p.phase = 'waiting';
+      p.startedAt = Date.now();
     } catch (err) {
       if (this._pairing.run !== run) return;
+      p.phase = 'idle';
       p.error = this._feedMessage(err, 'Zigbee2MQTT refused to open the network');
     } finally {
       if (this._pairing.run === run) {
         p.opening = false;
-        this._render();
+        this._paintPairDialog();
+        this._startTicker();
       }
     }
   }
@@ -1655,18 +1836,67 @@ class Z2MPanel extends HTMLElement {
     this._unsub('pairing');
     this._unsub('pairlogs');
     if (p.ownsPermit) this._closeJoinWindow();
+    // The log level goes back by itself: dropping the pairing subscription is what
+    // releases it, and Home Assistant drops it even if this page never gets to.
     this._resetPairing();
+  }
+
+  /**
+   * Is this log line about pairing, or is it the mesh going about its business?
+   *
+   * At debug level a 42-device network emits a line per received message and per
+   * MQTT publish, so an unfiltered view scrolls the interview off screen faster
+   * than it can be read. The rule is deliberately about the SUBJECT of the line:
+   * anything concerning the device being paired is kept, anything that is routine
+   * traffic from a device already on the network is dropped.
+   */
+  _pairLogRelevant(message) {
+    const text = String(message);
+    const p = this._pairing;
+    const target = p.target;
+    const name = (p.event && p.event.friendly_name) || null;
+    const mentionsTarget =
+      (target && text.includes(target)) || (name && name !== target && text.includes(name));
+    if (mentionsTarget) return true;
+
+    // Routine device traffic. These are the lines that drown everything else, and
+    // none of them concern a device that is joining -- a device Z2M is still
+    // interviewing has no state to publish and no converter to publish it with.
+    if (/^z2m:mqtt: MQTT publish: topic '[^']*'/.test(text)) {
+      // Bridge topics are the pairing conversation itself; device topics are not.
+      if (!/topic '[^'/]*\/bridge\//.test(text)) return false;
+      // Even among bridge topics, the retained inventory republishes on every
+      // state change and says nothing about pairing.
+      if (/\/bridge\/(devices|groups|info|state|logging|health)'/.test(text)) return false;
+      return true;
+    }
+    if (/^z2m: Received Zigbee message from '/.test(text)) return false;
+    if (/No converter available/.test(text)) return true;
+
+    // The pairing vocabulary, as Zigbee2MQTT and zigbee-herdsman actually write it.
+    return /(join|interview|announce|pair|permit|allow(?:ing)? new devices|disabling joining|leave|left the network|removed|configur|bind|reporting|new device|unsupported|not supported|definition|security|transport key|network key|device_(?:joined|announce|interview|leave)|failed)/i.test(
+      text
+    );
   }
 
   _onPairLog(run, entry) {
     const p = this._pairing;
     if (p.run !== run || !entry || !entry.message) return;
+    if (!this._pairLogRelevant(entry.message)) return;
     p.logs.push(entry);
     if (p.logs.length > PAIR_LOG_MAX) p.logs.splice(0, p.logs.length - PAIR_LOG_MAX);
     // Patch the log box in place: a full render would drop the operator's typing
     // in the name field once a device has joined.
     const box = this.shadowRoot && this.shadowRoot.getElementById('pairlog');
-    if (box) box.innerHTML = this._pairLogRows();
+    if (!box) return;
+    box.innerHTML = this._pairLogRows();
+    if (p.follow) box.scrollTop = box.scrollHeight;
+  }
+
+  /** Pin the pairing log to its newest line. */
+  _scrollPairLog() {
+    const box = this.shadowRoot && this.shadowRoot.getElementById('pairlog');
+    if (box) box.scrollTop = box.scrollHeight;
   }
 
   _pairLogRows() {
@@ -1698,7 +1928,7 @@ class Z2MPanel extends HTMLElement {
         const live = p.pairing.sessions.find((s) => s.phase !== 'failed');
         if (live) this._adoptPairSession(live);
       }
-      this._render();
+      this._paintPairDialog();
       return;
     }
     if (ev.kind !== 'event' || !ev.event) return;
@@ -1720,7 +1950,7 @@ class Z2MPanel extends HTMLElement {
       // rest of the window: an open network is an open network.
       this._closeJoinWindow();
     }
-    this._render();
+    this._paintPairDialog();
   }
 
   /** The freshly paired device, once the retained inventory has caught up. */
@@ -1732,7 +1962,7 @@ class Z2MPanel extends HTMLElement {
   _onPairDevices() {
     // A joined device appears in the inventory a moment after the event, which is
     // what fills in its model, endpoints and Home Assistant device id.
-    if (this._view.name === 'pairing' && this._pairing.target) this._render();
+    if (this._pairing.open && this._pairing.target) this._paintPairDialog();
   }
 
   _pairStatusText() {
@@ -1750,138 +1980,413 @@ class Z2MPanel extends HTMLElement {
         return 'The interview failed';
       case 'waiting':
         return 'Waiting for a device to join';
+      case 'timeout':
+        return 'Nothing joined';
       default:
-        return 'Opening the network';
+        return 'Ready';
     }
   }
 
-  _pairingView() {
+  /* ------------------------------------------------------- the pair dialog */
+
+  /**
+   * The dialog element, made once and kept.
+   *
+   * It is deliberately NOT part of the panel's rendered markup. `_render()` writes
+   * the whole shadow root in one go, which would tear the dialog down and take the
+   * log scroll, the caret in the name field and HA's own open/close animation with
+   * it. So the element is retained, re-hosted after each render, and its contents
+   * are painted by `_paintPairDialog()` alone.
+   *
+   * `ha-dialog` is Home Assistant's own component: it brings the scrim, the focus
+   * trap, Escape handling and the phone-width layout for free, which is exactly
+   * why this is a dialog and not another full-page view. It is still OPTIONAL, in
+   * the same way as every other HA component this panel uses -- on a cold load it
+   * may not be defined yet, and then a plain sheet stands in for it.
+   */
+  _ensurePairDialog() {
+    if (this._dialog && this._dialog.native === this._has('ha-dialog')) return this._dialog;
+
+    if (this._dialog && this._dialog.el.parentNode) this._dialog.el.remove();
+
+    const native = this._has('ha-dialog');
+    const el = document.createElement(native ? 'ha-dialog' : 'div');
+    const d = { el, native, painted: null, opened: false };
+    if (native) {
+      // No `hideActions`: the footer is where Home Assistant puts a dialog's buttons,
+      // and using it is most of what makes this look native. The title is ours too --
+      // `ha-dialog`'s `heading` attribute renders the close button and leaves the
+      // text blank unless something fills the heading slot.
+      //
+      // `closed` also arrives while the component settles into its initial closed
+      // state, before anything has been shown. Acting on that one shut the dialog the
+      // instant it was asked for, so only a close that follows a real `opened` counts.
+      el.addEventListener('opened', () => {
+        d.opened = true;
+      });
+      // Escape and the scrim both mean "stop", which is what the close button means.
+      el.addEventListener('closed', () => {
+        if (!d.opened) return;
+        d.opened = false;
+        this._closePairDialog();
+      });
+    } else {
+      el.className = 'pairdlg';
+      el.setAttribute('role', 'dialog');
+      el.setAttribute('aria-modal', 'true');
+    }
+    this._dialog = d;
+    return this._dialog;
+  }
+
+  /** Put the retained dialog back after a render replaced the shadow root. */
+  _hostPairDialog() {
+    if (!this._pairing.open) return;
+    const d = this._ensurePairDialog();
+    if (d.el.parentNode !== this.shadowRoot) this.shadowRoot.appendChild(d.el);
+  }
+
+  async _openPairDialog() {
+    this._resetPairing();
     const p = this._pairing;
-    const done = p.phase === 'successful';
-    const dev = this._pairDevice();
-    const definition = p.definition || {};
-    const areas = Object.values((this._hass && this._hass.areas) || {});
+    p.open = true;
+    p.duration = PAIR_OPEN_SECONDS;
+    const d = this._ensurePairDialog();
+    this.shadowRoot.appendChild(d.el);
+    this._paintPairDialog();
+    if (d.native) d.el.open = true;
+    this._startTicker();
+    // Watching starts immediately; the radio waits for Start.
+    await this._openPairing();
+  }
 
-    const identity = p.target
-      ? `<div class="pair-identity">
-           <strong>${esc(
-             (dev && dev.friendly_name) || (p.event && p.event.friendly_name) || p.target
-           )}</strong>
-           <code class="supporting">${esc(p.target)}</code>
-           ${
-             definition.vendor || definition.model
-               ? `<div class="supporting">${esc(definition.vendor || '')} ${esc(
-                   definition.model || ''
-                 )}</div>`
-               : ''
-           }
-           ${
-             definition.description
-               ? `<div class="supporting">${esc(definition.description)}</div>`
-               : ''
-           }
-         </div>`
-      : '';
+  /**
+   * Close the dialog, and with it the window and the subscriptions.
+   *
+   * Closing is the same event however it arrives -- the button, Escape, the scrim,
+   * or navigating away -- so all of them land here.
+   */
+  _closePairDialog() {
+    const p = this._pairing;
+    if (!p.open) return;
+    p.open = false;
+    const d = this._dialog;
+    if (d) {
+      if (d.native) d.el.open = false;
+      d.el.remove();
+      d.painted = null;
+    }
+    this._leavePairing();
+    this._startTicker();
+    this._render();
+  }
 
-    const status = `<ha-card class="nav-card">
-        <div class="pair-state">
-          <strong>${esc(this._pairStatusText())}</strong>
-          <span class="supporting">Joining ${
-            done ? 'closed' : `<span id="pairtime">${esc(this._pairingCountdown())}</span>`
-          }</span>
-          ${
-            done
-              ? ''
-              : `<span class="supporting">Put the device into pairing mode now \u2014 usually a
-                 long press, or power-cycling it a few times.</span>`
-          }
-        </div>
-        ${identity}
-        ${
-          p.supported === false && done
-            ? `<ha-alert alert-type="warning">The device is on the network. Zigbee2MQTT has no
-               converter for it, so it has no entities until one is added.</ha-alert>`
-            : ''
-        }
-        ${
-          p.phase === 'failed'
-            ? `<ha-alert alert-type="error">The interview failed. The device is on the network
-               but incompletely known; re-interview it from its device page, or pair it
-               closer to a mains-powered device.</ha-alert>`
-            : ''
-        }
-        <div class="actions">
-          ${
-            done
-              ? `<ha-button appearance="plain" data-act="pairagain">Add another</ha-button>`
-              : `<ha-button appearance="plain" data-act="pairstop">Stop</ha-button>`
-          }
-          ${
-            !done && !(this._summary || {}).permit_join && !p.opening
-              ? `<ha-button appearance="filled" data-act="pairretry">Open again</ha-button>`
-              : ''
-          }
-        </div>
-      </ha-card>`;
+  /**
+   * Paint the dialog's own contents.
+   *
+   * Memoised on the same principle as `_render()`: a 45-device mesh pushes retained
+   * topics constantly, and repainting would fight the operator for the caret in the
+   * name field. The log is patched separately by `_onPairLog`, so a new line does
+   * not repaint the form.
+   */
+  _paintPairDialog() {
+    if (!this._pairing.open) return;
+    const d = this._ensurePairDialog();
+    // Painting something that is not on the page is a no-op with extra steps, and a
+    // render may have detached it a moment ago.
+    this._hostPairDialog();
+    const title = this._pairDialogTitle();
+    const markup = d.native
+      ? // Home Assistant's dialog exposes `headerTitle` and `footer` slots. Naming
+        // them is what puts the title and the buttons in HA's own furniture instead
+        // of leaving them as loose content in the body.
+        `<span slot="headerTitle" class="dlg-title">${esc(title)}</span>
+         <div class="dlg">${this._pairDialogBody()}</div>
+         <div class="dlg-actions" slot="footer">${this._pairDialogActions()}</div>`
+      : `<div class="pairdlg-scrim" data-act="pairclose"></div>
+         <div class="pairdlg-sheet">
+           <div class="pairdlg-head">
+             <h2>${esc(title)}</h2>
+             <button class="close" type="button" data-act="pairclose"
+               aria-label="Close">&times;</button>
+           </div>
+           <div class="dlg">${this._pairDialogBody()}</div>
+           <div class="dlg-actions">${this._pairDialogActions()}</div>
+         </div>`;
 
-    // Naming and area are Home Assistant's own registry fields, applied through
-    // HA's own websocket command. The Zigbee friendly name is Z2M's, and both are
-    // set from this one form so the operator does not have to know that.
-    const setup =
-      done && p.target
-        ? `<ha-card class="nav-card">
-             <div class="card-header">Name and place it</div>
-             <div class="form-row">
-               <label for="pairname">Name</label>
-               <input id="pairname" type="text" value="${esc(
-                 (dev && dev.friendly_name) || (p.event && p.event.friendly_name) || ''
-               )}">
-             </div>
-             <div class="form-row">
-               <label for="pairarea">Area</label>
-               <select id="pairarea">
-                 <option value="">No area</option>
-                 ${areas
-                   .map(
-                     (a) =>
-                       `<option value="${esc(a.area_id)}"${
-                         dev && dev.device_id && a.area_id === this._deviceArea(dev.device_id)
-                           ? ' selected'
-                           : ''
-                       }>${esc(a.name)}</option>`
-                   )
-                   .join('')}
-               </select>
-             </div>
-             ${
-               p.setup.completed
-                 ? '<ha-alert alert-type="success">Saved.</ha-alert>'
-                 : ''
-             }
-             <div class="actions">
-               ${
-                 dev && dev.device_id
-                   ? `<ha-button appearance="plain" data-act="pairopen">Open device</ha-button>`
-                   : '<span class="supporting">Waiting for Home Assistant to register it\u2026</span>'
-               }
-               <ha-button appearance="filled" data-act="pairsave"${
-                 p.setup.saving ? ' disabled' : ''
-               }>${p.setup.saving ? 'Saving\u2026' : 'Save'}</ha-button>
-             </div>
-           </ha-card>`
-        : '';
+    if (markup === d.painted) return;
+    d.painted = markup;
+    if (d.native) d.el.setAttribute('heading', title);
+    d.el.innerHTML = markup;
+    this._wire(d.el);
+    this._scrollPairLog();
+  }
 
+  _pairDialogTitle() {
+    const p = this._pairing;
+    if (p.phase === 'successful') return 'Device added';
+    if (p.phase === 'timeout') return 'Nothing joined';
+    return 'Add a Zigbee device';
+  }
+
+  /** Routers the network can be joined through, coordinator first. */
+  _pairRouters() {
+    return this._devices
+      .filter((d) => d.type === 'Coordinator' || d.type === 'Router')
+      .map((d) => ({
+        ieee: d.ieee_address,
+        name: d.friendly_name || d.ieee_address,
+        coordinator: d.type === 'Coordinator',
+      }))
+      .sort((a, b) =>
+        a.coordinator === b.coordinator
+          ? a.name.localeCompare(b.name)
+          : a.coordinator
+            ? -1
+            : 1
+      );
+  }
+
+  _pairDialogBody() {
+    const p = this._pairing;
     return (
       (p.error ? `<ha-alert alert-type="error">${esc(p.error)}</ha-alert>` : '') +
       (p.notice ? `<ha-alert alert-type="success">${esc(p.notice)}</ha-alert>` : '') +
-      status +
-      setup +
-      `<ha-card class="nav-card">
-         <div class="card-header">Zigbee2MQTT log</div>
-         <div class="pair-log" id="pairlog">${this._pairLogRows()}</div>
-         <div class="note">Diagnostics only. Pairing is judged by Zigbee2MQTT\u2019s own
-         join and interview events, not by this text.</div>
-       </ha-card>`
+      this._pairStep() +
+      this._pairLogBlock()
+    );
+  }
+
+  /** The part of the dialog that changes with the phase. */
+  _pairStep() {
+    const p = this._pairing;
+    if (p.phase === 'successful' || p.phase === 'failed') return this._pairResultStep();
+    if (p.phase === 'joined' || p.phase === 'interview_started') return this._pairJoinedStep();
+    if (p.ownsPermit || p.opening) return this._pairSearchingStep();
+    if (p.phase === 'timeout') return this._pairTimeoutStep();
+    return this._pairSetupStep();
+  }
+
+  /** Before the radio is touched: how to join, and for how long. */
+  _pairSetupStep() {
+    const p = this._pairing;
+    const routers = this._pairRouters();
+    const options = routers
+      .map(
+        (r) =>
+          `<option value="${esc(r.ieee)}"${r.ieee === p.via ? ' selected' : ''}>${esc(
+            r.name
+          )}${r.coordinator ? ' (coordinator)' : ''}</option>`
+      )
+      .join('');
+    const times = [60, 120, PAIR_OPEN_SECONDS]
+      .map(
+        (t) =>
+          `<option value="${t}"${t === p.duration ? ' selected' : ''}>${
+            t === PAIR_OPEN_SECONDS ? `${t} seconds (max)` : `${t} seconds`
+          }</option>`
+      )
+      .join('');
+
+    return `<div class="dlg-lead">The network stays closed until you press Start. Have the
+        device ready: joining is usually a long press, or power-cycling it a few times.</div>
+      <div class="form-row">
+        <label for="pairvia">Join through</label>
+        <select id="pairvia" data-change="pairvia">
+          <option value=""${p.via ? '' : ' selected'}>Any router</option>
+          ${options}
+        </select>
+      </div>
+      <div class="dlg-hint">A device that refuses to join often pairs first time through a
+        router sitting next to it, instead of whichever one answers first from across the
+        house.</div>
+      <div class="form-row">
+        <label for="pairdur">Open for</label>
+        <select id="pairdur" data-change="pairdur">${times}</select>
+      </div>`;
+  }
+
+  /** The window is open and nothing has joined yet. */
+  _pairSearchingStep() {
+    const p = this._pairing;
+    const left = this._pairingCountdown();
+    const via = p.via ? (this._dev(p.via) || {}).friendly_name || p.via : null;
+    return `<div class="pair-hero">
+        <div class="pair-spin" aria-hidden="true"></div>
+        <div>
+          <strong>${p.opening ? 'Opening the network\u2026' : 'Searching for a device'}</strong>
+          <div class="supporting">Put the device into pairing mode now.</div>
+          ${via ? `<div class="supporting">Joining through ${esc(via)}.</div>` : ''}
+        </div>
+        <div class="pair-left" id="pairleft">${left === null ? '' : `${left}s`}</div>
+      </div>`;
+  }
+
+  /** Nothing joined before the window closed. */
+  _pairTimeoutStep() {
+    const p = this._pairing;
+    return `<ha-alert alert-type="warning">The window closed after ${esc(
+      p.duration
+    )} seconds and no device joined.</ha-alert>
+      <div class="dlg-hint">Try again with the device held in pairing mode BEFORE you press
+        the button, or join through a router closer to it.</div>
+      ${this._pairSetupStep()}`;
+  }
+
+  /** A device is on the network and the interview is running. */
+  _pairJoinedStep() {
+    return `<div class="pair-hero">
+        <div class="pair-spin" aria-hidden="true"></div>
+        <div>
+          <strong>${esc(this._pairStatusText())}</strong>
+          <div class="supporting">Keep the device awake until this finishes.</div>
+        </div>
+      </div>
+      ${this._pairIdentity()}`;
+  }
+
+  _pairIdentity() {
+    const p = this._pairing;
+    if (!p.target) return '';
+    const dev = this._pairDevice();
+    const definition = p.definition || {};
+    const bits = [definition.vendor, definition.model].filter(Boolean).join(' ');
+    return `<div class="pair-identity">
+        <strong>${esc(
+          (dev && dev.friendly_name) || (p.event && p.event.friendly_name) || p.target
+        )}</strong>
+        <code class="supporting">${esc(p.target)}</code>
+        ${bits ? `<div class="supporting">${esc(bits)}</div>` : ''}
+        ${
+          definition.description
+            ? `<div class="supporting">${esc(definition.description)}</div>`
+            : ''
+        }
+      </div>`;
+  }
+
+  /**
+   * Paired, or the interview failed.
+   *
+   * Naming and area are Home Assistant's own registry fields, applied through HA's
+   * own websocket command. The Zigbee friendly name is Zigbee2MQTT's, and both are
+   * set from this one form so the operator does not have to know that.
+   */
+  _pairResultStep() {
+    const p = this._pairing;
+    const done = p.phase === 'successful';
+    const dev = this._pairDevice();
+    const areas = Object.values((this._hass && this._hass.areas) || {});
+
+    return (
+      `<div class="pair-hero${done ? ' ok' : ''}">
+         <ha-svg-icon data-path="${done ? MDI.check : MDI.alert}"></ha-svg-icon>
+         <div>
+           <strong>${esc(this._pairStatusText())}</strong>
+           ${
+             done
+               ? '<div class="supporting">The network is closed again.</div>'
+               : '<div class="supporting">The device is on the network but incompletely known.</div>'
+           }
+         </div>
+       </div>` +
+      this._pairIdentity() +
+      (p.supported === false && done
+        ? `<ha-alert alert-type="warning">Zigbee2MQTT has no converter for this model, so it
+           has no entities until one is added.</ha-alert>`
+        : '') +
+      (p.phase === 'failed'
+        ? `<ha-alert alert-type="error">Re-interview it from its device page, or pair it
+           closer to a mains-powered device.</ha-alert>`
+        : '') +
+      (done && p.target
+        ? `<div class="form-row">
+             <label for="pairname">Name</label>
+             <input id="pairname" type="text" value="${esc(
+               (dev && dev.friendly_name) || (p.event && p.event.friendly_name) || ''
+             )}">
+           </div>
+           <div class="form-row">
+             <label for="pairarea">Area</label>
+             <select id="pairarea">
+               <option value="">No area</option>
+               ${areas
+                 .map(
+                   (a) =>
+                     `<option value="${esc(a.area_id)}"${
+                       dev && dev.device_id && a.area_id === this._deviceArea(dev.device_id)
+                         ? ' selected'
+                         : ''
+                     }>${esc(a.name)}</option>`
+                 )
+                 .join('')}
+             </select>
+           </div>
+           ${p.setup.completed ? '<ha-alert alert-type="success">Saved.</ha-alert>' : ''}`
+        : '')
+    );
+  }
+
+  /** The live log, which is the whole reason this is not a spinner in a corner. */
+  _pairLogBlock() {
+    const p = this._pairing;
+    return `<div class="pair-logbox">
+        <div class="pair-logtop">
+          <span>Zigbee2MQTT log</span>
+          <span class="header-actions">
+            ${
+              (this._summary || {}).log_level === 'debug'
+                ? '<span class="chip ok">debug</span>'
+                : ''
+            }
+            <ha-button appearance="plain" size="s" data-act="pairfollow"
+              aria-pressed="${p.follow}">${p.follow ? 'Following' : 'Follow'}</ha-button>
+          </span>
+        </div>
+        <div class="pair-log" id="pairlog">${this._pairLogRows()}</div>
+        <div class="dlg-hint">Filtered to joining, interviewing and configuring \u2014 routine
+          traffic from devices already on the network is left out. Zigbee2MQTT is at debug
+          while this window is open, and goes back on its own when you close it.</div>
+      </div>`;
+  }
+
+  _pairDialogActions() {
+    const p = this._pairing;
+    const done = p.phase === 'successful';
+    const searching = p.ownsPermit || p.opening;
+    const btn = (act, label, kind, extra = '') =>
+      `<ha-button appearance="${kind}" data-act="${act}"${extra}>${label}</ha-button>`;
+
+    if (done) {
+      return (
+        btn('pairagain', 'Add another', 'plain') +
+        (p.target
+          ? btn(
+              'pairsave',
+              p.setup.saving ? 'Saving\u2026' : 'Save and close',
+              'filled',
+              p.setup.saving ? ' disabled' : ''
+            )
+          : btn('pairclose', 'Close', 'filled'))
+      );
+    }
+    if (p.phase === 'failed') {
+      return btn('pairagain', 'Add another', 'plain') + btn('pairclose', 'Close', 'filled');
+    }
+    // Interviewing: the device is already in, so there is nothing to stop but the
+    // watching. Close is the only honest action.
+    if (p.phase === 'joined' || p.phase === 'interview_started') {
+      return btn('pairclose', 'Close', 'plain');
+    }
+    if (searching) {
+      // Stop leaves the dialog up so the log is still readable; Close ends the whole
+      // thing. Both shut the window, so neither can leave the network open behind a
+      // screen that has gone away.
+      return btn('pairclose', 'Close', 'plain') + btn('pairstop', 'Stop', 'filled');
+    }
+    return (
+      btn('pairclose', 'Close', 'plain') +
+      btn('pairstart', 'Start', 'filled', p.opening ? ' disabled' : '')
     );
   }
 
@@ -1909,7 +2414,7 @@ class Z2MPanel extends HTMLElement {
 
     p.setup.saving = true;
     p.error = null;
-    this._render();
+    this._paintPairDialog();
     try {
       const current = this._pairDevice() || {};
       if (name && name !== current.friendly_name) {
@@ -1938,7 +2443,11 @@ class Z2MPanel extends HTMLElement {
       p.error = this._feedMessage(err, 'Could not save the device');
     } finally {
       p.setup.saving = false;
-      this._render();
+      this._paintPairDialog();
+      // Saving is the last step of adding a device, so a clean save is also the end
+      // of the dialog. A partial save keeps it open, because there is something to
+      // read: the name went to Zigbee2MQTT but Home Assistant has not caught up.
+      if (p.setup.completed && !p.error) this._closePairDialog();
     }
   }
 
@@ -2433,6 +2942,16 @@ class Z2MPanel extends HTMLElement {
       this._paintLogs();
       return;
     }
+    // Both of these are read again when Start is pressed, so a repaint is not
+    // needed and would only fight the operator for the open select.
+    if (name === 'pairvia') {
+      this._pairing.via = el.value || null;
+      return;
+    }
+    if (name === 'pairdur') {
+      this._pairing.duration = Number(el.value) || PAIR_OPEN_SECONDS;
+      return;
+    }
     if (name === 'loglevel') this._act('z2m/log_level', { value: el.value });
   }
 
@@ -2486,25 +3005,47 @@ class Z2MPanel extends HTMLElement {
       case 'map':
         return this._go({ name: 'map' });
 
+      // Opens the dialog only. The radio stays shut until Start.
       case 'pair':
-        return this._go({ name: 'pairing' });
+        return this._openPairDialog();
 
-      // Stop is the honest word: it closes the window this helper opened and goes
-      // back, rather than pretending to cancel a join already in flight.
-      case 'pairstop':
-        return this._back();
+      case 'pairstart':
+        return this._startPairing();
 
-      case 'pairretry':
-        return this._openJoinWindow();
+      // Stop closes the window this helper opened, and leaves the dialog up so the
+      // log is still readable: stopping the radio is not the same as walking away.
+      case 'pairstop': {
+        const p = this._pairing;
+        this._closeJoinWindow();
+        p.phase = p.target ? p.phase : 'idle';
+        this._paintPairDialog();
+        return undefined;
+      }
+
+      case 'pairclose':
+        return this._closePairDialog();
 
       case 'pairagain': {
-        // A second device in the same visit: new session, new window.
+        // A second device in the same visit: new session, same open dialog, and the
+        // same choices -- someone adding four sensors to one room should not have to
+        // pick the same router four times.
+        const { via, duration } = this._pairing;
         this._leavePairing();
+        Object.assign(this._pairing, { open: true, via, duration });
         return this._openPairing();
       }
 
       case 'pairsave':
         return this._savePairSetup();
+
+      // Explicit control, because the operator sometimes wants to READ a line
+      // rather than watch the newest one arrive.
+      case 'pairfollow': {
+        this._pairing.follow = !this._pairing.follow;
+        this._paintPairDialog();
+        if (this._pairing.follow) this._scrollPairLog();
+        return undefined;
+      }
 
       case 'pairopen': {
         const paired = this._pairDevice();

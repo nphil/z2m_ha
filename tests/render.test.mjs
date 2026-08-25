@@ -60,16 +60,34 @@ class El {
   }
   set innerHTML(v) {
     this._html = String(v);
+    this._els = null;
+    // Matches the real thing: writing innerHTML detaches whatever was appended.
+    this.children.forEach((c) => {
+      c.parentNode = null;
+    });
+    this.children = [];
   }
   get innerHTML() {
     return this._html;
   }
+  setAttribute(name, value) {
+    this.attrs[name] = String(value);
+  }
+  getAttribute(name) {
+    return name in this.attrs ? this.attrs[name] : null;
+  }
+  remove() {
+    if (this.parentNode) this.parentNode.removeChild(this);
+  }
   appendChild(child) {
+    if (child.parentNode) child.parentNode.removeChild(child);
+    child.parentNode = this;
     this.children.push(child);
     return child;
   }
   removeChild(child) {
     this.children = this.children.filter((c) => c !== child);
+    if (child.parentNode === this) child.parentNode = null;
     return child;
   }
   addEventListener(type, fn) {
@@ -102,47 +120,80 @@ class Root {
     this.scrollTop = 0;
     this._els = null;
     this.activeElement = null;
+    this.children = [];
   }
   set innerHTML(v) {
     this._html = String(v);
     this._els = null;
+    this.children.forEach((c) => {
+      c.parentNode = null;
+    });
+    this.children = [];
   }
   get innerHTML() {
-    return this._html;
+    // The real thing serialises its children too, and the panel now renders the page
+    // into a container element rather than straight into the root.
+    return this._html + this.children.map((c) => c.innerHTML).join('');
   }
+  appendChild(child) {
+    if (child.parentNode) child.parentNode.removeChild(child);
+    child.parentNode = this;
+    this.children.push(child);
+    return child;
+  }
+  removeChild(child) {
+    this.children = this.children.filter((c) => c !== child);
+    if (child.parentNode === this) child.parentNode = null;
+    return child;
+  }
+}
+
+/* Both the shadow root and any element the panel builds by hand have to answer the
+ * same three questions, and -- crucially -- answer them with the SAME element
+ * objects each time, or hydration lands on throwaway copies. Appended children are
+ * searched too: the pair dialog is a child of the shadow root, and the panel looks
+ * its contents up through the root. */
+const QUERYABLE = {
   _index() {
-    if (this._els) return this._els;
-    const out = [];
-    TAG.lastIndex = 0;
-    let m;
-    while ((m = TAG.exec(this._html))) {
-      const el = new El(m[1]);
-      ATTR.lastIndex = 0;
-      let a;
-      while ((a = ATTR.exec(m[2]))) {
-        const name = a[1];
-        const value = a[2] === undefined ? '' : decode(a[2]);
-        if (name === 'id') el.id = value;
-        else if (name.startsWith('data-')) el.dataset[camel(name.slice(5))] = value;
-        else el.attrs[name] = value;
+    if (!this._els) {
+      const out = [];
+      TAG.lastIndex = 0;
+      let m;
+      while ((m = TAG.exec(this._html))) {
+        const el = new El(m[1]);
+        ATTR.lastIndex = 0;
+        let a;
+        while ((a = ATTR.exec(m[2]))) {
+          const name = a[1];
+          const value = a[2] === undefined ? '' : decode(a[2]);
+          if (name === 'id') el.id = value;
+          else if (name.startsWith('data-')) el.dataset[camel(name.slice(5))] = value;
+          else el.attrs[name] = value;
+        }
+        out.push(el);
       }
-      out.push(el);
+      this._els = out;
     }
-    this._els = out;
-    return out;
-  }
+    return this._els.concat(...this.children.map((c) => [c].concat(c._index())));
+  },
   getElementById(id) {
     return this._index().find((e) => e.id === id) || null;
-  }
+  },
   querySelectorAll(sel) {
+    if (sel.startsWith('#')) return this._index().filter((e) => e.id === sel.slice(1));
     const attr = sel.replace(/^\[|\]$/g, '').split('=')[0];
     if (attr.startsWith('data-')) {
       const key = camel(attr.slice(5));
       return this._index().filter((e) => e.dataset[key] !== undefined);
     }
     return this._index().filter((e) => e.attrs[attr] !== undefined);
-  }
-}
+  },
+  querySelector(sel) {
+    return this.querySelectorAll(sel)[0] || null;
+  },
+};
+Object.assign(El.prototype, QUERYABLE);
+Object.assign(Root.prototype, QUERYABLE);
 
 globalThis.HTMLElement = class {
   constructor() {
@@ -168,6 +219,7 @@ const HA_ELEMENTS = [
   'ha-icon-button',
   'ha-alert',
   'ha-button',
+  'ha-dialog',
   'hass-subpage',
 ];
 const defined = new Map();
@@ -1123,28 +1175,78 @@ check('surfaces a missing archive as an error', await (async () => {
 p._error = null;
 
 /* ================================================================= pairing */
-console.log('=== pairing helper: watch first, then open the radio ===');
+console.log('=== add device: a window that watches before it opens the radio ===');
 go('dashboard');
 sent.length = 0;
 await act('pair');
 await tick(60);
-check('Add device opens the helper', p._view.name === 'pairing');
-// Ordering is the whole point: bridge/event is not retained, so a subscription
-// established after the permit request can miss the join it was opened for.
+// Everything the dialog draws lives on the dialog element, not in the page markup:
+// it is deliberately outside the panel's own render so a retained-topic push cannot
+// tear it down mid-pairing.
+const dlg = () => String((p._dialog && p._dialog.el.innerHTML) || '');
+check('Add device opens a dialog, not another page', p._pairing.open === true
+  && p._view.name === 'dashboard');
+check('and it is HA\u2019s own dialog element', p._dialog.native === true
+  && p._dialog.el.tag === 'ha-dialog');
+check('the dialog is hosted in the panel', p._dialog.el.parentNode === p.shadowRoot);
+// The whole point of the two-step: pressing the button must not start a join.
+check('the radio is NOT opened yet',
+  !sent.some((m) => m.type === 'z2m/permit_join'), sent.map((m) => m.type).join(' -> '));
+check('but watching starts at once', hasSub('z2m/pairing/subscribe')
+  && hasSub('z2m/logs/subscribe'));
 const pairOrder = sent.map((m) => m.type);
-check('subscribes to the pairing stream', hasSub('z2m/pairing/subscribe'));
-check('subscribes to the live log for diagnostics', hasSub('z2m/logs/subscribe'));
-check('opens joining for a bounded window',
-  sent.some((m) => m.type === 'z2m/permit_join' && m.time === 254));
-check('the radio is opened only AFTER the stream is being watched',
-  pairOrder.indexOf('z2m/permit_join') === pairOrder.length - 1, pairOrder.join(' -> '));
+check('the panel does not drive the log level itself',
+  !pairOrder.includes('z2m/log_level'), pairOrder.join(' -> '));
+
+console.log('=== add device: how to join is a choice, not a default ===');
+// Zigbee2MQTT reports the coordinator in bridge/devices alongside the routers, and
+// joining through it is the normal case, so it has to be offered and labelled.
+p._devices = fx.devices.concat([
+  { ieee_address: '0x00124b0039db98bf', friendly_name: 'Coordinator', type: 'Coordinator',
+    power_source: 'Mains (single phase)', availability: 'online', supported: true,
+    endpoints: [1], exposes: [], options: [], scenes: [] },
+]);
+p._paintPairDialog();
+check('offers any router by default', dlg().includes('Any router') && p._pairing.via === null);
+const routers = p._pairRouters();
+check('offers the mains-powered devices as routes', routers.length > 1
+  && routers.every((r) => dlg().includes(r.name)));
+check('never offers a sleeping device as a route',
+  !routers.some((r) => (p._dev(r.ieee) || {}).type === 'EndDevice'));
+check('the coordinator is named as such', dlg().includes('(coordinator)'));
+check('the window length is capped at what Z2M accepts',
+  dlg().includes('254 seconds (max)'));
+// Choosing a router, then a shorter window, then starting.
+p._change('pairvia', { value: routers.find((r) => !r.coordinator).ieee });
+p._change('pairdur', { value: '60' });
+sent.length = 0;
+await act('pairstart');
+await tick(60);
+const permit = sent.find((m) => m.type === 'z2m/permit_join');
+check('Start is what opens joining', !!permit);
+check('for the chosen length', permit && permit.time === 60);
+check('through the chosen router', permit
+  && permit.device === routers.find((r) => !r.coordinator).ieee);
 check('the helper knows it owns this window', p._pairing.ownsPermit === true);
+check('and says which router it is joining through',
+  dlg().includes(routers.find((r) => !r.coordinator).name));
 
 p._summary = { ...fx.info, permit_join: true, permit_join_end: Date.now() + 90000 };
-p._render();
-check('shows a live countdown', /\d+s left/.test(html()));
-check('tells the operator what to do', html().includes('pairing mode'));
+p._paintPairDialog();
+check('shows a live countdown', /\d+s/.test(dlg()));
+check('tells the operator what to do', dlg().includes('pairing mode'));
 
+console.log('=== add device: the window running out is a state, not silence ===');
+p._summary = { ...fx.info, permit_join: false, permit_join_end: null };
+p._tick();
+check('an expired window is noticed', p._pairing.phase === 'timeout');
+check('and nothing is left claimed', p._pairing.ownsPermit === false);
+check('it says nothing joined', dlg().includes('no device joined'));
+check('and offers to go again', !!find('data-act', 'pairstart'));
+p._summary = { ...fx.info, permit_join: true, permit_join_end: Date.now() + 90000 };
+p._pairing.ownsPermit = true;
+p._pairing.phase = 'waiting';
+p._paintPairDialog();
 console.log('=== pairing helper: somebody else\u2019s device is not ours ===');
 push('z2m/pairing/subscribe', { kind: 'event', event: fx.pairing.joined });
 check('the first join is adopted', p._pairing.target === fx.pairing.joined.ieee_address);
@@ -1154,32 +1256,101 @@ check('a second pairer\u2019s device is ignored',
 
 console.log('=== pairing helper: interview progress is the source of truth ===');
 push('z2m/pairing/subscribe', { kind: 'event', event: fx.pairing.started });
-check('interview progress is shown', html().includes('Interviewing'));
+check('interview progress is shown', dlg().includes('Interviewing'));
 const logRows = () => String(p.shadowRoot.getElementById('pairlog').innerHTML);
 push('z2m/logs/subscribe', { time: Date.now() / 1000, level: 'info', message: 'Starting interview' });
 await tick();
 check('live log lines are shown', logRows().includes('Starting interview'));
 check('a log line is never treated as completion', p._pairing.phase === 'interview_started');
 
+console.log('=== add device: the log is turned up, then filtered ===');
+// Raising the level is the BACKEND's job, tied to the pairing subscription: a
+// browser cannot promise to put it back, because closing the tab skips whatever
+// cleanup the page intended and would leave the bridge at debug forever.
+check('subscribing is what asks for it', hasSub('z2m/pairing/subscribe'));
+p._summary = { ...p._summary, log_level: 'debug' };
+p._paintPairDialog();
+check('the raised level is shown while it lasts', dlg().includes('>debug<'));
+check('and it is described as self-restoring', dlg().includes('goes back on its own'));
+// Debug on a 42-device mesh is mostly other devices talking, and none of it is
+// about the device being paired.
+const noise = [
+  "z2m:mqtt: MQTT publish: topic 'zigbee2mqtt/Kitchen Humidity Sensor', payload '{\"humidity\":41.2}'",
+  "z2m:mqtt: MQTT publish: topic 'zigbee2mqtt/Front Door Light', payload '{\"state\":\"ON\",\"power\":12}'",
+  "z2m:mqtt: MQTT publish: topic 'zigbee2mqtt/bridge/devices', payload '[]'",
+  "z2m: Received Zigbee message from 'Gym Electronics Plug', type 'attributeReport', cluster 'haElectricalMeasurement'",
+];
+const signal = [
+  "z2m: Starting interview of '0x00158d0002ab34cd'",
+  "z2m: Successfully interviewed '0x00158d0002ab34cd', device has successfully been paired",
+  'z2m: Zigbee: allowing new devices to join.',
+  "z2m: Configuring '0x00158d0002ab34cd'",
+];
+const beforeNoise = p._pairing.logs.length;
+for (const message of noise) {
+  push('z2m/logs/subscribe', { time: Date.now() / 1000, level: 'debug', message });
+}
+await tick();
+check('routine device traffic is dropped', p._pairing.logs.length === beforeNoise,
+  `${p._pairing.logs.length - beforeNoise} noise line(s) kept`);
+check('a retained bridge republish is dropped', !logRows().includes('bridge/devices'));
+for (const message of signal) {
+  push('z2m/logs/subscribe', { time: Date.now() / 1000, level: 'debug', message });
+}
+await tick();
+check('every pairing line is kept', p._pairing.logs.length === beforeNoise + signal.length,
+  `${p._pairing.logs.length - beforeNoise} of ${signal.length}`);
+check('the interview conversation is visible', logRows().includes('Starting interview of'));
+// Anything naming the device being paired is relevant, whatever it says.
+push('z2m/logs/subscribe', { time: Date.now() / 1000, level: 'debug',
+  message: "z2m: Received Zigbee message from '0x00158d0002ab34cd', type 'readResponse'" });
+await tick();
+check('traffic from the joining device itself is kept', logRows().includes('readResponse'));
+
+console.log('=== pairing helper: auto-scroll, with a way to stop it ===');
+check('the log follows the newest line by default', p._pairing.follow === true
+  && p.shadowRoot.getElementById('pairlog').scrollTop > 0);
+await act('pairfollow');
+check('Follow can be turned off', p._pairing.follow === false);
+check('the button says what it will do next', dlg().includes('>Follow<'));
+const parked = p.shadowRoot.getElementById('pairlog').scrollTop;
+push('z2m/logs/subscribe', { time: Date.now() / 1000, level: 'debug',
+  message: "z2m: Configuring '0x00158d0002ab34cd' endpoint 1" });
+await tick();
+check('a new line does not yank the view while paused',
+  p.shadowRoot.getElementById('pairlog').scrollTop === parked);
+await act('pairfollow');
+check('Follow can be turned back on and re-pins', p._pairing.follow === true
+  && p.shadowRoot.getElementById('pairlog').scrollTop > 0);
+// Scrolling up is itself a request to stop following.
+const pairBox = p.shadowRoot.getElementById('pairlog');
+pairBox.scrollTop = 0;
+pairBox.onscroll();
+await tick();
+check('scrolling up pauses the follow', p._pairing.follow === false);
+await act('pairfollow');
+
 sent.length = 0;
 push('z2m/pairing/subscribe', { kind: 'event', event: fx.pairing.successful });
 await tick();
-check('success is reported', html().includes('Paired'));
-check('the device is named exactly', html().includes(fx.pairing.successful.ieee_address)
-  && html().includes('WSDCGQ11LM'));
+check('success is reported', dlg().includes('Paired'));
+check('the device is named exactly', dlg().includes(fx.pairing.successful.ieee_address)
+  && dlg().includes('WSDCGQ11LM'));
 // An open network is an open network: close it as soon as the device is in.
 check('the helper closes the window it opened',
   sent.some((m) => m.type === 'z2m/permit_join' && m.time === 0));
 check('and stops claiming ownership', p._pairing.ownsPermit === false);
 
-console.log('=== pairing helper: name and area, through HA\u2019s own registry ===');
+console.log('=== add device: name and area, through HA\u2019s own registry ===');
 // The retained inventory catching up is what supplies the HA device id.
 p._devices = fx.devices.concat([fx.paired_device]);
-p._render();
-check('offers a name field', html().includes('id="pairname"'));
+p._paintPairDialog();
+check('offers a name field', dlg().includes('id="pairname"'));
 check('offers every HA area', Object.values(fx.registry.areas)
-  .every((a) => html().includes(a.name)));
-check('offers to open the HA device page', !!find('data-act', 'pairopen'));
+  .every((a) => dlg().includes(a.name)));
+check('saving is the closing action', !!find('data-act', 'pairsave')
+  && dlg().includes('Save and close'));
+check('and adding another is offered beside it', !!find('data-act', 'pairagain'));
 sent.length = 0;
 p.shadowRoot.getElementById('pairname').value = 'Nursery Climate';
 p.shadowRoot.getElementById('pairarea').value = 'hallway';
@@ -1193,28 +1364,70 @@ check('sets the HA display name and area through HA\u2019s own command', sent.so
   && m.name_by_user === 'Nursery Climate' && m.area_id === 'hallway'));
 check('never rewrites entity ids', !sent.some((m) => 'new_entity_id' in m));
 
-console.log('=== pairing helper: unsupported and failed are different states ===');
+console.log('=== add device: unsupported and failed are different states ===');
 p._resetPairing();
-p._pairing.active = true;
+p._pairing.open = true;
 p._adoptPairSession(fx.pairing.unsupported);
-check('unsupported is a success with a caveat', html().includes('no converter'));
+check('unsupported is a success with a caveat', dlg().includes('no converter'));
 p._resetPairing();
-p._pairing.active = true;
+p._pairing.open = true;
 p._adoptPairSession(fx.pairing.failed);
-check('a failed interview says so locally', html().includes('interview failed'));
+check('a failed interview says so locally', dlg().includes('interview failed'));
 check('a failed interview is not a page-level unknown error',
   !html().includes('Unknown error'));
 
-console.log('=== pairing helper: leaving cleans up ===');
-p._devices = fx.devices;
+console.log('=== add device: closing is what stops everything ===');
+p._resetPairing();
+p._pairing.open = true;
 p._pairing.ownsPermit = true;
+p._paintPairDialog();
 sent.length = 0;
-go('dashboard');
+await act('pairclose');
 await tick();
-check('closes its own window on the way out',
+check('closing shuts the window it opened',
   sent.some((m) => m.type === 'z2m/permit_join' && m.time === 0));
+check('the dialog is taken off the page', p._pairing.open === false
+  && p._dialog.el.parentNode === null);
 check('unsubscribes the pairing stream', !hasSub('z2m/pairing/subscribe'));
 check('unsubscribes the pairing log', !hasSub('z2m/logs/subscribe'));
+check('nothing is left holding the log level up',
+  !sent.some((m) => m.type === 'z2m/log_level'));
+
+// Escape and the scrim are the same event as the button, and HA's dialog reports
+// them the same way. It also reports `closed` while it settles into its initial
+// state, before anything is on screen -- which must NOT count as a dismissal.
+await act('pair');
+await tick(60);
+p._dialog.el.emit('closed');
+check('a settling close does not dismiss it', p._pairing.open === true);
+p._dialog.el.emit('opened');
+// As if Start had been pressed: the window is ours, so dismissing must shut it.
+p._pairing.ownsPermit = true;
+sent.length = 0;
+p._dialog.el.emit('closed');
+await tick();
+check('Escape closes it too', p._pairing.open === false
+  && sent.some((m) => m.type === 'z2m/permit_join' && m.time === 0));
+
+console.log('=== add device: a cold load still gets a usable window ===');
+// ha-dialog is lazily loaded like everything else HA owns, so the dialog cannot
+// depend on it being defined the moment the operator presses the button.
+const stashedDialog = defined.get('ha-dialog');
+defined.delete('ha-dialog');
+p._dialog = null;
+await act('pair');
+await tick(60);
+check('falls back to a plain sheet', p._dialog.native === false
+  && p._dialog.el.tag === 'div');
+check('which is a real dialog to assistive tech',
+  p._dialog.el.attrs.role === 'dialog' && p._dialog.el.attrs['aria-modal'] === 'true');
+check('and still offers Start', !!find('data-act', 'pairstart'));
+check('and still carries the live log', dlg().includes('id="pairlog"'));
+check('and can be dismissed', !!find('data-act', 'pairclose'));
+defined.set('ha-dialog', stashedDialog);
+await act('pairclose');
+await tick();
+p._devices = fx.devices;
 p._summary = fx.info;
 p._render();
 

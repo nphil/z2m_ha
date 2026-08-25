@@ -752,11 +752,10 @@ class Z2MNetworkMap extends HTMLElement {
                   margin-right:3px; vertical-align:middle; }
       .legend b { font-weight:500; color:var(--primary-text-color,#212121); }
 
-      /* Anchored beside the selected node rather than parked in the corner: the
-         corner card meant the answer was as far as possible from the thing you
-         clicked, and on a phone it covered it. Placement is computed in
-         _positionDetail; only the fallback lives here. */
-      .detail { position:absolute; left:8px; top:8px;
+      /* Desktop and tablet: parked bottom-right, opposite the legend, so it never
+         sits on top of the graph the operator is reading and never moves under the
+         pointer. Phones get a bottom sheet instead -- see the media query. */
+      .detail { position:absolute; right:8px; bottom:8px;
                 width:min(272px, calc(100% - 16px));
                 background:var(--card-background-color, #fff);
                 border:1px solid var(--divider-color, #e0e0e0);
@@ -1542,10 +1541,9 @@ class Z2MNetworkMap extends HTMLElement {
       'transform',
       `translate(${this._view.x} ${this._view.y}) scale(${this._view.k})`
     );
-    // Both overlays are positioned in screen space, so a pan or a zoom moves what
-    // they were measured against.
+    // Labels are culled in screen space, so a pan or a zoom changes which of them
+    // collide.
     this._cullLabels();
-    this._positionDetail();
   }
 
   _resize() {
@@ -1553,7 +1551,6 @@ class Z2MNetworkMap extends HTMLElement {
     const rect = this._stage.getBoundingClientRect();
     this._sim.resize(rect.width, rect.height);
     this._sim.reheat(0.3);
-    this._positionDetail();
     this._startLoop();
   }
 
@@ -1657,46 +1654,6 @@ class Z2MNetworkMap extends HTMLElement {
       (node.device_id && this._hass
         ? `<p><a data-device="${escapeHtml(node.device_id)}">Open in Home Assistant</a></p>`
         : '');
-    this._positionDetail();
-  }
-
-  /**
-   * Put the detail card next to the device it describes.
-   *
-   * It used to be pinned to the bottom-right corner, which put the answer as far
-   * as possible from the node that was clicked and, on a narrow screen, on top of
-   * it. Here it is placed beside the node, flipped to whichever side has room and
-   * clamped inside the canvas. On a phone the stylesheet turns it into a bottom
-   * sheet instead, so this leaves the position alone below that width.
-   */
-  _positionDetail() {
-    if (!this._detail || this._detail.hidden || !this._selected) return;
-    const stage = this._stage.getBoundingClientRect();
-    if (!stage.width || stage.width <= NARROW_PX) {
-      // Bottom sheet: CSS owns it.
-      this._detail.style.left = '';
-      this._detail.style.top = '';
-      return;
-    }
-    const node = this._graph.byIeee.get(this._selected);
-    if (!node) return;
-
-    const box = this._detail.getBoundingClientRect();
-    const w = box.width || 272;
-    const h = box.height || 180;
-    const gap = 18;
-    // Node position in stage space, through the same transform the SVG uses.
-    const k = this._view.k || 1;
-    const nx = node.x * k + this._view.x;
-    const ny = node.y * k + this._view.y;
-
-    // Prefer the right of the node; flip left when that would overflow.
-    let left = nx + gap + (node._r || 8) * k;
-    if (left + w > stage.width - 8) left = nx - gap - (node._r || 8) * k - w;
-    let top = ny - h / 2;
-
-    this._detail.style.left = `${clamp(left, 8, Math.max(8, stage.width - w - 8))}px`;
-    this._detail.style.top = `${clamp(top, 8, Math.max(8, stage.height - h - 8))}px`;
   }
 
   /* ------------------------------------------------------------------- loop */
@@ -1773,7 +1730,6 @@ class Z2MNetworkMap extends HTMLElement {
     // cost more than the physics and make names blink while the layout moves.
     if (!busy) {
       this._cullLabels();
-      this._positionDetail();
     }
     return busy;
   }

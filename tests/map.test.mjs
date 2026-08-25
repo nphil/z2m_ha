@@ -23,9 +23,9 @@ globalThis.HTMLElement = class {};
 globalThis.customElements = { get: () => undefined, define: () => {} };
 globalThis.window = { customCards: [] };
 
-const { Graph, Simulation, hopCost, restLength, lqiBand, labelText, NODE_CLEARANCE } =
+const { Graph, Simulation, hopCost, restLength, lqiBand, labelText, NODE_CLEARANCE, NARROW_PX } =
   new Function(
-    `${src}\nreturn { Graph, Simulation, hopCost, restLength, lqiBand, labelText, NODE_CLEARANCE };`
+    `${src}\nreturn { Graph, Simulation, hopCost, restLength, lqiBand, labelText, NODE_CLEARANCE, NARROW_PX };`
   )();
 
 let failures = 0;
@@ -395,10 +395,15 @@ const link = (source, target, lqi, relationship, extra = {}) => ({
   // if it were a device fault.
   check('no dependency ring is drawn', !src.includes('choke-ring'));
   check('the dependency fact survives as words', src.includes('Only route: in this scan'));
-  check('a scan failure still gets its own ring', src.includes('.warn-ring'));
-
-  // The detail card is placed against the node, and closable from the keyboard.
-  check('the detail card is positioned, not parked', src.includes('_positionDetail'));
+  // Parked bottom-right on desktop and tablet, opposite the legend, so it never
+  // moves under the pointer; a phone gets a bottom sheet instead.
+  check('the inspector is anchored bottom-right', /\.detail \{ position:absolute; right:8px; bottom:8px;/
+    .test(src));
+  // The breakpoint is templated from NARROW_PX rather than written out.
+  check('a phone gets a bottom sheet', /@media \(max-width:\$\{NARROW_PX\}px\)[\s\S]*?\.detail \{[^}]*bottom:0/
+    .test(src) && NARROW_PX === 600);
+  check('no per-frame repositioning remains', !src.includes('_positionDetail'));
+  // Closable from the keyboard as well as the pointer.
   check('the close affordance is a real button',
     src.includes('<button class="close" type="button" aria-label="Clear selection">'));
   check('nodes are keyboard reachable', src.includes("g.setAttribute('tabindex', '0')"));

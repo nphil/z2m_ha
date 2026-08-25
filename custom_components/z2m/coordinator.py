@@ -318,7 +318,6 @@ class _Scan:
 
     @callback
     def audit(self) -> str:
-        """The rows this scan refused to believe, for the log."""
         dropped = ", ".join(f"{name}={count}" for name, count in self.counts.items() if count)
         return dropped or "nothing dropped"
 
@@ -338,6 +337,11 @@ class Z2MData:
         # Latest normalized join/interview state per IEEE address. bridge/event is
         # not retained, so bridge/devices also reconciles this cache on reload.
         self._pairing_sessions: dict[str, dict[str, Any]] = {}
+        # How many pairing views are watching, and the log level to put back when
+        # the last of them goes away. Held here rather than in the browser because
+        # only this side is guaranteed to be told when a client disappears.
+        self._verbose_users = 0
+        self._verbose_restore: str | None = None
         # Set by Z2MLabels once the label is resolved, and surfaced in summary() so
         # the panel can deep-link into HA's own tables with ?label=<id>.
         self.label_id: str | None = None
@@ -601,6 +605,50 @@ class Z2MData:
     @callback
     def pairing_message(self) -> dict[str, Any]:
         return {"kind": "snapshot", "pairing": self.pairing_snapshot()}
+
+    async def async_pairing_verbose_acquire(self) -> None:
+        """Raise Zigbee2MQTT to debug while at least one pairing view is watching.
+
+        Reference counted, because two tabs (or a phone and a laptop) can watch the
+        same join, and the first one to close must not silence the other.
+        """
+        self._verbose_users += 1
+        if self._verbose_users > 1:
+            return
+        current = self.info.get("log_level")
+        if not isinstance(current, str) or current == "debug":
+            # Already debug, or the bridge has not told us yet. Either way there is
+            # nothing to restore afterwards, so record nothing.
+            return
+        self._verbose_restore = current
+        await self.async_request(
+            "options", {"options": {"advanced": {"log_level": "debug"}}}
+        )
+        _LOGGER.debug("Pairing view raised Zigbee2MQTT log level from %s", current)
+
+    @callback
+    def async_pairing_verbose_release(self) -> None:
+        """Put the level back once the last pairing view has gone.
+
+        Called from a websocket unsubscribe, which Home Assistant also runs when the
+        socket dies -- that is why this is reliable where a browser is not. It is a
+        @callback, so the MQTT publish goes out as a task rather than being awaited
+        during teardown.
+        """
+        self._verbose_users = max(0, self._verbose_users - 1)
+        if self._verbose_users:
+            return
+        restore = self._verbose_restore
+        self._verbose_restore = None
+        if restore is None:
+            return
+        self.hass.async_create_task(
+            self.async_request(
+                "options", {"options": {"advanced": {"log_level": restore}}}
+            ),
+            f"{DOMAIN} restore log level",
+        )
+        _LOGGER.debug("Pairing view restored Zigbee2MQTT log level to %s", restore)
 
     @callback
     def async_clear_pairing_sessions(self) -> None:

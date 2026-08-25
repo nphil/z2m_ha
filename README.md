@@ -198,7 +198,7 @@ the built-in `zwave_js` panel talks to its integration:
 | `z2m/group/add`, `/rename`, `/remove`, `/members/add`, `/members/remove` | Group management |
 | `z2m/networkmap` | The cached topology, scanning only when stale or forced |
 | `z2m/networkmap/scan` | Runs a scan and pushes it out device by device as it happens |
-| `z2m/permit_join` | Open/close joining |
+| `z2m/permit_join` | Open/close joining, network-wide or through one router |
 | `z2m/device/rename`, `/options`, `/configure`, `/interview`, `/remove` | Device management |
 | `z2m/ota/check` | Firmware check |
 | `z2m/health_check`, `z2m/backup`, `z2m/restart` | Bridge actions |
@@ -238,19 +238,36 @@ CI additionally runs Home Assistant's `hassfest` and HACS validation.
 
 ## Adding a device
 
-*Add device*, next to *Show map*, opens a pairing helper rather than just toggling the
-radio. It subscribes to Zigbee2MQTT's `bridge/event` stream **before** opening the
-network — those events are not retained, so a subscription made afterwards can miss
-the join it was opened for — then shows the join, the interview and the result, with
-the live Zigbee2MQTT log beside it as diagnostics. Completion is decided by the
-interview event, never by log text.
+*Add device*, next to *Show map*, opens a Home Assistant dialog — the same `ha-dialog`
+the rest of the frontend uses, so it scales to the screen and goes full-screen on a
+phone. Opening it does **not** open the radio. It subscribes to Zigbee2MQTT's
+`bridge/event` stream first — those events are not retained, so a subscription made
+after the permit request can miss the join it was opened for — and that subscription is
+also what raises Zigbee2MQTT to `debug`, so the live log is already flowing before
+anything is asked of the network.
+
+Before starting, two things are chosen:
+
+- **Join through** — any router, or one specific router. This is Zigbee2MQTT's own
+  `device` parameter on `permit_join`, and it is the thing to reach for when a device
+  will not pair: it joins via a router physically near it, instead of whichever
+  neighbour answers first from across the house. The list is the mains-powered devices
+  from the retained inventory, coordinator included and labelled.
+- **Open for** — 60, 120 or 254 seconds. 254 is Zigbee2MQTT's maximum.
+
+*Start* opens the window; *Stop* closes it and leaves the dialog up so the log is still
+readable; *Close* ends both. If the window runs out with nothing joined, that is said
+plainly and the same choices are offered again rather than leaving a dead countdown on
+screen. The log level is released by the backend when the subscription goes, so it
+returns to its previous value even if the tab is simply closed.
 
 The network closes as soon as a device is in, rather than staying open for the rest of
-the window, and only if this helper is what opened it. A device that pairs but has no
+the window, and only if this dialog is what opened it. A device that pairs but has no
 Zigbee2MQTT converter is reported as paired-but-unsupported, which is a different
-thing from a failed interview.
+thing from a failed interview. Completion is decided by the interview event, never by
+log text.
 
-Once it is in, the same screen names it and puts it in a room: the Zigbee friendly name
+Once it is in, the same dialog names it and puts it in a room: the Zigbee friendly name
 goes to Zigbee2MQTT addressed by IEEE, and the display name and area are written to
 Home Assistant's own device registry through `config/device_registry/update`. Entity ids
 are deliberately left alone — they belong to MQTT discovery.

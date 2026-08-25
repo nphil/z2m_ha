@@ -262,24 +262,38 @@ async def ws_pairing(hass, connection, msg, data) -> None:
 @websocket_api.async_response
 @_guard
 async def ws_pairing_subscribe(hass, connection, msg, data) -> None:
-    """Join and interview progress, snapshot first.
+    """Join and interview progress, snapshot first, with Zigbee2MQTT turned up.
 
     bridge/event is NOT retained, so a browser that reloads between "joined" and
     "interview successful" would otherwise see nothing at all for a device that is
     mid-pairing. The snapshot is what makes the helper survive a reload; the events
     after it are the live progress.
+
+    Raising the log level lives HERE rather than in the panel, and that placement is
+    the whole point. At `info` a failed join says almost nothing -- the interview
+    conversation is debug -- but debug across a 42-device mesh must not outlive the
+    screen that wanted it. A browser cannot promise that: closing the tab, reloading
+    or losing Wi-Fi all skip whatever cleanup the page intended, and the bridge is
+    left shouting forever. Home Assistant, on the other hand, always tears a
+    subscription down -- including when the socket dies -- so the level goes back
+    even if the laptop lid closes.
     """
 
     @callback
     def _forward(payload: dict[str, Any]) -> None:
         connection.send_message(websocket_api.event_message(msg["id"], payload))
 
-    connection.subscriptions[msg["id"]] = async_dispatcher_connect(
-        hass, SIGNAL_PAIRING, _forward
-    )
+    detach = async_dispatcher_connect(hass, SIGNAL_PAIRING, _forward)
+    await data.async_pairing_verbose_acquire()
+
+    @callback
+    def _unsubscribe() -> None:
+        detach()
+        data.async_pairing_verbose_release()
+
+    connection.subscriptions[msg["id"]] = _unsubscribe
     connection.send_result(msg["id"])
     _forward(data.pairing_message())
-
 
 
 # ----------------------------------------------------------------- network map
@@ -439,8 +453,9 @@ async def ws_permit_join(hass, connection, msg, data) -> None:
     if msg.get("device"):
         payload["device"] = msg["device"]
     # A fresh window starts a fresh session list, so the helper cannot inherit the
-    # terminal state of a device that was paired an hour ago.
-    if msg["time"] > 0 and not msg.get("device"):
+    # terminal state of a device that was paired an hour ago. True of a join through
+    # one router as much as a network-wide one.
+    if msg["time"] > 0:
         data.async_clear_pairing_sessions()
     result = await data.async_request_mutation(
         "permit_join", payload, REQUEST_TIMEOUT
