@@ -1342,7 +1342,6 @@ const targeted = ['z2m/device/configure', 'z2m/device/interview', 'z2m/device/re
 check('every device-targeted command sent this run named its device', (() => {
   const seen = [];
   for (const t of targeted) {
-    // Replayed from the whole run, not just the last batch.
     if (!allSent.some((m) => m.type === t)) continue;
     if (!allSent.filter((m) => m.type === t).every((m) => typeof m.device === 'string')) seen.push(t);
   }
@@ -1350,6 +1349,17 @@ check('every device-targeted command sent this run named its device', (() => {
 })());
 check('the panel points its map import at the sibling module',
   src.includes("import('./z2m-map.js')"));
+// Observed in the live log: a second evaluation of this module threw
+// "the name z2m-panel has already been used with this registry", which left the
+// operator looking at a dead page.
+check('registering the element twice is not fatal', (() => {
+  try {
+    new Function(src)();
+    return true;
+  } catch (_) {
+    return false;
+  }
+})());
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) =>

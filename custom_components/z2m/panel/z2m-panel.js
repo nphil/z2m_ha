@@ -559,8 +559,10 @@ class Z2MPanel extends HTMLElement {
       @media (max-width:600px) {
         .container { padding:var(--ha-space-1, 4px) var(--ha-space-2, 8px)
                      calc(var(--ha-space-12, 48px) + var(--safe-area-inset-bottom, 0px)); }
-        .card-header { align-items:flex-start; }
-        .header-actions { justify-content:flex-start; }
+        /* Give the title the full width and let the actions take their own row,
+           rather than squeezing a two-word heading into two lines. */
+        .card-header { align-items:flex-start; flex-wrap:wrap; }
+        .header-actions { justify-content:flex-start; width:100%; }
         .kv { flex-direction:column; gap:var(--ha-space-1, 4px); }
         .kv .k { flex:none; }
         .form-row { align-items:stretch; flex-direction:column; }
@@ -2702,4 +2704,11 @@ class Z2MPanel extends HTMLElement {
   }
 }
 
-customElements.define('z2m-panel', Z2MPanel);
+// Guarded, because this module can legitimately be evaluated twice: Home Assistant
+// caches panel modules per URL, but a scoped custom-element registry (and a soft
+// re-navigation to /z2m) can re-run it, and a bare define() then throws
+// "the name z2m-panel has already been used with this registry" -- which was
+// observed in the live log and leaves the operator on a dead page.
+if (!customElements.get('z2m-panel')) {
+  customElements.define('z2m-panel', Z2MPanel);
+}

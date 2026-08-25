@@ -1648,8 +1648,8 @@ class Z2MNetworkMap extends HTMLElement {
       // a red ring that made a working router look broken.
       (stranded
         ? `<p class="note">Only route: in this scan, ${stranded} device${
-            stranded === 1 ? '' : 's'
-          } reach the coordinator only through this one.</p>`
+            stranded === 1 ? ' reaches' : 's reach'
+          } the coordinator only through this one.</p>`
         : '') +
       (node.failed?.length
         ? `<p class="warnline">No scan reply: ${escapeHtml(node.failed.join(', '))}</p>`
