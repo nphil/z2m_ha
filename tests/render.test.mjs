@@ -313,8 +313,47 @@ const subs = {};
 const hasSub = (type) => (subs[type] || []).length > 0;
 const push = (type, ev) => {
   const list = subs[type] || [];
-  if (!list.length) throw new Error(`nothing subscribed to ${type}`);
+  if (!list.length) {
+    // Which subscriptions DO exist is the whole diagnosis when this fires on a machine
+    // that is not this one: it separates "never subscribed" from "subscribed and then
+    // torn down", and names what the panel thinks it is doing instead.
+    const live = Object.entries(subs)
+      .filter(([, l]) => l.length)
+      .map(([t, l]) => `${t}x${l.length}`)
+      .join(', ') || 'none';
+    throw new Error(`nothing subscribed to ${type}; live subscriptions: ${live}`);
+  }
   list.forEach((cb) => cb(ev));
+};
+
+/**
+ * Wait for a condition instead of guessing how long it takes.
+ *
+ * Mounting the map is asynchronous -- a lazy import, then the element, then the
+ * subscription -- so a fixed sleep is a race that passes on a fast machine and fails on
+ * a loaded CI runner. Timing out throws with the label, so a real regression still fails
+ * loudly rather than hanging.
+ */
+const until = async (label, pred, ms = 5000) => {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (pred()) return;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  throw new Error(`timed out waiting for ${label}`);
+};
+/**
+ * Bounded wait that ANSWERS rather than throws, so a positive assertion stays a real
+ * assertion: it is still the check that fails, not a helper, and it does not depend on
+ * how fast this machine happens to be.
+ */
+const soon = async (pred, ms = 5000) => {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (pred()) return true;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  return false;
 };
 let mapModule = 'present';
 
@@ -473,6 +512,17 @@ const openMap = () => {
   const el = find('data-act', 'map');
   if (!el) throw new Error('no Show map button');
   el.onclick();
+};
+// Opening the map is only half of it: the element arrives after a lazy import, and
+// whatever the panel decides to do about a scan happens in that same continuation. Every
+// assertion about the map -- including the ones asserting a scan did NOT start -- is only
+// meaningful once that has settled.
+const settleMap = async () => {
+  await until('the map element to be hosted', () => {
+    const stage = p.shadowRoot.getElementById('mapstage');
+    return !!stage && stage.children.length > 0;
+  });
+  await tick();
 };
 const headlines = () =>
   Array.from(html().matchAll(/<div slot="headline">([\s\S]*?)<\/div>/g)).map((m) =>
@@ -1087,7 +1137,7 @@ check('log ring buffer is capped', (() => {
 console.log('=== map: a cached scan is drawn, never re-probed ===');
 sent.length = 0;
 openMap();
-await tick(60);
+await settleMap();
 const mapCalls = sent.filter((m) => m.type === 'z2m/networkmap');
 check('reads the cache', mapCalls.length === 1);
 check('NEVER auto-scans on open', mapCalls.every((m) => !m.force));
@@ -1138,10 +1188,11 @@ p._resetMap();
 p._summary = { ...fx.info, map_generated: null };
 sent.length = 0;
 openMap();
-await tick(60);
+await settleMap();
 check('no cache: never calls the blocking map command',
   !sent.some((m) => m.type === 'z2m/networkmap'));
-check('no cache: starts a streaming scan', hasSub('z2m/networkmap/scan'));
+check('no cache: starts a streaming scan',
+  await soon(() => hasSub('z2m/networkmap/scan')));
 const liveEl = p.shadowRoot.getElementById('mapstage').children[0];
 check('the map is mounted before any radio traffic',
   !!liveEl && liveEl.tag === 'z2m-network-map' && liveEl.topology === undefined);
@@ -1185,7 +1236,7 @@ p._go({ name: 'dashboard' });
 await tick();
 p._resetMap();
 openMap();
-await tick(60);
+await settleMap();
 const dumbEl = p.shadowRoot.getElementById('mapstage').children[0];
 push('z2m/networkmap/scan', { phase: 'done', generated: doneAt,
   coordinator: fx.networkmap.coordinator, nodes: fx.networkmap.nodes,
@@ -1201,11 +1252,12 @@ p._resetMap();
 p._summary = fx.info;
 sent.length = 0;
 openMap();
-await tick(60);
+await settleMap();
 check('a cached open still does not scan', !hasSub('z2m/networkmap/scan'));
 p.shadowRoot.getElementById('mapstage').emit('z2m-rescan');
 await tick();
-check('z2m-rescan starts a fresh streaming scan', hasSub('z2m/networkmap/scan'));
+check('z2m-rescan starts a fresh streaming scan',
+  await soon(() => hasSub('z2m/networkmap/scan')));
 check('re-scan tells the map it is scanning', p._map.el.scan.scanning === true);
 check('re-scan sends no blocking map command', !sent.some((m) => m.type === 'z2m/networkmap'
   && m.force === true));
@@ -1255,7 +1307,7 @@ console.log('=== map: element survives leaving and re-entering ===');
 go('dashboard');
 await tick();
 openMap();
-await tick(60);
+await settleMap();
 const stage2 = p.shadowRoot.getElementById('mapstage');
 check('same map instance is re-hosted',
   stage2.children.length === 1 && stage2.children[0] === survivor);
@@ -1731,8 +1783,10 @@ check('registering the element twice is not fatal', (() => {
 /* ================================================================ bindings */
 console.log('=== bindings: what is bound, and to what ===');
 p._go({ name: 'binds', ieee: '0x0000000000000001' });
-await tick(60);
-check('reads the device\u2019s endpoints and binds', !!p._binds.clusters && !!p._binds.binds);
+// Both reads are in flight at once, so wait for the state they land in rather than for a
+// duration that only happens to be long enough on this machine.
+check('reads the device\u2019s endpoints and binds',
+  await soon(() => !!p._binds.clusters && !!p._binds.binds));
 check('titled Bindings', html().includes('header="Bindings"'));
 check('says what a bind actually does', html().includes('without Home Assistant or'));
 check('groups binds by the endpoint that owns them',
@@ -1780,7 +1834,8 @@ console.log('=== bindings: writing, and the partial failure Z2M calls success ==
 bindSpec.data = { endpoint: '1', target: 'g:5', clusters: ['genOnOff', 'genScenes'] };
 sent.length = 0;
 await act('bind');
-await tick(60);
+await until('the bind command to be sent',
+  () => sent.some((m) => m.type === 'z2m/device/bind'));
 const bindMsg = sent.find((m) => m.type === 'z2m/device/bind');
 check('binds with the chosen endpoint, target and clusters', !!bindMsg
   && bindMsg.from === '0x0000000000000001' && bindMsg.from_endpoint === 1
@@ -1798,7 +1853,8 @@ check('the list is re-read from Zigbee2MQTT afterwards',
 console.log('=== bindings: removing one cluster ===');
 sent.length = 0;
 await act('unbind');
-await tick(60);
+await until('the unbind command to be sent',
+  () => sent.some((m) => m.type === 'z2m/device/unbind'));
 const unbindMsg = sent.find((m) => m.type === 'z2m/device/unbind');
 check('unbinds exactly the cluster on the row', !!unbindMsg
   && unbindMsg.clusters.length === 1);
