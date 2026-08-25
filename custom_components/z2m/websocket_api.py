@@ -1300,6 +1300,12 @@ async def ws_touchlink_factory_reset(hass, connection, msg, data) -> None:
 # A target is a device (ieee or friendly name) or a group (id or friendly name). The
 # endpoint is optional and only meaningful for a device: a two-gang switch holds a
 # separate scene table per gang.
+#
+# The scene id is carried as `scene`, NOT as `id`. Same reason the device commands
+# take `device` and the group commands take `group`: every Home Assistant websocket
+# message already has an `id`, the numeric message id, and a JSON object cannot hold
+# the key twice. A schema declaring `id` here would either be overwritten by the
+# envelope or reject a perfectly good scene 0 for not being a positive message id.
 
 # Zigbee scene ids are a single byte.
 _SCENE_ID = vol.All(vol.Coerce(int), vol.Range(min=0, max=255))
@@ -1336,14 +1342,14 @@ async def ws_scenes(hass, connection, msg, data) -> None:
         vol.Required("type"): "z2m/scene/store",
         vol.Required("target"): _SCENE_TARGET,
         vol.Optional("endpoint"): _BIND_ENDPOINT,
-        vol.Required("id"): _SCENE_ID,
+        vol.Required("scene"): _SCENE_ID,
         vol.Optional("name"): vol.All(str, vol.Length(min=1)),
     }
 )
 @websocket_api.async_response
 @_guard
 async def ws_scene_store(hass, connection, msg, data) -> None:
-    """Save the target's CURRENT state as a scene under `id`.
+    """Save the target's CURRENT state as a scene under `scene`.
 
     Not a bridge request: this is `{"scene_store": {...}}` published to the target's
     `set` topic, so nothing answers it. What is waited for instead is Z2M
@@ -1364,7 +1370,20 @@ async def ws_scene_store(hass, connection, msg, data) -> None:
     group id, so id 0 is fine there.
     """
     target, endpoint = _scene_target(msg)
-    scene_id = msg["id"]
+    scene_id = msg["scene"]
+    # Refused here rather than at the radio. Z2M would reject it too, but only after
+    # the publish, and the reason would then be reachable solely through the log.
+    # scenes_for is a projection over the retained inventory, so this costs nothing
+    # and it also settles whether the target exists at all.
+    if scene_id == 0 and data.scenes_for(target)["kind"] == "device":
+        connection.send_error(
+            msg["id"],
+            websocket_api.ERR_INVALID_FORMAT,
+            "Scene 0 is reserved: the Zigbee specification keeps scene 0 in group 0 "
+            "for the OnOff cluster's global scene, so a device cannot store it. Use "
+            "an id from 1 to 255, or store it on a group.",
+        )
+        return
     value: Any = {"ID": scene_id}
     if msg.get("name"):
         value["name"] = msg["name"]
@@ -1386,7 +1405,7 @@ async def ws_scene_store(hass, connection, msg, data) -> None:
         vol.Required("type"): "z2m/scene/recall",
         vol.Required("target"): _SCENE_TARGET,
         vol.Optional("endpoint"): _BIND_ENDPOINT,
-        vol.Required("id"): _SCENE_ID,
+        vol.Required("scene"): _SCENE_ID,
     }
 )
 @websocket_api.async_response
@@ -1409,7 +1428,7 @@ async def ws_scene_recall(hass, connection, msg, data) -> None:
     target, endpoint = _scene_target(msg)
     connection.send_result(
         msg["id"],
-        await data.async_scene_write(target, endpoint, "scene_recall", msg["id"]),
+        await data.async_scene_write(target, endpoint, "scene_recall", msg["scene"]),
     )
 
 
@@ -1419,7 +1438,7 @@ async def ws_scene_recall(hass, connection, msg, data) -> None:
         vol.Required("type"): "z2m/scene/remove",
         vol.Required("target"): _SCENE_TARGET,
         vol.Optional("endpoint"): _BIND_ENDPOINT,
-        vol.Required("id"): _SCENE_ID,
+        vol.Required("scene"): _SCENE_ID,
     }
 )
 @websocket_api.async_response
@@ -1436,7 +1455,7 @@ async def ws_scene_remove(hass, connection, msg, data) -> None:
     Costs one ZCL scene command, to a device that has to be awake.
     """
     target, endpoint = _scene_target(msg)
-    scene_id = msg["id"]
+    scene_id = msg["scene"]
     connection.send_result(
         msg["id"],
         await data.async_scene_write(
