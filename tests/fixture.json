@@ -101,7 +101,11 @@
         }
       ],
       "scenes": [],
-      "update_entity": "update.hallway_dimmer"
+      "update_entity": "update.hallway_dimmer",
+      "endpoints": [
+        1,
+        2
+      ]
     },
     {
       "ieee_address": "0x0000000000000002",
@@ -125,7 +129,10 @@
         }
       ],
       "scenes": [],
-      "update_entity": "update.porch_sensor"
+      "update_entity": "update.porch_sensor",
+      "endpoints": [
+        1
+      ]
     },
     {
       "ieee_address": "0x0000000000000003",
@@ -138,7 +145,10 @@
       "supported": false,
       "options": [],
       "scenes": [],
-      "update_entity": null
+      "update_entity": null,
+      "endpoints": [
+        1
+      ]
     },
     {
       "ieee_address": "0x0000000000000004",
@@ -152,7 +162,10 @@
       "supported": true,
       "options": [],
       "scenes": [],
-      "update_entity": "update.tricky_name"
+      "update_entity": "update.tricky_name",
+      "endpoints": [
+        1
+      ]
     }
   ],
   "groups": [
@@ -273,6 +286,16 @@
         "entity_id": "sensor.cpu",
         "device_id": "devX",
         "labels": []
+      }
+    },
+    "areas": {
+      "living_room": {
+        "area_id": "living_room",
+        "name": "Living Room"
+      },
+      "hallway": {
+        "area_id": "hallway",
+        "name": "Hallway"
       }
     }
   },
@@ -395,5 +418,80 @@
   },
   "backup": {
     "zip": "UEsDBCBwcmV0ZW5kIGNvb3JkaW5hdG9yIGJhY2t1cA=="
+  },
+  "pairing": {
+    "snapshot": {
+      "permit_join": false,
+      "permit_join_end": null,
+      "sessions": []
+    },
+    "joined": {
+      "type": "device_joined",
+      "ieee_address": "0x00158d0002ab34cd",
+      "friendly_name": "0x00158d0002ab34cd",
+      "phase": "joined"
+    },
+    "started": {
+      "type": "device_interview",
+      "ieee_address": "0x00158d0002ab34cd",
+      "friendly_name": "0x00158d0002ab34cd",
+      "phase": "interview_started"
+    },
+    "successful": {
+      "type": "device_interview",
+      "ieee_address": "0x00158d0002ab34cd",
+      "friendly_name": "0x00158d0002ab34cd",
+      "phase": "successful",
+      "supported": true,
+      "definition": {
+        "vendor": "Aqara",
+        "model": "WSDCGQ11LM",
+        "description": "Temperature and humidity sensor"
+      }
+    },
+    "unsupported": {
+      "type": "device_interview",
+      "ieee_address": "0x00158d0002ab34cd",
+      "friendly_name": "0x00158d0002ab34cd",
+      "phase": "successful",
+      "supported": false,
+      "definition": {
+        "vendor": "Unknown",
+        "model": "TS0601"
+      }
+    },
+    "failed": {
+      "type": "device_interview",
+      "ieee_address": "0x00158d0002ab34cd",
+      "friendly_name": "0x00158d0002ab34cd",
+      "phase": "failed"
+    },
+    "other": {
+      "type": "device_joined",
+      "ieee_address": "0x00158d0009999999",
+      "friendly_name": "somebody else",
+      "phase": "joined"
+    }
+  },
+  "paired_device": {
+    "ieee_address": "0x00158d0002ab34cd",
+    "friendly_name": "0x00158d0002ab34cd",
+    "type": "EndDevice",
+    "power_source": "Battery",
+    "vendor": "Aqara",
+    "model": "WSDCGQ11LM",
+    "description": "Temperature and humidity sensor",
+    "supported": true,
+    "interview_state": "SUCCESSFUL",
+    "endpoints": [
+      1
+    ],
+    "availability": "online",
+    "network_address": 41234,
+    "exposes": [],
+    "options": [],
+    "scenes": [],
+    "update_entity": null,
+    "device_id": "dev_paired"
   }
 }

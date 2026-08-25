@@ -157,6 +157,9 @@ class Z2MPanel extends HTMLElement {
     this._feedVersions = { info: 0, devices: 0, groups: 0 };
     this._feedRequests = { info: 0, devices: 0, groups: 0 };
     this._filter = '';
+    // Group writes report locally: a refused rename must not blank the dashboard.
+    this._groupError = null;
+    this._groupNotice = null;
     this._busy = false;
     this._subs = {};
     this._logs = [];
@@ -374,7 +377,9 @@ class Z2MPanel extends HTMLElement {
     const groups = this._arrayPayload(ev, 'groups');
     if (!groups) return;
     this._applyFeed('groups', groups);
-    if (this._groupStatus) this._groupStatus = null;
+    // The retained list is the authoritative answer to a write, so a stale refusal
+    // must not sit on screen next to membership that has since changed.
+    this._groupError = null;
   }
 
   _refresh() {
@@ -567,13 +572,37 @@ class Z2MPanel extends HTMLElement {
 
   /* ----------------------------------------------------------------- render */
 
+  /**
+   * Which failed feeds this view actually depends on. The old panel read all three
+   * in one Promise.all and put a single "Unknown error" above every page, so one
+   * broken command made the whole integration look dead. A feed the current view
+   * does not use is not this view's error.
+   */
+  _feedAlert() {
+    const relevant = { info: true };
+    if (['dashboard', 'devices', 'device', 'ota', 'group', 'pairing'].includes(this._view.name))
+      relevant.devices = true;
+    if (['dashboard', 'groups', 'group'].includes(this._view.name)) relevant.groups = true;
+
+    const failed = Object.keys(relevant).filter((k) => this._feedErrors[k]);
+    if (!failed.length) return '';
+    return failed
+      .map(
+        (k) =>
+          `<ha-alert alert-type="error" title="${
+            k === 'info' ? 'Bridge unavailable' : `Could not read Zigbee ${k}`
+          }">${esc(this._feedErrors[k])}</ha-alert>`
+      )
+      .join('');
+  }
+
   _render() {
     if (!this.shadowRoot) return;
-
 
     this._counts = this._countKey();
     const body = `<div class="container${this._view.name === 'map' ? ' mapview' : ''}">
         ${this._error ? `<ha-alert alert-type="error">${esc(this._error)}</ha-alert>` : ''}
+        ${this._feedAlert()}
         ${this._bodyFor()}
       </div>`;
 
@@ -927,10 +956,18 @@ class Z2MPanel extends HTMLElement {
       }),
     ].join('');
 
+    // Add device sits here, next to Show map, rather than in a floating corner
+    // button. The old FAB was an ha-button pretending to be one, it overlapped the
+    // content it floated over, and it toggled the radio directly -- so "Add device"
+    // opened the network with nothing on screen to watch. Both actions now belong
+    // to the network they act on, and Add device opens the pairing helper.
     return `
       <ha-card class="nav-card">
         <div class="card-header">My network
-          <ha-button appearance="filled" data-act="map">${icon(MDI.map)}Show map</ha-button>
+          <span class="header-actions">
+            <ha-button appearance="plain" data-act="map">${icon(MDI.map)}Show map</ha-button>
+            <ha-button appearance="filled" data-act="pair">${icon(MDI.plus)}Add device</ha-button>
+          </span>
         </div>
         <div class="card-content">${list(rows)}</div>
       </ha-card>`;
@@ -1364,22 +1401,543 @@ class Z2MPanel extends HTMLElement {
     );
   }
 
+  /* ----------------------------------------------------------------- groups */
+
+  /** A group by its id, tolerating the string ids that arrive from the DOM. */
+  _group(id) {
+    const key = String(id);
+    return (this._groups || []).find((g) => String(g.id) === key) || null;
+  }
+
+  /** Every device endpoint, as the member picker's candidate list. */
+  _memberCandidates(group) {
+    const taken = new Set(
+      (group.members || []).map((m) => `${m.ieee_address}|${m.endpoint}`)
+    );
+    const out = [];
+    for (const d of this._devices) {
+      // A device with no endpoint projection can still be grouped on its first
+      // endpoint, which is what Z2M means by "default".
+      const endpoints = (d.endpoints || []).length ? d.endpoints : ['default'];
+      for (const endpoint of endpoints) {
+        if (taken.has(`${d.ieee_address}|${endpoint}`)) continue;
+        out.push({ device: d, endpoint });
+      }
+    }
+    return out;
+  }
+
   _groupsView() {
     const rows = (this._groups || [])
-      .map((g) =>
-        row({
+      .map((g) => {
+        const members = (g.members || []).length;
+        return row({
           icon: MDI.groups,
           headline: esc(g.friendly_name || String(g.id)),
-          text: `ID ${esc(String(g.id))} \u00b7 ${(g.members || []).length} member${
-            (g.members || []).length === 1 ? '' : 's'
+          text: `ID ${esc(String(g.id))} \u00b7 ${members} member${
+            members === 1 ? '' : 's'
           }`,
-          end: '',
-        })
+          data: ` data-group="${esc(String(g.id))}"`,
+          tap: true,
+        });
+      })
+      .join('');
+
+    // Create stays reachable when the list is empty, which is the state a first
+    // group is made from.
+    return (
+      (this._groupError
+        ? `<ha-alert alert-type="error">${esc(this._groupError)}</ha-alert>`
+        : '') +
+      `<ha-card class="nav-card">
+        <div class="card-header">Zigbee groups
+          <span class="header-actions">
+            <ha-button appearance="filled" size="s" data-act="groupadd">${icon(
+              MDI.plus
+            )}New group</ha-button>
+          </span>
+        </div>
+        <div class="form-row">
+          <label for="gname">Name</label>
+          <input id="gname" type="text" placeholder="Kitchen downlights">
+        </div>
+        <div class="card-content">${
+          rows ? list(rows) : '<div class="empty">No Zigbee groups yet.</div>'
+        }</div>
+        <div class="note">A Zigbee group switches its members from the radio itself,
+        so they respond together instead of one after another.</div>
+      </ha-card>`
+    );
+  }
+
+  _groupView(id) {
+    const g = this._group(id);
+    if (!g) {
+      return `<ha-card class="nav-card"><div class="empty">This group no longer exists.</div></ha-card>`;
+    }
+
+    const members = g.members || [];
+    const memberRows = members
+      .map((m) => {
+        const dev = this._dev(m.ieee_address);
+        return row({
+          icon: MDI.devices,
+          headline: esc((dev && dev.friendly_name) || m.ieee_address),
+          text: `Endpoint ${esc(String(m.endpoint))}${
+            dev && dev.model ? ` \u00b7 ${esc(dev.model)}` : ''
+          }`,
+          end: `<ha-button slot="end" appearance="plain" size="s"
+                  data-act="memberremove"
+                  data-device="${esc(m.ieee_address)}"
+                  data-endpoint="${esc(String(m.endpoint))}">Remove</ha-button>`,
+        });
+      })
+      .join('');
+
+    const candidates = this._memberCandidates(g);
+    const options = candidates
+      .map(
+        (c) =>
+          `<option value="${esc(`${c.device.ieee_address}|${c.endpoint}`)}">${esc(
+            c.device.friendly_name || c.device.ieee_address
+          )}${(c.device.endpoints || []).length > 1 ? ` \u2014 endpoint ${esc(String(c.endpoint))}` : ''}</option>`
       )
       .join('');
-    return `<ha-card class="nav-card"><div class="card-content">${
-      rows ? list(rows) : '<div class="empty">No Zigbee groups.</div>'
-    }</div></ha-card>`;
+
+    return (
+      (this._groupError
+        ? `<ha-alert alert-type="error">${esc(this._groupError)}</ha-alert>`
+        : '') +
+      (this._groupNotice
+        ? `<ha-alert alert-type="success">${esc(this._groupNotice)}</ha-alert>`
+        : '') +
+      `<ha-card class="nav-card">
+        ${this._kvs([
+          ['Group ID', g.id],
+          ['Members', members.length],
+        ])}
+        <div class="form-row">
+          <label for="grn">Name</label>
+          <input id="grn" type="text" value="${esc(g.friendly_name || '')}">
+        </div>
+        <div class="actions">
+          <ha-button appearance="plain" size="s" data-act="grouprename">Rename</ha-button>
+        </div>
+      </ha-card>` +
+      `<ha-card class="nav-card">
+        <div class="card-header">Members</div>
+        <div class="card-content">${
+          memberRows ? list(memberRows) : '<div class="empty">No members yet.</div>'
+        }</div>
+        ${
+          candidates.length
+            ? `<div class="form-row">
+                 <label for="gmember">Add</label>
+                 <select id="gmember">${options}</select>
+                 <ha-button appearance="filled" size="s" data-act="memberadd">Add</ha-button>
+               </div>`
+            : '<div class="note">Every device endpoint is already in this group.</div>'
+        }
+        <div class="note">Membership is per endpoint, because that is what the radio
+        binds. A multi-endpoint device can have one endpoint in the group and not
+        another.</div>
+      </ha-card>` +
+      `<ha-card class="nav-card recovery">
+        <div class="card-header">Delete</div>
+        <div class="card-content">${list(
+          row({
+            icon: MDI.groups,
+            headline: 'Delete this group',
+            text: 'Tells each member to leave the group, then removes it',
+            end: rowButton('Delete', 'groupremove'),
+          }) +
+            row({
+              icon: MDI.alert,
+              headline: 'Force delete',
+              text: 'Recovery only \u2014 deletes the group without telling the devices, so they stay programmed with its address',
+              end: rowButton('Force', 'groupforce'),
+            })
+        )}</div>
+      </ha-card>`
+    );
+  }
+
+  /* ---------------------------------------------------------------- pairing */
+  //
+  // Completion is decided by Zigbee2MQTT's bridge/event stream, never by reading
+  // the log. The log is shown because it is the only place a failing join
+  // explains itself, but a line of text is not a state machine: `device_joined`
+  // then `device_interview successful` is what "paired" means, and the interview
+  // carries whether Z2M has a converter for the thing that just joined.
+
+  /** Seconds left in the join window, from Z2M's own end timestamp. */
+  _pairingCountdown() {
+    const left = this._joinLeft();
+    if (!(this._summary || {}).permit_join) return 'closed';
+    return left ? `${left}s left` : 'open';
+  }
+
+  /**
+   * Subscribe FIRST, then open the radio. The events are not retained, so a
+   * subscription established after the request can miss the join it was opened for.
+   */
+  async _openPairing() {
+    const p = this._pairing;
+    if (p.active) return;
+    p.active = true;
+    const run = p.run;
+
+    try {
+      await Promise.all([
+        this._sub('pairing', { type: 'z2m/pairing/subscribe' }, (ev) =>
+          this._onPairingEvent(run, ev)
+        ),
+        this._sub('pairlogs', { type: 'z2m/logs/subscribe' }, (entry) =>
+          this._onPairLog(run, entry)
+        ),
+      ]);
+    } catch (err) {
+      if (this._pairing.run !== run) return;
+      p.error = this._feedMessage(err, 'Could not watch the pairing stream');
+      this._render();
+      return;
+    }
+    if (this._pairing.run !== run) return;
+    p.subscribed = true;
+    await this._openJoinWindow();
+  }
+
+  async _openJoinWindow() {
+    const p = this._pairing;
+    const run = p.run;
+    p.opening = true;
+    p.error = null;
+    p.notice = null;
+    this._render();
+    try {
+      await this._call('z2m/permit_join', { time: PAIR_OPEN_SECONDS });
+      if (this._pairing.run !== run) return;
+      // Only a window this helper opened is a window this helper may close.
+      p.ownsPermit = true;
+      p.phase = 'waiting';
+    } catch (err) {
+      if (this._pairing.run !== run) return;
+      p.error = this._feedMessage(err, 'Zigbee2MQTT refused to open the network');
+    } finally {
+      if (this._pairing.run === run) {
+        p.opening = false;
+        this._render();
+      }
+    }
+  }
+
+  /** Close the window only when we opened it, so another tab is left alone. */
+  async _closeJoinWindow() {
+    const p = this._pairing;
+    if (!p.ownsPermit || p.closing) return;
+    p.closing = true;
+    p.ownsPermit = false;
+    try {
+      await this._call('z2m/permit_join', { time: 0 });
+    } catch (_) {
+      // The window expires by itself after PAIR_OPEN_SECONDS, so a failed close
+      // is not worth an error banner over a device that just paired.
+    } finally {
+      p.closing = false;
+    }
+  }
+
+  _leavePairing() {
+    const p = this._pairing;
+    if (!p) return;
+    this._unsub('pairing');
+    this._unsub('pairlogs');
+    if (p.ownsPermit) this._closeJoinWindow();
+    this._resetPairing();
+  }
+
+  _onPairLog(run, entry) {
+    const p = this._pairing;
+    if (p.run !== run || !entry || !entry.message) return;
+    p.logs.push(entry);
+    if (p.logs.length > PAIR_LOG_MAX) p.logs.splice(0, p.logs.length - PAIR_LOG_MAX);
+    // Patch the log box in place: a full render would drop the operator's typing
+    // in the name field once a device has joined.
+    const box = this.shadowRoot && this.shadowRoot.getElementById('pairlog');
+    if (box) box.innerHTML = this._pairLogRows();
+  }
+
+  _pairLogRows() {
+    return this._pairing.logs
+      .map(
+        (e) =>
+          `<div class="log ${esc(e.level || 'info')}"><span class="l">${esc(
+            e.level || 'info'
+          )}</span><span class="m">${esc(e.message)}</span></div>`
+      )
+      .join('');
+  }
+
+  /**
+   * One pairing envelope. A snapshot replaces what we know; an event is only ours
+   * if it concerns the device this session already latched onto, or is the first
+   * join of the session. Two people pairing at once must not each see the other's
+   * device.
+   */
+  _onPairingEvent(run, ev) {
+    const p = this._pairing;
+    if (p.run !== run || !ev) return;
+
+    if (ev.kind === 'snapshot') {
+      p.pairing = ev.pairing || null;
+      // Adopt an in-flight device after a reload: the events that named it are
+      // gone, but the snapshot still carries its phase.
+      if (!p.target && p.pairing && Array.isArray(p.pairing.sessions)) {
+        const live = p.pairing.sessions.find((s) => s.phase !== 'failed');
+        if (live) this._adoptPairSession(live);
+      }
+      this._render();
+      return;
+    }
+    if (ev.kind !== 'event' || !ev.event) return;
+    const event = ev.event;
+    if (p.target && event.ieee_address !== p.target) return;
+    this._adoptPairSession(event);
+  }
+
+  _adoptPairSession(event) {
+    const p = this._pairing;
+    p.target = event.ieee_address;
+    p.event = event;
+    p.phase = event.phase;
+    if ('supported' in event) p.supported = event.supported;
+    if (event.definition) p.definition = event.definition;
+
+    if (event.phase === 'successful') {
+      // Paired. Close the radio immediately rather than leaving it open for the
+      // rest of the window: an open network is an open network.
+      this._closeJoinWindow();
+    }
+    this._render();
+  }
+
+  /** The freshly paired device, once the retained inventory has caught up. */
+  _pairDevice() {
+    const ieee = this._pairing.target;
+    return ieee ? this._dev(ieee) : null;
+  }
+
+  _onPairDevices() {
+    // A joined device appears in the inventory a moment after the event, which is
+    // what fills in its model, endpoints and Home Assistant device id.
+    if (this._view.name === 'pairing' && this._pairing.target) this._render();
+  }
+
+  _pairStatusText() {
+    const p = this._pairing;
+    switch (p.phase) {
+      case 'joined':
+        return 'Device joined \u2014 interviewing';
+      case 'interview_started':
+        return 'Interviewing the device';
+      case 'successful':
+        return p.supported === false
+          ? 'Paired, but Zigbee2MQTT has no converter for this model'
+          : 'Paired';
+      case 'failed':
+        return 'The interview failed';
+      case 'waiting':
+        return 'Waiting for a device to join';
+      default:
+        return 'Opening the network';
+    }
+  }
+
+  _pairingView() {
+    const p = this._pairing;
+    const done = p.phase === 'successful';
+    const dev = this._pairDevice();
+    const definition = p.definition || {};
+    const areas = Object.values((this._hass && this._hass.areas) || {});
+
+    const identity = p.target
+      ? `<div class="pair-identity">
+           <strong>${esc(
+             (dev && dev.friendly_name) || (p.event && p.event.friendly_name) || p.target
+           )}</strong>
+           <code class="supporting">${esc(p.target)}</code>
+           ${
+             definition.vendor || definition.model
+               ? `<div class="supporting">${esc(definition.vendor || '')} ${esc(
+                   definition.model || ''
+                 )}</div>`
+               : ''
+           }
+           ${
+             definition.description
+               ? `<div class="supporting">${esc(definition.description)}</div>`
+               : ''
+           }
+         </div>`
+      : '';
+
+    const status = `<ha-card class="nav-card">
+        <div class="pair-state">
+          <strong>${esc(this._pairStatusText())}</strong>
+          <span class="supporting">Joining ${
+            done ? 'closed' : `<span id="pairtime">${esc(this._pairingCountdown())}</span>`
+          }</span>
+          ${
+            done
+              ? ''
+              : `<span class="supporting">Put the device into pairing mode now \u2014 usually a
+                 long press, or power-cycling it a few times.</span>`
+          }
+        </div>
+        ${identity}
+        ${
+          p.supported === false && done
+            ? `<ha-alert alert-type="warning">The device is on the network. Zigbee2MQTT has no
+               converter for it, so it has no entities until one is added.</ha-alert>`
+            : ''
+        }
+        ${
+          p.phase === 'failed'
+            ? `<ha-alert alert-type="error">The interview failed. The device is on the network
+               but incompletely known; re-interview it from its device page, or pair it
+               closer to a mains-powered device.</ha-alert>`
+            : ''
+        }
+        <div class="actions">
+          ${
+            done
+              ? `<ha-button appearance="plain" data-act="pairagain">Add another</ha-button>`
+              : `<ha-button appearance="plain" data-act="pairstop">Stop</ha-button>`
+          }
+          ${
+            !done && !(this._summary || {}).permit_join && !p.opening
+              ? `<ha-button appearance="filled" data-act="pairretry">Open again</ha-button>`
+              : ''
+          }
+        </div>
+      </ha-card>`;
+
+    // Naming and area are Home Assistant's own registry fields, applied through
+    // HA's own websocket command. The Zigbee friendly name is Z2M's, and both are
+    // set from this one form so the operator does not have to know that.
+    const setup =
+      done && p.target
+        ? `<ha-card class="nav-card">
+             <div class="card-header">Name and place it</div>
+             <div class="form-row">
+               <label for="pairname">Name</label>
+               <input id="pairname" type="text" value="${esc(
+                 (dev && dev.friendly_name) || (p.event && p.event.friendly_name) || ''
+               )}">
+             </div>
+             <div class="form-row">
+               <label for="pairarea">Area</label>
+               <select id="pairarea">
+                 <option value="">No area</option>
+                 ${areas
+                   .map(
+                     (a) =>
+                       `<option value="${esc(a.area_id)}"${
+                         dev && dev.device_id && a.area_id === this._deviceArea(dev.device_id)
+                           ? ' selected'
+                           : ''
+                       }>${esc(a.name)}</option>`
+                   )
+                   .join('')}
+               </select>
+             </div>
+             ${
+               p.setup.completed
+                 ? '<ha-alert alert-type="success">Saved.</ha-alert>'
+                 : ''
+             }
+             <div class="actions">
+               ${
+                 dev && dev.device_id
+                   ? `<ha-button appearance="plain" data-act="pairopen">Open device</ha-button>`
+                   : '<span class="supporting">Waiting for Home Assistant to register it\u2026</span>'
+               }
+               <ha-button appearance="filled" data-act="pairsave"${
+                 p.setup.saving ? ' disabled' : ''
+               }>${p.setup.saving ? 'Saving\u2026' : 'Save'}</ha-button>
+             </div>
+           </ha-card>`
+        : '';
+
+    return (
+      (p.error ? `<ha-alert alert-type="error">${esc(p.error)}</ha-alert>` : '') +
+      (p.notice ? `<ha-alert alert-type="success">${esc(p.notice)}</ha-alert>` : '') +
+      status +
+      setup +
+      `<ha-card class="nav-card">
+         <div class="card-header">Zigbee2MQTT log</div>
+         <div class="pair-log" id="pairlog">${this._pairLogRows()}</div>
+         <div class="note">Diagnostics only. Pairing is judged by Zigbee2MQTT\u2019s own
+         join and interview events, not by this text.</div>
+       </ha-card>`
+    );
+  }
+
+  /** The area a registry device currently sits in, directly or via its own area. */
+  _deviceArea(deviceId) {
+    const devices = (this._hass && this._hass.devices) || {};
+    const entry = devices[deviceId];
+    return (entry && entry.area_id) || '';
+  }
+
+  /**
+   * Apply the operator's chosen name and area. The Zigbee friendly name goes to
+   * Zigbee2MQTT, addressed by ieee so a rename cannot miss; the display name and
+   * area are Home Assistant registry fields and go through HA's own command. Entity
+   * ids are deliberately left alone -- they belong to MQTT discovery.
+   */
+  async _savePairSetup() {
+    const r = this.shadowRoot;
+    const p = this._pairing;
+    const nameEl = r && r.getElementById('pairname');
+    const areaEl = r && r.getElementById('pairarea');
+    const name = nameEl ? String(nameEl.value || '').trim() : '';
+    const areaId = areaEl ? areaEl.value || null : null;
+    if (!p.target) return;
+
+    p.setup.saving = true;
+    p.error = null;
+    this._render();
+    try {
+      const current = this._pairDevice() || {};
+      if (name && name !== current.friendly_name) {
+        await this._call('z2m/device/rename', { from: p.target, to: name });
+      }
+      let device = this._pairDevice();
+      // The HA device appears via MQTT discovery, which is asynchronous. Wait for
+      // it briefly rather than failing a rename the operator just asked for.
+      for (let i = 0; i < 10 && !(device && device.device_id); i += 1) {
+        await new Promise((done) => setTimeout(done, 600));
+        await this._refreshFeed('devices', 'z2m/devices');
+        device = this._pairDevice();
+      }
+      if (device && device.device_id) {
+        await this._call('config/device_registry/update', {
+          device_id: device.device_id,
+          name_by_user: name || null,
+          area_id: areaId,
+        });
+        p.setup.completed = true;
+      } else {
+        p.error =
+          'Renamed in Zigbee2MQTT. Home Assistant has not registered the device yet, so its area was not set.';
+      }
+    } catch (err) {
+      p.error = this._feedMessage(err, 'Could not save the device');
+    } finally {
+      p.setup.saving = false;
+      this._render();
+    }
   }
 
   /* ---------------------------------------------------------------- options */
@@ -1876,7 +2434,38 @@ class Z2MPanel extends HTMLElement {
     if (name === 'loglevel') this._act('z2m/log_level', { value: el.value });
   }
 
-  async _dispatch(act) {
+  /**
+   * One group write. The command is awaited because Zigbee2MQTT can refuse it --
+   * duplicate name, unknown endpoint, a member that did not answer -- and the
+   * operator needs to see that. The resulting membership is NOT taken from the
+   * response: Z2M republishes bridge/groups after the radio work, and
+   * z2m/groups/subscribe delivers that, which is the authoritative version.
+   */
+  async _groupWrite(type, payload, after) {
+    if (this._busy) return;
+    this._busy = true;
+    this._groupError = null;
+    this._groupNotice = null;
+    this._render();
+    try {
+      const res = await this._call(type, payload);
+      if (after) after(res);
+      else this._render();
+    } catch (err) {
+      this._groupError = this._feedMessage(err, 'Zigbee2MQTT refused the change');
+      this._render();
+    } finally {
+      this._busy = false;
+    }
+  }
+
+  /** Navigate with Home Assistant's own router rather than a bare link. */
+  _openHaDevice(deviceId) {
+    history.pushState(null, '', `/config/devices/device/${deviceId}`);
+    window.dispatchEvent(new CustomEvent('location-changed', { detail: { replace: false } }));
+  }
+
+  async _dispatch(act, el) {
     const r = this.shadowRoot;
     const d = this._view.name === 'device' ? this._dev(this._view.ieee) : null;
     // `id` is reserved by Home Assistant's websocket envelope, so every
@@ -1895,10 +2484,91 @@ class Z2MPanel extends HTMLElement {
       case 'map':
         return this._go({ name: 'map' });
 
-      case 'permit': {
-        // Time is the only field Z2M reads; 0 closes the network.
-        const open = (this._summary || {}).permit_join;
-        return this._act('z2m/permit_join', { time: open ? 0 : 254 });
+      case 'pair':
+        return this._go({ name: 'pairing' });
+
+      // Stop is the honest word: it closes the window this helper opened and goes
+      // back, rather than pretending to cancel a join already in flight.
+      case 'pairstop':
+        return this._back();
+
+      case 'pairretry':
+        return this._openJoinWindow();
+
+      case 'pairagain': {
+        // A second device in the same visit: new session, new window.
+        this._leavePairing();
+        return this._openPairing();
+      }
+
+      case 'pairsave':
+        return this._savePairSetup();
+
+      case 'pairopen': {
+        const paired = this._pairDevice();
+        if (paired && paired.device_id) this._openHaDevice(paired.device_id);
+        return undefined;
+      }
+
+      case 'groupadd': {
+        const input = r.getElementById('gname');
+        const name = input && String(input.value || '').trim();
+        if (!name) return undefined;
+        return this._groupWrite('z2m/group/add', { name }, (res) => {
+          if (input) input.value = '';
+          if (res && res.id !== undefined) this._go({ name: 'group', group: res.id });
+        });
+      }
+
+      case 'grouprename': {
+        const input = r.getElementById('grn');
+        const to = input && String(input.value || '').trim();
+        const group = this._view.group;
+        const current = this._group(group);
+        if (!to || !current || to === current.friendly_name) return undefined;
+        return this._groupWrite('z2m/group/rename', { group, to });
+      }
+
+      case 'groupremove':
+      case 'groupforce': {
+        const group = this._view.group;
+        const force = act === 'groupforce';
+        const current = this._group(group);
+        if (!current) return undefined;
+        if (
+          !confirm(
+            force
+              ? `Force delete ${current.friendly_name}?\n\nThe members are NOT told to leave, so they stay programmed with this group address. Use this only when a member cannot be reached.`
+              : `Delete ${current.friendly_name}?`
+          )
+        )
+          return undefined;
+        return this._groupWrite('z2m/group/remove', { group, force }, () =>
+          this._go({ name: 'groups' })
+        );
+      }
+
+      case 'memberadd': {
+        const select = r.getElementById('gmember');
+        const value = select && select.value;
+        if (!value) return undefined;
+        const [ieee, endpoint] = value.split('|');
+        return this._groupWrite('z2m/group/members/add', {
+          group: this._view.group,
+          device: ieee,
+          endpoint: endpoint === 'default' ? 'default' : Number(endpoint),
+        });
+      }
+
+      case 'memberremove': {
+        const ieee = el && el.dataset && el.dataset.device;
+        const endpoint = el && el.dataset && el.dataset.endpoint;
+        if (!ieee || endpoint === undefined) return undefined;
+        return this._groupWrite('z2m/group/members/remove', {
+          group: this._view.group,
+          device: ieee,
+          endpoint: endpoint === 'default' ? 'default' : Number(endpoint),
+        });
       }
 
       case 'restart':

@@ -272,6 +272,13 @@ Panel.prototype._loadMapModule = function _loadMapModule() {
   return Promise.resolve({});
 };
 
+// Set to a command type to make it reject once, so a scoped feed failure can be
+// asserted rather than assumed.
+let failFeed = null;
+// Group and pairing writes answer the way Zigbee2MQTT does, so the panel is tested
+// against real response shapes rather than bare acks.
+let groupAddId = 7;
+
 const hass = {
   // The panel reads firmware from HA's own `update` entities and counts the label
   // rows from HA's own registry collections, so the stub carries all three just like
@@ -279,6 +286,9 @@ const hass = {
   states: fx.states,
   devices: fx.registry.devices,
   entities: fx.registry.entities,
+  // Area assignment after pairing is a Home Assistant registry write, so the areas
+  // collection is part of the contract.
+  areas: fx.registry.areas,
   connection: {
     sendMessagePromise: (msg) => {
       // Home Assistant assigns the websocket envelope `id` itself and overwrites
@@ -287,6 +297,9 @@ const hass = {
       if (Object.prototype.hasOwnProperty.call(msg, 'id')) reservedKeyUse.push(msg.type);
       sent.push(msg);
       allSent.push(msg);
+      if (failFeed && msg.type === failFeed) {
+        return Promise.reject(new Error(`${msg.type} is unavailable`));
+      }
       switch (msg.type) {
         case 'z2m/info':
           return Promise.resolve(fx.info);
@@ -304,6 +317,25 @@ const hass = {
           return Promise.resolve(fx.health_check);
         case 'z2m/backup':
           return Promise.resolve(fx.backup);
+        case 'z2m/pairing':
+          return Promise.resolve(fx.pairing.snapshot);
+        case 'z2m/permit_join':
+          return Promise.resolve({ time: msg.time });
+        case 'z2m/group/add':
+          return Promise.resolve({ friendly_name: msg.name, id: groupAddId });
+        case 'z2m/group/rename':
+          return Promise.resolve({ from: String(msg.group), to: msg.to });
+        case 'z2m/group/remove':
+          return Promise.resolve({ id: String(msg.group), force: !!msg.force });
+        case 'z2m/group/members/add':
+        case 'z2m/group/members/remove':
+          return Promise.resolve({
+            device: msg.device,
+            group: String(msg.group),
+            endpoint: msg.endpoint,
+          });
+        case 'config/device_registry/update':
+          return Promise.resolve({ id: msg.device_id });
         default:
           return Promise.resolve(null);
       }
@@ -401,7 +433,16 @@ check('shows offline count', html().includes(`(${fx.info.offline_count} offline)
 check('shows Z2M version', html().includes(`Zigbee2MQTT ${fx.info.version}`));
 check('shows coordinator version', html().includes(fx.info.coordinator.meta.revision));
 check('shows permit-join state', html().includes('Joining closed'));
-check('offers Add device as the FAB', html().includes('slot="fab"') && html().includes('Add device'));
+// The FAB is gone deliberately. It was an ha-button positioned like a floating
+// action button, it floated over the content, and it toggled the radio directly --
+// so "Add device" opened the network with nothing on screen to watch it.
+check('no floating action button anywhere', !html().includes('slot="fab"')
+  && !html().includes('fabwrap'));
+check('Add device sits beside Show map', (() => {
+  const header = /My network([\s\S]*?)<\/div>\s*<div class="card-content">/.exec(html());
+  return !!header && header[1].includes('Show map') && header[1].includes('Add device');
+})());
+check('Add device opens the pairing helper, not the radio', !!find('data-act', 'pair'));
 
 console.log('=== my network card delegates into HA tables ===');
 const devHref = `/config/devices/dashboard?historyBack=1&label=${fx.info.label_id}`;
@@ -499,8 +540,8 @@ withoutElement('hass-subpage', () => {
   check('hass-subpage missing: title still shown', html().includes('>Zigbee</div>'));
   check('hass-subpage missing: refresh is still HA\u2019s ha-icon-button',
     html().includes('<ha-icon-button id="reload"'));
-  check('hass-subpage missing: FAB keeps its corner',
-    html().includes('class="fabwrap"') && html().includes('appearance="filled"'));
+  check('hass-subpage missing: primary actions stay in the card, not a corner',
+    html().includes('class="header-actions"') && !html().includes('class="fabwrap"'));
   check('hass-subpage missing: cards and rows unchanged',
     html().includes('<ha-card') && html().includes('<ha-md-list-item'));
   p._go({ name: 'devices' });
@@ -513,24 +554,27 @@ withoutElement('hass-subpage', () => {
 check('hass-subpage present: HA chrome is used again', html().includes('<hass-subpage'));
 
 // ha-fab and ha-textfield are the other two missing cold. The page never asks for
-// either: the FAB is already an ha-button (which is what HA's own ZHA page uses for
-// its FAB in this version) and text entry is already a native input.
+// either: actions are ordinary ha-buttons inside their card, and text entry is a
+// native input.
 check('never depends on ha-fab', !src.includes('ha-fab'));
 check('never depends on ha-textfield', !src.includes('ha-textfield'));
-check('FAB is an ha-button', /<ha-button[^>]*slot="fab"/.test(html()));
 check('text entry is a native input', html().includes('<input id="q"')
   || (() => { p._go({ name: 'devices' }); return html().includes('<input id="q"'); })());
 p._go({ name: 'dashboard' });
 
-console.log('=== the wait is bounded per element and non-fatal ===');
-check('a permanently missing element does not block boot', await (async () => {
+console.log('=== first paint waits for nothing ===');
+// This used to be a bounded 1.5s wait for HA's lazily loaded elements, measured at
+// 2.07s to a useful dashboard on the live instance. The Z-Wave page does not do
+// that, and neither does this one now: paint immediately with whatever exists.
+check('a missing element does not delay first paint', await (async () => {
   const stashed = defined.get('ha-md-list');
   defined.delete('ha-md-list');
-  const started = Date.now();
   const cold = new Panel();
   cold.connectedCallback();
+  const started = Date.now();
   cold.hass = hass;
-  await new Promise((r) => setTimeout(r, 2200));
+  // One microtask turn, nowhere near a component timeout.
+  await new Promise((r) => setTimeout(r, 60));
   const elapsed = Date.now() - started;
   const rendered = String(cold.shadowRoot.innerHTML);
   // Late arrival must upgrade the page in place rather than needing a reload.
@@ -539,7 +583,41 @@ check('a permanently missing element does not block boot', await (async () => {
   const upgraded = String(cold.shadowRoot.innerHTML).includes('<ha-md-list>');
   cold.disconnectedCallback();
   return rendered.includes('<ha-md-list-item') && rendered.includes('role="list"')
-    && elapsed < 3000 && upgraded;
+    && elapsed < 500 && upgraded;
+})());
+
+check('a card-helper promise that never settles cannot block the page', await (async () => {
+  const stashed = globalThis.window.loadCardHelpers;
+  // The classic hang: awaited, never resolved.
+  globalThis.window.loadCardHelpers = () => new Promise(() => {});
+  const cold = new Panel();
+  cold.connectedCallback();
+  cold.hass = hass;
+  await new Promise((r) => setTimeout(r, 60));
+  const rendered = String(cold.shadowRoot.innerHTML);
+  cold.disconnectedCallback();
+  globalThis.window.loadCardHelpers = stashed;
+  return rendered.includes('<ha-card');
+})());
+
+console.log('=== one broken feed cannot blank the panel ===');
+check('a failed groups read leaves the dashboard usable', await (async () => {
+  const cold = new Panel();
+  cold.connectedCallback();
+  failFeed = 'z2m/groups';
+  cold.hass = hass;
+  await new Promise((r) => setTimeout(r, 80));
+  failFeed = null;
+  const rendered = String(cold.shadowRoot.innerHTML);
+  cold.disconnectedCallback();
+  return (
+    // The devices and summary feeds still rendered...
+    rendered.includes('Online') &&
+    rendered.includes('My network') &&
+    // ...and the failure is named for what it is, not "Unknown error".
+    rendered.includes('Could not read Zigbee groups') &&
+    !rendered.includes('Unknown error')
+  );
 })());
 
 /* ================================================================== devices */
@@ -850,7 +928,7 @@ withoutElement('hass-subpage', () => {
   check('fallback chrome: same height rule',
     html().includes('.stage { height:calc(100vh - var(--header-height,56px)); min-height:360px; }'));
   check('fallback chrome: the sticky toolbar is exactly that band',
-    html().includes('height:var(--header-height,56px)'));
+    html().includes('height:var(--header-height, 56px)'));
   check('fallback chrome: still nothing between body and map',
     /<div class="container mapview">\s*<div class="stage" id="mapstage"><\/div>\s*<\/div>/
       .test(html()));
@@ -1044,21 +1122,198 @@ check('surfaces a missing archive as an error', await (async () => {
 })());
 p._error = null;
 
-/* ================================================================ commands */
-console.log('=== permit join and restart ===');
+/* ================================================================= pairing */
+console.log('=== pairing helper: watch first, then open the radio ===');
 go('dashboard');
 sent.length = 0;
-await act('permit');
-check('Add device -> z2m/permit_join with time', sent.some((m) => m.type === 'z2m/permit_join' && m.time === 254));
+await act('pair');
+await tick(60);
+check('Add device opens the helper', p._view.name === 'pairing');
+// Ordering is the whole point: bridge/event is not retained, so a subscription
+// established after the permit request can miss the join it was opened for.
+const pairOrder = sent.map((m) => m.type);
+check('subscribes to the pairing stream', hasSub('z2m/pairing/subscribe'));
+check('subscribes to the live log for diagnostics', hasSub('z2m/logs/subscribe'));
+check('opens joining for a bounded window',
+  sent.some((m) => m.type === 'z2m/permit_join' && m.time === 254));
+check('the radio is opened only AFTER the stream is being watched',
+  pairOrder.indexOf('z2m/permit_join') === pairOrder.length - 1, pairOrder.join(' -> '));
+check('the helper knows it owns this window', p._pairing.ownsPermit === true);
+
 p._summary = { ...fx.info, permit_join: true, permit_join_end: Date.now() + 90000 };
 p._render();
-check('shows the join countdown', html().includes('Joining open') && /\d+s left/.test(html()));
-check('FAB closes the network while open', html().includes('Close network'));
+check('shows a live countdown', /\d+s left/.test(html()));
+check('tells the operator what to do', html().includes('pairing mode'));
+
+console.log('=== pairing helper: somebody else\u2019s device is not ours ===');
+push('z2m/pairing/subscribe', { kind: 'event', event: fx.pairing.joined });
+check('the first join is adopted', p._pairing.target === fx.pairing.joined.ieee_address);
+push('z2m/pairing/subscribe', { kind: 'event', event: fx.pairing.other });
+check('a second pairer\u2019s device is ignored',
+  p._pairing.target === fx.pairing.joined.ieee_address);
+
+console.log('=== pairing helper: interview progress is the source of truth ===');
+push('z2m/pairing/subscribe', { kind: 'event', event: fx.pairing.started });
+check('interview progress is shown', html().includes('Interviewing'));
+const logRows = () => String(p.shadowRoot.getElementById('pairlog').innerHTML);
+push('z2m/logs/subscribe', { time: Date.now() / 1000, level: 'info', message: 'Starting interview' });
+await tick();
+check('live log lines are shown', logRows().includes('Starting interview'));
+check('a log line is never treated as completion', p._pairing.phase === 'interview_started');
+
 sent.length = 0;
-await act('permit');
-check('closing sends time 0', sent.some((m) => m.type === 'z2m/permit_join' && m.time === 0));
+push('z2m/pairing/subscribe', { kind: 'event', event: fx.pairing.successful });
+await tick();
+check('success is reported', html().includes('Paired'));
+check('the device is named exactly', html().includes(fx.pairing.successful.ieee_address)
+  && html().includes('WSDCGQ11LM'));
+// An open network is an open network: close it as soon as the device is in.
+check('the helper closes the window it opened',
+  sent.some((m) => m.type === 'z2m/permit_join' && m.time === 0));
+check('and stops claiming ownership', p._pairing.ownsPermit === false);
+
+console.log('=== pairing helper: name and area, through HA\u2019s own registry ===');
+// The retained inventory catching up is what supplies the HA device id.
+p._devices = fx.devices.concat([fx.paired_device]);
+p._render();
+check('offers a name field', html().includes('id="pairname"'));
+check('offers every HA area', Object.values(fx.registry.areas)
+  .every((a) => html().includes(a.name)));
+check('offers to open the HA device page', !!find('data-act', 'pairopen'));
+sent.length = 0;
+p.shadowRoot.getElementById('pairname').value = 'Nursery Climate';
+p.shadowRoot.getElementById('pairarea').value = 'hallway';
+await act('pairsave');
+await tick(80);
+check('renames in Zigbee2MQTT by ieee, not by name', sent.some((m) =>
+  m.type === 'z2m/device/rename' && m.from === fx.pairing.successful.ieee_address
+  && m.to === 'Nursery Climate'));
+check('sets the HA display name and area through HA\u2019s own command', sent.some((m) =>
+  m.type === 'config/device_registry/update' && m.device_id === 'dev_paired'
+  && m.name_by_user === 'Nursery Climate' && m.area_id === 'hallway'));
+check('never rewrites entity ids', !sent.some((m) => 'new_entity_id' in m));
+
+console.log('=== pairing helper: unsupported and failed are different states ===');
+p._resetPairing();
+p._pairing.active = true;
+p._adoptPairSession(fx.pairing.unsupported);
+check('unsupported is a success with a caveat', html().includes('no converter'));
+p._resetPairing();
+p._pairing.active = true;
+p._adoptPairSession(fx.pairing.failed);
+check('a failed interview says so locally', html().includes('interview failed'));
+check('a failed interview is not a page-level unknown error',
+  !html().includes('Unknown error'));
+
+console.log('=== pairing helper: leaving cleans up ===');
+p._devices = fx.devices;
+p._pairing.ownsPermit = true;
+sent.length = 0;
+go('dashboard');
+await tick();
+check('closes its own window on the way out',
+  sent.some((m) => m.type === 'z2m/permit_join' && m.time === 0));
+check('unsubscribes the pairing stream', !hasSub('z2m/pairing/subscribe'));
+check('unsubscribes the pairing log', !hasSub('z2m/logs/subscribe'));
 p._summary = fx.info;
 p._render();
+
+/* ================================================================== groups */
+console.log('=== groups: create ===');
+go('groups');
+check('Create stays reachable', !!find('data-act', 'groupadd'));
+check('lists existing groups', html().includes(esc(fx.groups[0].friendly_name)));
+check('group rows open the group', !!find('data-group', String(fx.groups[0].id)));
+sent.length = 0;
+p.shadowRoot.getElementById('gname').value = 'Kitchen downlights';
+await act('groupadd');
+await tick(40);
+check('Create -> z2m/group/add with a name', sent.some((m) =>
+  m.type === 'z2m/group/add' && m.name === 'Kitchen downlights'));
+check('navigates to the group it just made', p._view.name === 'group'
+  && String(p._view.group) === '7');
+
+console.log('=== groups: detail, rename, members ===');
+p._go({ name: 'group', group: fx.groups[0].id });
+check('shows the group id', html().includes(`${fx.groups[0].id}`));
+check('lists members by name, not just address',
+  html().includes(esc(fx.devices[0].friendly_name)));
+check('names the endpoint, because membership is per endpoint',
+  html().includes('Endpoint 1'));
+sent.length = 0;
+p.shadowRoot.getElementById('grn').value = 'Lounge lights';
+await act('grouprename');
+await tick(40);
+check('Rename -> z2m/group/rename', sent.some((m) =>
+  m.type === 'z2m/group/rename' && String(m.group) === String(fx.groups[0].id)
+  && m.to === 'Lounge lights'));
+
+// Endpoint 1 of device one is already a member, so it must not be offered again.
+// Read the rendered markup: the stub indexes elements, it does not reflow their
+// children into innerHTML, so the select's own innerHTML proves nothing here.
+const offered = Array.from(
+  /<select id="gmember">([\s\S]*?)<\/select>/.exec(html())[1].matchAll(/value="([^"]*)"/g)
+).map((m) => m[1]);
+check('an endpoint already in the group is not offered again',
+  !offered.includes('0x0000000000000001|1'), offered.join(', '));
+check('the device\u2019s other endpoint IS offered',
+  offered.includes('0x0000000000000001|2'), offered.join(', '));
+sent.length = 0;
+p.shadowRoot.getElementById('gmember').value = '0x0000000000000002|1';
+await act('memberadd');
+await tick(40);
+check('Add member -> z2m/group/members/add with an explicit endpoint', sent.some((m) =>
+  m.type === 'z2m/group/members/add' && m.device === '0x0000000000000002'
+  && m.endpoint === 1 && String(m.group) === String(fx.groups[0].id)));
+sent.length = 0;
+await act('memberremove');
+await tick(40);
+check('Remove member -> z2m/group/members/remove', sent.some((m) =>
+  m.type === 'z2m/group/members/remove' && m.device === '0x0000000000000001'
+  && m.endpoint === 1));
+
+console.log('=== groups: the retained list is authoritative ===');
+const grown = [{ ...fx.groups[0], members: fx.groups[0].members.concat(
+  [{ ieee_address: '0x0000000000000002', endpoint: 1 }]) }];
+push('z2m/groups/subscribe', { groups: grown });
+await tick();
+check('membership comes from the retained push, not the response',
+  html().includes(esc(fx.devices[1].friendly_name)));
+
+console.log('=== groups: a refusal is local and readable ===');
+p._groupError = null;
+sent.length = 0;
+failFeed = 'z2m/group/rename';
+p.shadowRoot.getElementById('grn').value = 'Duplicate name';
+await act('grouprename');
+await tick(40);
+failFeed = null;
+check('the refusal is shown', html().includes('is unavailable'));
+check('the group page still works', html().includes('Members'));
+check('the refusal never reaches the dashboard', (() => {
+  p._groupError = null;
+  go('dashboard');
+  return !html().includes('is unavailable');
+})());
+
+console.log('=== groups: delete is careful, force is explicit ===');
+p._go({ name: 'group', group: fx.groups[0].id });
+check('offers a normal delete', !!find('data-act', 'groupremove'));
+check('offers force delete separately', !!find('data-act', 'groupforce'));
+check('force delete explains what it leaves behind',
+  html().includes('stay programmed'));
+sent.length = 0;
+await act('groupremove');
+await tick(40);
+check('Delete -> z2m/group/remove without force', sent.some((m) =>
+  m.type === 'z2m/group/remove' && m.force === false));
+sent.length = 0;
+p._go({ name: 'group', group: fx.groups[0].id });
+await act('groupforce');
+await tick(40);
+check('Force -> z2m/group/remove with force', sent.some((m) =>
+  m.type === 'z2m/group/remove' && m.force === true));
+go('dashboard');
 
 console.log('=== restart_required is surfaced ===');
 p._summary = { ...fx.info, restart_required: true };
