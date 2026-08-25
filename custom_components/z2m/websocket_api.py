@@ -6,6 +6,7 @@ mirroring how the built-in zwave_js panel talks to its integration.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import voluptuous as vol
@@ -19,14 +20,19 @@ from .const import (
     BACKUP_TIMEOUT,
     DOMAIN,
     REQUEST_TIMEOUT,
+    SIGNAL_DEVICE_LIST,
+    SIGNAL_GROUPS,
     SIGNAL_LOG,
     SIGNAL_MAP,
+    SIGNAL_PAIRING,
     SIGNAL_UPDATE,
 )
 from .coordinator import Z2MError, ieee_from_identifiers
 
 # Zigbee2MQTT refused the request, or never answered it.
 ERR_Z2M = "z2m_error"
+
+_LOGGER = logging.getLogger(__package__)
 
 
 def _data(hass: HomeAssistant):
@@ -45,6 +51,10 @@ def async_setup_websocket(hass: HomeAssistant) -> None:
         ws_devices,
         ws_groups,
         ws_subscribe,
+        ws_devices_subscribe,
+        ws_groups_subscribe,
+        ws_pairing,
+        ws_pairing_subscribe,
         ws_networkmap,
         ws_networkmap_scan,
         ws_networkmap_subscribe,
@@ -53,6 +63,11 @@ def async_setup_websocket(hass: HomeAssistant) -> None:
         ws_coordinator_check,
         ws_permit_join,
         ws_rename,
+        ws_group_add,
+        ws_group_rename,
+        ws_group_remove,
+        ws_group_member_add,
+        ws_group_member_remove,
         ws_remove,
         ws_set_options,
         ws_configure,
@@ -87,6 +102,15 @@ def _guard(func):
             await func(hass, connection, msg, data)
         except Z2MError as err:
             connection.send_error(msg["id"], ERR_Z2M, str(err))
+        except Exception as err:  # noqa: BLE001
+            # A bug in one command must not blank the whole panel. Home Assistant's
+            # own decorator answers a bare "Unknown error", which is what made a
+            # three-field device identifier look like a dead integration; this says
+            # which command failed and still logs the traceback for diagnosis.
+            _LOGGER.exception("Zigbee command %s failed", msg.get("type"))
+            connection.send_error(
+                msg["id"], "z2m_internal_error", f"{type(err).__name__}: {err}"
+            )
 
     wrapper.__name__ = func.__name__
     return wrapper
@@ -140,7 +164,10 @@ def _with_update_entities(hass: HomeAssistant, devices: list[dict]) -> list[dict
                 if entity.domain == "update":
                     entity_id = entity.entity_id
                     break
-        out.append({**device, "update_entity": entity_id})
+        # `device_id` is what lets the panel hand a freshly paired device to Home
+        # Assistant's own registry: naming and area assignment are registry writes,
+        # and they need the registry's id rather than the Zigbee address.
+        out.append({**device, "update_entity": entity_id, "device_id": device_id})
     return out
 
 
@@ -168,6 +195,91 @@ async def ws_subscribe(hass, connection, msg, data) -> None:
     )
     connection.send_result(msg["id"])
     _forward()
+
+
+@websocket_api.websocket_command({vol.Required("type"): "z2m/devices/subscribe"})
+@websocket_api.async_response
+@_guard
+async def ws_devices_subscribe(hass, connection, msg, data) -> None:
+    """Push the device projection whenever the inventory or availability changes.
+
+    Separate from z2m/subscribe on purpose: the summary carries counts, so a device
+    that was renamed, joined, left or went offline changes the header and nothing
+    else. The panel's device list, group member picker and pairing view all read
+    this, which is what removes the guessed delay after every write.
+    """
+
+    @callback
+    def _forward() -> None:
+        connection.send_message(
+            websocket_api.event_message(
+                msg["id"], {"devices": _with_update_entities(hass, data.device_list())}
+            )
+        )
+
+    connection.subscriptions[msg["id"]] = async_dispatcher_connect(
+        hass, SIGNAL_DEVICE_LIST, _forward
+    )
+    connection.send_result(msg["id"])
+    _forward()
+
+
+@websocket_api.websocket_command({vol.Required("type"): "z2m/groups/subscribe"})
+@websocket_api.async_response
+@_guard
+async def ws_groups_subscribe(hass, connection, msg, data) -> None:
+    """Push the group list whenever Zigbee2MQTT republishes bridge/groups.
+
+    Membership is the authoritative answer to a member write, and it arrives after
+    the command response: Z2M sends the Zigbee command, answers, and only then
+    republishes the retained topic. Reading it from here is what makes the group UI
+    correct rather than optimistic.
+    """
+
+    @callback
+    def _forward() -> None:
+        connection.send_message(
+            websocket_api.event_message(msg["id"], {"groups": data.groups})
+        )
+
+    connection.subscriptions[msg["id"]] = async_dispatcher_connect(
+        hass, SIGNAL_GROUPS, _forward
+    )
+    connection.send_result(msg["id"])
+    _forward()
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): "z2m/pairing"})
+@websocket_api.async_response
+@_guard
+async def ws_pairing(hass, connection, msg, data) -> None:
+    connection.send_result(msg["id"], data.pairing_snapshot())
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): "z2m/pairing/subscribe"})
+@websocket_api.async_response
+@_guard
+async def ws_pairing_subscribe(hass, connection, msg, data) -> None:
+    """Join and interview progress, snapshot first.
+
+    bridge/event is NOT retained, so a browser that reloads between "joined" and
+    "interview successful" would otherwise see nothing at all for a device that is
+    mid-pairing. The snapshot is what makes the helper survive a reload; the events
+    after it are the live progress.
+    """
+
+    @callback
+    def _forward(payload: dict[str, Any]) -> None:
+        connection.send_message(websocket_api.event_message(msg["id"], payload))
+
+    connection.subscriptions[msg["id"]] = async_dispatcher_connect(
+        hass, SIGNAL_PAIRING, _forward
+    )
+    connection.send_result(msg["id"])
+    _forward(data.pairing_message())
+
 
 
 # ----------------------------------------------------------------- network map
@@ -317,26 +429,194 @@ async def ws_coordinator_check(hass, connection, msg, data) -> None:
 @websocket_api.async_response
 @_guard
 async def ws_permit_join(hass, connection, msg, data) -> None:
+    """Open or close joining, and report what Zigbee2MQTT actually did.
+
+    Awaited rather than fired and forgotten: the pairing helper puts the operator
+    in front of a countdown, and a radio that refused to open must say so then,
+    not by silently never producing a join.
+    """
     payload: dict[str, Any] = {"time": msg["time"]}
     if msg.get("device"):
         payload["device"] = msg["device"]
-    await data.async_request("permit_join", payload)
-    connection.send_result(msg["id"])
+    # A fresh window starts a fresh session list, so the helper cannot inherit the
+    # terminal state of a device that was paired an hour ago.
+    if msg["time"] > 0 and not msg.get("device"):
+        data.async_clear_pairing_sessions()
+    result = await data.async_request_mutation(
+        "permit_join", payload, REQUEST_TIMEOUT
+    )
+    connection.send_result(msg["id"], result)
 
 
 @websocket_api.require_admin
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "z2m/device/rename",
+        # Either a friendly name or an ieee address: Z2M resolves both, and the
+        # pairing helper only knows the address.
         vol.Required("from"): str,
         vol.Required("to"): str,
+        # Off by default and deliberately opt-in: Z2M deletes and republishes its
+        # discovery topics for this device, which recreates the HA entities.
+        vol.Optional("homeassistant_rename", default=False): bool,
     }
 )
 @websocket_api.async_response
 @_guard
 async def ws_rename(hass, connection, msg, data) -> None:
-    await data.async_request("device/rename", {"from": msg["from"], "to": msg["to"]})
-    connection.send_result(msg["id"])
+    result = await data.async_request_mutation(
+        "device/rename",
+        {
+            "from": msg["from"],
+            "to": msg["to"],
+            "homeassistant_rename": msg["homeassistant_rename"],
+        },
+        REQUEST_TIMEOUT,
+    )
+    connection.send_result(msg["id"], result)
+
+
+# ------------------------------------------------------------------- groups
+#
+# `id` is reserved by Home Assistant's websocket envelope, so a group is addressed
+# as `group` here and mapped onto Z2M's own `id` field at the MQTT boundary. Every
+# one of these awaits the bridge's answer: a group write can be refused (duplicate
+# name, unknown endpoint, unreachable device) and the operator has to be told.
+# Authoritative membership then arrives on z2m/groups/subscribe, because Z2M
+# republishes bridge/groups only after the Zigbee command has been sent.
+
+# Z2M accepts 1..65527; above that the group id is not addressable on the mesh.
+_GROUP_ID = vol.All(vol.Coerce(int), vol.Range(min=1, max=65527))
+# "default" is Z2M's own word for "the device's first endpoint".
+_ENDPOINT = vol.Any("default", vol.All(vol.Coerce(int), vol.Range(min=1, max=254)))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "z2m/group/add",
+        vol.Required("name"): vol.All(str, vol.Length(min=1)),
+        vol.Optional("group_id"): _GROUP_ID,
+    }
+)
+@websocket_api.async_response
+@_guard
+async def ws_group_add(hass, connection, msg, data) -> None:
+    payload: dict[str, Any] = {"friendly_name": msg["name"]}
+    if "group_id" in msg:
+        # Z2M's settings layer compares this as a string key.
+        payload["id"] = str(msg["group_id"])
+    # Answers {friendly_name, id}: the generated id is the only place the caller
+    # can learn which group it just made.
+    connection.send_result(
+        msg["id"],
+        await data.async_request_mutation("group/add", payload, REQUEST_TIMEOUT),
+    )
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "z2m/group/rename",
+        vol.Required("group"): vol.Any(str, _GROUP_ID),
+        vol.Required("to"): vol.All(str, vol.Length(min=1)),
+        vol.Optional("homeassistant_rename", default=False): bool,
+    }
+)
+@websocket_api.async_response
+@_guard
+async def ws_group_rename(hass, connection, msg, data) -> None:
+    connection.send_result(
+        msg["id"],
+        await data.async_request_mutation(
+            "group/rename",
+            {
+                "from": str(msg["group"]),
+                "to": msg["to"],
+                "homeassistant_rename": msg["homeassistant_rename"],
+            },
+            REQUEST_TIMEOUT,
+        ),
+    )
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "z2m/group/remove",
+        vol.Required("group"): vol.Any(str, _GROUP_ID),
+        # force skips the Zigbee removal commands: the local group goes away while
+        # the devices stay programmed with its address. Recovery only.
+        vol.Optional("force", default=False): bool,
+    }
+)
+@websocket_api.async_response
+@_guard
+async def ws_group_remove(hass, connection, msg, data) -> None:
+    connection.send_result(
+        msg["id"],
+        await data.async_request_mutation(
+            "group/remove",
+            {"id": str(msg["group"]), "force": msg["force"]},
+            REQUEST_TIMEOUT,
+        ),
+    )
+
+
+def _member_payload(msg: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "device": msg["device"],
+        "group": str(msg["group"]),
+        # Always explicit. Z2M defaults an omitted endpoint to the device's first
+        # one, which is the wrong endpoint on a multi-endpoint device and silently
+        # groups the wrong load.
+        "endpoint": msg["endpoint"],
+    }
+    if msg.get("skip_disable_reporting"):
+        payload["skip_disable_reporting"] = True
+    return payload
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "z2m/group/members/add",
+        vol.Required("group"): vol.Any(str, _GROUP_ID),
+        vol.Required("device"): str,
+        vol.Required("endpoint"): _ENDPOINT,
+        vol.Optional("skip_disable_reporting", default=False): bool,
+    }
+)
+@websocket_api.async_response
+@_guard
+async def ws_group_member_add(hass, connection, msg, data) -> None:
+    connection.send_result(
+        msg["id"],
+        await data.async_request_mutation(
+            "group/members/add", _member_payload(msg), REQUEST_TIMEOUT
+        ),
+    )
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "z2m/group/members/remove",
+        vol.Required("group"): vol.Any(str, _GROUP_ID),
+        vol.Required("device"): str,
+        vol.Required("endpoint"): _ENDPOINT,
+        vol.Optional("skip_disable_reporting", default=False): bool,
+    }
+)
+@websocket_api.async_response
+@_guard
+async def ws_group_member_remove(hass, connection, msg, data) -> None:
+    connection.send_result(
+        msg["id"],
+        await data.async_request_mutation(
+            "group/members/remove", _member_payload(msg), REQUEST_TIMEOUT
+        ),
+    )
 
 
 @websocket_api.require_admin

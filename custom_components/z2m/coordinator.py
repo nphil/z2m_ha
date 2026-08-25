@@ -138,6 +138,26 @@ def _extension_source() -> tuple[str, str]:
 
 
 @callback
+def _endpoint_ids(endpoints: Any) -> list[int]:
+    """Z2M's `endpoints` map, as the sorted numeric ids the panel can offer.
+
+    Z2M publishes this as an object keyed by endpoint id, and JSON object keys are
+    strings even though the group API matches on the number. Anything that is not
+    a number is dropped rather than passed through: an unparseable key would be
+    offered as a member target and then rejected by the bridge.
+    """
+    if not isinstance(endpoints, dict):
+        return []
+    ids: list[int] = []
+    for key in endpoints:
+        try:
+            ids.append(int(key))
+        except (TypeError, ValueError):
+            continue
+    return sorted(ids)
+
+
+@callback
 def ieee_from_identifiers(identifiers: Iterable[tuple[str, ...]]) -> str | None:
     """The Zigbee ieee address behind a device's MQTT identifier, if it has one.
 
@@ -734,6 +754,25 @@ class Z2MData:
         )
         return await self._async_wait(path, pending, timeout)
 
+    async def async_request_mutation(
+        self, path: str, payload: Any, timeout: float
+    ) -> dict[str, Any]:
+        """Publish a WRITE and return its own answer, never somebody else's.
+
+        async_request_response deliberately coalesces concurrent callers by path,
+        which is right for expensive reads: two tabs opening the map must not make
+        the coordinator scan twice. It is WRONG for a write, because two group
+        member additions share a path and carry different payloads -- the second
+        caller would be handed the first one's result and the second command would
+        never be sent. Serializing per path gives every mutation its own
+        transaction, its own publish and its own response.
+        """
+        lock = self._mutation_locks.get(path)
+        if lock is None:
+            lock = self._mutation_locks[path] = asyncio.Lock()
+        async with lock:
+            return await self.async_request_response(path, payload, timeout)
+
     async def _async_wait(
         self, path: str, pending: _Pending, timeout: float
     ) -> dict[str, Any]:
@@ -1309,6 +1348,10 @@ class Z2MData:
                     "ieee": ieee,
                     "name": name,
                     "type": device.get("type"),
+                    # Mains vs battery is the map's only honest way to tell a
+                    # powered device from a sleeping one. Z2M reports it per device
+                    # and the renderer must not infer it from node type.
+                    "power_source": device.get("power_source"),
                     "addr": device.get("network_address"),
                     "vendor": defn.get("vendor") or device.get("manufacturer"),
                     "model": defn.get("model") or device.get("model_id"),
@@ -1339,6 +1382,11 @@ class Z2MData:
         """
         dev_reg = dr.async_get(self.hass)
         nodes: list[dict[str, Any]] = []
+        power_sources = {
+            ieee: device.get("power_source")
+            for device in self.devices
+            if (ieee := device.get("ieee_address"))
+        }
         for raw in raw_nodes:
             ieee = raw.get("ieeeAddr")
             if not ieee:
@@ -1352,6 +1400,10 @@ class Z2MData:
                     "ieee": ieee,
                     "name": name,
                     "type": raw.get("type"),
+                    # Z2M's own map payload does not carry the power source, so it
+                    # comes from the retained inventory rather than being inferred:
+                    # the streamed and cached maps have to describe the same fleet.
+                    "power_source": power_sources.get(ieee),
                     "addr": raw.get("networkAddress"),
                     "vendor": defn.get("vendor") or raw.get("manufacturerName"),
                     "model": defn.get("model") or raw.get("modelID"),
@@ -1592,6 +1644,12 @@ class Z2MData:
                     "disabled": d.get("disabled"),
                     "interviewing": d.get("interviewing"),
                     "interview_completed": d.get("interview_completed"),
+                    "interview_state": d.get("interview_state"),
+                    # Group membership is per ENDPOINT, not per device, so the
+                    # member picker cannot work without these. Z2M keys them by
+                    # endpoint id; "default" resolves to the first endpoint, which
+                    # is not the same thing on a multi-endpoint device.
+                    "endpoints": _endpoint_ids(d.get("endpoints")),
                     "availability": self.availability.get(d.get("friendly_name", "")),
                     "network_address": d.get("network_address"),
                     "date_code": d.get("date_code"),
