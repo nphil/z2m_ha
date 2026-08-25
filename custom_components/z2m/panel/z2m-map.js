@@ -64,6 +64,32 @@ const svgEl = (name, attrs = {}) => {
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 
 /**
+ * Space kept between two node bodies. It is deliberately larger than a visual
+ * nicety: names are drawn under the dots now, so this is what keeps one device's
+ * label off the next device's.
+ */
+const NODE_CLEARANCE = 26;
+
+/** Radius assumed while seeding, before a node knows what it is. */
+const SEED_NODE_RADIUS = 9;
+
+/** Below this width the overlays reflow: HUD stacks, detail becomes a sheet. */
+const NARROW_PX = 600;
+
+/** Longest name drawn on the canvas before it is clipped with an ellipsis. */
+const LABEL_MAX_CHARS = 18;
+
+/**
+ * Visual truncation only. The untruncated name stays on the node's accessible
+ * name and in the detail panel, so nothing becomes unfindable to make room.
+ */
+const labelText = (name) =>
+  name.length > LABEL_MAX_CHARS ? `${name.slice(0, LABEL_MAX_CHARS - 1)}\u2026` : name;
+
+/** Approximate half-width of a drawn label, in world units, per character. */
+const LABEL_CHAR_HALF_WIDTH = 2.9;
+
+/**
  * A neighbour row can arrive with no LQI at all: the radio never rated that link.
  * Treating it as 0 would make the layout and the path finder behave as if it were
  * the worst link on the mesh, and treating it as 255 would make it the best. Both
@@ -358,23 +384,10 @@ class Simulation {
         b.vx += fx;
         b.vy += fy;
 
-        // Hard collision. Repulsion alone leaves nodes sitting on top of each other
-        // once springs pull a hub's children inward, which is what made the map look
-        // messy. This guarantees a minimum gap regardless of the force balance.
-        const minGap = (a._r || 8) + (b._r || 8) + 12;
-        if (d < minGap) {
-          const push = (minGap - d) / 2;
-          const ux = dx / d;
-          const uy = dy / d;
-          if (!a.dragging && !a.pinned) {
-            a.x -= ux * push;
-            a.y -= uy * push;
-          }
-          if (!b.dragging && !b.pinned) {
-            b.x += ux * push;
-            b.y += uy * push;
-          }
-        }
+        // Soft repulsion only. The hard separation used to live here, BEFORE the
+        // springs and centering were integrated, so the very next lines could push
+        // two nodes straight back on top of each other -- which is what made a
+        // dense first paint overlap and flicker. It now runs after integration.
       }
     }
 
@@ -430,8 +443,63 @@ class Simulation {
       moved += Math.abs(dx) + Math.abs(dy);
     }
 
+    this._separate();
+
     this.alpha *= 0.987;
     return moved > 0.4 || alpha > 0.05;
+  }
+
+  /**
+   * Guarantee a minimum gap, after every other force has had its say. Two passes
+   * because one pass can push a node into a third; more than two buys nothing at
+   * this fleet size and starts to look like jitter.
+   *
+   * The gap is the VISUAL radius, label included, not the circle: a map whose dots
+   * are 12px apart with their names written across each other is still unreadable.
+   */
+  _separate() {
+    const nodes = this.graph.nodes;
+    for (let pass = 0; pass < 2; pass++) {
+      for (let i = 0; i < nodes.length; i++) {
+        const a = nodes[i];
+        for (let j = i + 1; j < nodes.length; j++) {
+          const b = nodes[j];
+          let dx = b.x - a.x;
+          let dy = b.y - a.y;
+          let d = Math.sqrt(dx * dx + dy * dy);
+          if (d === 0) {
+            // Perfectly co-located, which is exactly what a streamed start
+            // produces before any link arrives. Deterministic nudge, so the same
+            // fleet always lands the same way.
+            dx = ((i % 7) - 3) * 0.7 + 0.35;
+            dy = ((j % 5) - 2) * 0.7 + 0.35;
+            d = Math.sqrt(dx * dx + dy * dy) || 1;
+          }
+          const minGap = (a._r || 8) + (b._r || 8) + NODE_CLEARANCE;
+          if (d >= minGap) continue;
+          const push = (minGap - d) / 2;
+          const ux = dx / d;
+          const uy = dy / d;
+          const aFixed = a.dragging || a.pinned;
+          const bFixed = b.dragging || b.pinned;
+          // A pinned node does not move, so the other one absorbs the whole gap
+          // rather than half of it and staying overlapped.
+          if (!aFixed) {
+            a.x -= ux * (bFixed ? push * 2 : push);
+            a.y -= uy * (bFixed ? push * 2 : push);
+          }
+          if (!bFixed) {
+            b.x += ux * (aFixed ? push * 2 : push);
+            b.y += uy * (aFixed ? push * 2 : push);
+          }
+        }
+      }
+    }
+    for (const node of nodes) {
+      const pad = (node._r || 8) + 14;
+      node.x = clamp(node.x, pad, this.width - pad);
+      node.y = clamp(node.y, pad, this.height - pad);
+    }
   }
 }
 
@@ -499,6 +567,14 @@ class Z2MNetworkMap extends HTMLElement {
   connectedCallback() {
     if (!this.shadowRoot.firstChild) this._scaffold();
     window.addEventListener('resize', this._onResize);
+    // A window resize is not the only way this element changes size: as a Lovelace
+    // card it resizes when the dashboard column does, and in the panel when the
+    // sidebar collapses. Without this the simulation keeps its old bounds and the
+    // layout is clamped to a viewport that no longer exists.
+    if (typeof ResizeObserver === 'function') {
+      this._observer = new ResizeObserver(() => this._resize());
+      this._observer.observe(this);
+    }
     this._loadLayout();
     if (this._live) this._sync({ animate: false });
     this._renderHud();
@@ -506,6 +582,10 @@ class Z2MNetworkMap extends HTMLElement {
 
   disconnectedCallback() {
     window.removeEventListener('resize', this._onResize);
+    if (this._observer) {
+      this._observer.disconnect();
+      this._observer = null;
+    }
     this._stopLoop();
     this._saveLayout();
   }
@@ -599,25 +679,36 @@ class Z2MNetworkMap extends HTMLElement {
       /* Dimmed context stays readable. Fading it away made one route obvious but
          destroyed the shape of the mesh around it, which is why you opened the map. */
       .node.dim { opacity:.3; }
-      .warn-ring { fill:none; stroke:var(--warning-color,#ff9800); stroke-width:2;
+      /* A device that failed to answer the scan: real, current, worth a ring. */
+      .warn-ring { fill:none; stroke:var(--warning-color, #ff9800); stroke-width:2;
                    stroke-dasharray:2 3; }
-      .choke-ring { fill:none; stroke:var(--error-color,#f44336); stroke-width:1.6;
-                    opacity:.8; }
-      .pin-dot { fill:var(--primary-text-color,#212121); opacity:.5; }
+      /* There is deliberately no ring for a single-path dependency. A red circle
+         around a healthy mains router read as "this device is broken", when all it
+         meant was that this SNAPSHOT recorded no second route past it. That fact is
+         still reported, in the node's own detail panel, in words. */
+      .pin-dot { fill:var(--primary-text-color, #212121); opacity:.5; }
 
-      text.label { font-size:11px; text-anchor:middle;
+      text.label { font-size:var(--ha-font-size-s, 11px); text-anchor:middle;
                    fill:var(--primary-text-color, #212121);
-                   paint-order:stroke; stroke:var(--card-background-color,#fff);
+                   paint-order:stroke; stroke:var(--card-background-color, #fff);
                    stroke-width:3px; stroke-linejoin:round;
                    pointer-events:none; user-select:none; }
-      /* 45 labels at once is unreadable, so only structural nodes are named by
-         default. An end device names itself on hover, selection, route or search. */
-      .node.enddevice text.label { display:none; }
-      .node.enddevice.hover text.label,
-      .node.enddevice.selected text.label,
-      .node.enddevice.on-route text.label,
-      .node.enddevice.match text.label { display:block; }
+      /* Every device is named, including battery end devices: the map is used to
+         find a specific device, and an unlabelled dot cannot be found. They are
+         quieter than a router's name rather than hidden, and any label that would
+         collide with another is dropped -- see _cullLabels. */
+      .node.enddevice text.label { font-size:var(--ha-font-size-xs, 10px);
+                   fill:var(--secondary-text-color, #727272); }
+      .node.crowded text.label { display:none; }
+      /* Attention always wins over decluttering. */
+      .node.hover text.label,
+      .node.selected text.label,
+      .node.on-route text.label,
+      .node.match text.label { display:block;
+                   fill:var(--primary-text-color, #212121); }
       .node.dim text.label { opacity:0; }
+      .node:focus { outline:none; }
+      .node:focus-visible .halo { opacity:1; stroke:var(--primary-color, #03a9f4); }
 
       .pulse { fill:var(--primary-color, #03a9f4); }
 
@@ -661,12 +752,19 @@ class Z2MNetworkMap extends HTMLElement {
                   margin-right:3px; vertical-align:middle; }
       .legend b { font-weight:500; color:var(--primary-text-color,#212121); }
 
-      .detail { position:absolute; right:8px; bottom:8px;
+      /* Anchored beside the selected node rather than parked in the corner: the
+         corner card meant the answer was as far as possible from the thing you
+         clicked, and on a phone it covered it. Placement is computed in
+         _positionDetail; only the fallback lives here. */
+      .detail { position:absolute; left:8px; top:8px;
                 width:min(272px, calc(100% - 16px));
-                background:var(--card-background-color,#fff);
-                border:1px solid var(--divider-color,#e0e0e0); border-radius:12px;
-                padding:10px 12px; box-shadow:var(--ha-card-box-shadow, 0 2px 6px rgba(0,0,0,.18));
-                font-size:13px; color:var(--primary-text-color,#212121);
+                background:var(--card-background-color, #fff);
+                border:1px solid var(--divider-color, #e0e0e0);
+                border-radius:var(--ha-border-radius-lg, 12px);
+                padding:10px 12px;
+                box-shadow:var(--ha-card-box-shadow, 0 2px 6px rgba(0,0,0,.18));
+                font-size:var(--ha-font-size-m, 13px);
+                color:var(--primary-text-color, #212121);
                 max-height:calc(100% - 96px); overflow:auto; }
       .detail[hidden] { display:none; }
       .detail h3 { margin:0 22px 1px 0; font-size:14px; font-weight:500; }
@@ -689,19 +787,42 @@ class Z2MNetworkMap extends HTMLElement {
       .hops { list-style:none; margin:0; padding:0; }
       .hops li { display:flex; justify-content:space-between; gap:8px; padding:2px 0;
                  border-top:1px solid var(--divider-color,#e0e0e0); }
+      /* Plain explanation, not an alarm: this is a property of the snapshot. */
+      .detail .note { color:var(--secondary-text-color, #727272);
+                      font-size:var(--ha-font-size-s, 11px); margin:5px 0 0; }
       .hops .v.b1 { color:var(--error-color,#f44336); font-weight:500; }
       .hops .v.b2 { color:#ef6c00; }
       .hops .v.b3 { color:var(--warning-color,#ff9800); }
       .detail a { color:var(--primary-color,#03a9f4); text-decoration:none;
                   cursor:pointer; }
-      .detail .close { position:absolute; top:8px; right:10px; cursor:pointer;
-                       opacity:.6; }
+      .detail button.close { all:unset; position:absolute; top:4px; right:6px;
+                       display:grid; place-items:center; width:28px; height:28px;
+                       border-radius:var(--ha-border-radius-md, 8px); cursor:pointer;
+                       color:var(--secondary-text-color, #727272); }
+      .detail button.close:hover { background:var(--divider-color, #e0e0e0); }
+      .detail button.close:focus-visible { outline:2px solid var(--primary-color, #03a9f4); }
       .warnline { color:var(--error-color,#f44336); font-size:11px; margin:5px 0 0; }
 
       .empty { position:absolute; inset:0; display:grid; place-items:center;
                text-align:center; padding:24px;
                color:var(--secondary-text-color,#727272); }
       .empty[hidden] { display:none; }
+
+      /* Phone layout. The HUD stacks instead of two clusters colliding at the top,
+         and the node detail becomes a bottom sheet that can be scrolled with a
+         thumb without dragging the canvas underneath it. */
+      @media (max-width:${NARROW_PX}px) {
+        .hud.tl { right:8px; flex-wrap:wrap; }
+        .hud.tr { top:auto; bottom:8px; right:8px; }
+        input.search { width:100%; min-width:96px; }
+        button.tool { width:40px; height:40px; }
+        .legend { display:none; }
+        .detail { left:8px; right:8px; top:auto; bottom:0;
+                  width:auto; max-height:52%;
+                  border-bottom-left-radius:0; border-bottom-right-radius:0;
+                  padding-bottom:calc(10px + var(--safe-area-inset-bottom, 0px));
+                  touch-action:pan-y; }
+      }
     `;
 
     const stage = document.createElement('div');
@@ -872,25 +993,30 @@ class Z2MNetworkMap extends HTMLElement {
       if (!els) {
         const g = svgEl('g', { class: 'node' });
         const halo = svgEl('circle', { class: 'halo' });
-        const choke = svgEl('circle', { class: 'choke-ring' });
+        // No dependency ring: it read as a fault on healthy hardware.
         const warn = svgEl('circle', { class: 'warn-ring' });
         const body = svgEl('circle', { class: 'body' });
         const pin = svgEl('circle', { class: 'pin-dot', r: 1.8 });
         const label = svgEl('text', { class: 'label' });
-        g.append(halo, choke, warn, body, pin, label);
+        g.append(halo, warn, body, pin, label);
         g.dataset.ieee = node.ieee;
-        els = { g, body, halo, warn, choke, pin, label, appear: wantAnimate ? now : 0 };
+        // Reachable and operable from the keyboard, not just the mouse.
+        g.setAttribute('role', 'button');
+        g.setAttribute('tabindex', '0');
+        els = { g, body, halo, warn, pin, label, appear: wantAnimate ? now : 0 };
         this._nodeEls.set(node.ieee, els);
         this._gNodes.append(g);
       }
       els.node = node;
       els.halo.setAttribute('r', node._r + 5);
-      els.choke.setAttribute('r', node._r + 8);
       els.warn.setAttribute('r', node._r + 3);
       els.body.setAttribute('r', node._r);
       els.pin.setAttribute('cy', -node._r - 6);
       els.label.setAttribute('y', node._r + 13);
-      els.label.textContent = node.name || node.ieee;
+      // Truncated for the canvas only. The full name stays on the group's
+      // accessible name, so search, hover and assistive tech all still see it.
+      els.label.textContent = labelText(node.name || node.ieee);
+      els.g.setAttribute('aria-label', node.name || node.ieee);
       els.pin.style.display = node.pinned ? '' : 'none';
 
       const kind =
@@ -903,7 +1029,6 @@ class Z2MNetworkMap extends HTMLElement {
         'class',
         `node ${kind}${node.availability === 'offline' ? ' offline' : ''}`
       );
-      els.choke.style.display = this._diagnostics && this._choke.has(node.ieee) ? '' : 'none';
       els.warn.style.display = this._diagnostics && node.failed?.length ? '' : 'none';
     }
     for (const [ieee, els] of [...this._nodeEls]) {
@@ -924,24 +1049,53 @@ class Z2MNetworkMap extends HTMLElement {
     this._startLoop();
   }
 
-  /** Place new nodes on their hop ring; keep known positions stable. */
+  /**
+   * Place new nodes on their hop ring; keep known positions stable.
+   *
+   * The depth fallback matters more than it looks. A streamed scan creates every
+   * device before a single link exists, so every one of them has no depth and used
+   * to land on ONE ring: 40 devices on a circle whose circumference cannot hold
+   * them, overlapping until the springs sorted it out. Nodes with no depth are
+   * therefore spread across as many concentric rings as they need, each ring
+   * holding only what fits at the clearance the renderer actually draws.
+   */
   _seedPositions() {
     const byDepth = new Map();
     for (const node of this._graph.nodes) {
-      const d = this._graph.depth.get(node.ieee) ?? 3;
+      // `null` rather than 3: "not known yet" and "three hops out" are different
+      // things, and only the first one needs spreading.
+      const d = this._graph.depth.get(node.ieee) ?? null;
       if (!byDepth.has(d)) byDepth.set(d, []);
       byDepth.get(d).push(node);
     }
-    const maxDepth = Math.max(1, ...byDepth.keys());
+    const depths = [...byDepth.keys()].filter((d) => d !== null);
+    const maxDepth = Math.max(1, ...depths);
     const span = Math.min(this._sim.width, this._sim.height) / 2 - 70;
 
     for (const [depth, group] of byDepth) {
+      const rings = depth === null ? this._ringsFor(group.length, span) : null;
+      let placed = 0;
+      let ring = 0;
       group.forEach((node, i) => {
         const saved = this._pos.get(node.ieee);
         if (saved && Number.isFinite(saved.x)) {
           node.x = saved.x;
           node.y = saved.y;
           node.pinned = !!saved.pinned;
+        } else if (rings) {
+          while (ring < rings.length - 1 && placed >= rings[ring].capacity) {
+            placed = 0;
+            ring += 1;
+          }
+          const { radius, capacity } = rings[ring];
+          // Offset every other ring by half a slot so radial spokes do not line
+          // up and read as one thick line.
+          const angle =
+            ((placed + (ring % 2) * 0.5) / Math.max(capacity, 1)) * Math.PI * 2 + ring * 0.3;
+          node.x = this._sim.cx + Math.cos(angle) * radius;
+          node.y = this._sim.cy + Math.sin(angle) * radius;
+          node.pinned = false;
+          placed += 1;
         } else {
           const radius = depth === 0 ? 0 : (span * Math.max(depth, 1)) / maxDepth;
           const angle = (i / Math.max(group.length, 1)) * Math.PI * 2 + depth * 0.7;
@@ -954,6 +1108,29 @@ class Z2MNetworkMap extends HTMLElement {
         node.dragging = false;
       });
     }
+  }
+
+  /**
+   * Concentric rings that can actually hold `count` nodes at drawing clearance.
+   * Capacity is geometry, not a guess: a ring of radius r fits its circumference
+   * divided by the space one node needs.
+   */
+  _ringsFor(count, span) {
+    const slot = 2 * (SEED_NODE_RADIUS + NODE_CLEARANCE);
+    const rings = [];
+    let remaining = count;
+    let index = 1;
+    while (remaining > 0) {
+      // Rings step outward by one slot, and stop growing past the canvas: beyond
+      // that the fit transform shrinks everything anyway.
+      const radius = Math.min(index * slot, Math.max(span, slot));
+      const capacity = Math.max(1, Math.floor((2 * Math.PI * radius) / slot));
+      rings.push({ radius, capacity });
+      remaining -= capacity;
+      index += 1;
+      if (index > 64) break; // no fleet is this big; never spin
+    }
+    return rings;
   }
 
   _loadLayout() {
@@ -1008,7 +1185,9 @@ class Z2MNetworkMap extends HTMLElement {
     ];
     if (this._diagnostics) {
       if (weak) bits.push(`<span><b>${weak}</b> weak</span>`);
-      if (chokes) bits.push(`<span><b>${chokes}</b> choke</span>`);
+      // "choke" was jargon attached to a red ring nobody could interpret. The
+      // count stays, in the map's own words, without marking any device as faulty.
+      if (chokes) bits.push(`<span><b>${chokes}</b> single-path</span>`);
       if (asym) bits.push(`<span><b>${asym}</b> asymmetric</span>`);
       if (unknown) bits.push(`<span><b>${unknown}</b> unmeasured</span>`);
       if (failed) bits.push(`<span><b>${failed}</b> no reply</span>`);
@@ -1077,6 +1256,54 @@ class Z2MNetworkMap extends HTMLElement {
       const isRoute = routeLinks.has(key);
       entry.el.classList.toggle('route', isRoute);
       entry.el.classList.toggle('dim', narrowed && !isRoute);
+    }
+  }
+
+  /**
+   * Hide only the labels that would actually collide with one already drawn.
+   *
+   * Every device is named by default, which on a dense mesh means some names would
+   * overlap. The old answer was to hide EVERY end device's name, which made the
+   * common task -- find this specific sensor -- impossible. This hides a name only
+   * when its own box overlaps a box already kept, in a fixed priority order, so the
+   * result is stable rather than flickering between frames.
+   *
+   * Cheap and deliberately not per-frame: it runs when the layout settles, on
+   * selection, search, zoom and resize.
+   */
+  _cullLabels() {
+    if (!this._graph) return;
+    const scale = this._view.k || 1;
+    // Priority: the coordinator, then routers, then anything the operator is
+    // currently interested in, then the rest by a stable key.
+    const priority = (node) => {
+      if (node.ieee === this._selected || node.ieee === this._hovered) return 0;
+      if (this._matches?.has(node.ieee)) return 1;
+      if (node.ieee === this._graph.coordinator) return 2;
+      return node.type === 'Router' ? 3 : 4;
+    };
+    const ordered = [...this._graph.nodes].sort(
+      (a, b) => priority(a) - priority(b) || (a.ieee < b.ieee ? -1 : 1)
+    );
+
+    const kept = [];
+    for (const node of ordered) {
+      const els = this._nodeEls.get(node.ieee);
+      if (!els) continue;
+      const text = els.label.textContent || '';
+      // World-space box of the drawn label, converted to screen space so the
+      // decision matches what the operator can actually read at this zoom.
+      const halfW = (text.length * LABEL_CHAR_HALF_WIDTH + 2) * scale;
+      const halfH = 7 * scale;
+      const cx = node.x * scale;
+      const cy = (node.y + node._r + 13) * scale;
+      const box = { x1: cx - halfW, x2: cx + halfW, y1: cy - halfH, y2: cy + halfH };
+      const always = priority(node) <= 1;
+      const clash =
+        !always &&
+        kept.some((k) => box.x1 < k.x2 && box.x2 > k.x1 && box.y1 < k.y2 && box.y2 > k.y1);
+      els.g.classList.toggle('crowded', clash);
+      if (!clash) kept.push(box);
     }
   }
 
@@ -1230,6 +1457,34 @@ class Z2MNetworkMap extends HTMLElement {
       if (ieee) this._nodeEls.get(ieee)?.g.classList.add('hover');
       this._applyEmphasis();
     });
+
+    // Keyboard parity with the pointer. The nodes are focusable, so Enter and
+    // Space select, and Escape clears -- the same gesture as clicking the canvas.
+    stage.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape') {
+        if (this._selected) {
+          this._select(null);
+          ev.preventDefault();
+        }
+        return;
+      }
+      if (ev.key !== 'Enter' && ev.key !== ' ') return;
+      const hit = ev.target.closest?.('.node');
+      if (!hit) return;
+      ev.preventDefault();
+      this._select(hit.dataset.ieee === this._selected ? null : hit.dataset.ieee);
+    });
+
+    stage.addEventListener('focusin', (ev) => {
+      const hit = ev.target.closest?.('.node');
+      if (!hit) return;
+      // Focus reveals the name, the same way hovering does.
+      if (this._hovered) this._nodeEls.get(this._hovered)?.g.classList.remove('hover');
+      this._hovered = hit.dataset.ieee;
+      this._nodeEls.get(this._hovered)?.g.classList.add('hover');
+      this._applyEmphasis();
+      this._cullLabels();
+    });
   }
 
   _action(act, button) {
@@ -1287,6 +1542,10 @@ class Z2MNetworkMap extends HTMLElement {
       'transform',
       `translate(${this._view.x} ${this._view.y}) scale(${this._view.k})`
     );
+    // Both overlays are positioned in screen space, so a pan or a zoom moves what
+    // they were measured against.
+    this._cullLabels();
+    this._positionDetail();
   }
 
   _resize() {
@@ -1294,6 +1553,7 @@ class Z2MNetworkMap extends HTMLElement {
     const rect = this._stage.getBoundingClientRect();
     this._sim.resize(rect.width, rect.height);
     this._sim.reheat(0.3);
+    this._positionDetail();
     this._startLoop();
   }
 
@@ -1378,14 +1638,18 @@ class Z2MNetworkMap extends HTMLElement {
     const stranded = this._choke?.get(node.ieee);
     this._detail.hidden = false;
     this._detail.innerHTML =
-      `<span class="close" title="Clear">&times;</span>` +
+      `<button class="close" type="button" aria-label="Clear selection">&times;</button>` +
       `<h3>${escapeHtml(node.name || node.ieee)}</h3>` +
       `<div class="sub">${escapeHtml(node.ieee)}</div>` +
       chip +
       `<dl>${rows.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join('')}</dl>` +
       (hopList ? `<ul class="hops">${hopList}</ul>` : '') +
+      // Stated as what it is -- a property of THIS snapshot -- rather than drawn as
+      // a red ring that made a working router look broken.
       (stranded
-        ? `<p class="warnline">Choke point: ${stranded} device${stranded === 1 ? '' : 's'} depend on it.</p>`
+        ? `<p class="note">Only route: in this scan, ${stranded} device${
+            stranded === 1 ? '' : 's'
+          } reach the coordinator only through this one.</p>`
         : '') +
       (node.failed?.length
         ? `<p class="warnline">No scan reply: ${escapeHtml(node.failed.join(', '))}</p>`
@@ -1393,6 +1657,46 @@ class Z2MNetworkMap extends HTMLElement {
       (node.device_id && this._hass
         ? `<p><a data-device="${escapeHtml(node.device_id)}">Open in Home Assistant</a></p>`
         : '');
+    this._positionDetail();
+  }
+
+  /**
+   * Put the detail card next to the device it describes.
+   *
+   * It used to be pinned to the bottom-right corner, which put the answer as far
+   * as possible from the node that was clicked and, on a narrow screen, on top of
+   * it. Here it is placed beside the node, flipped to whichever side has room and
+   * clamped inside the canvas. On a phone the stylesheet turns it into a bottom
+   * sheet instead, so this leaves the position alone below that width.
+   */
+  _positionDetail() {
+    if (!this._detail || this._detail.hidden || !this._selected) return;
+    const stage = this._stage.getBoundingClientRect();
+    if (!stage.width || stage.width <= NARROW_PX) {
+      // Bottom sheet: CSS owns it.
+      this._detail.style.left = '';
+      this._detail.style.top = '';
+      return;
+    }
+    const node = this._graph.byIeee.get(this._selected);
+    if (!node) return;
+
+    const box = this._detail.getBoundingClientRect();
+    const w = box.width || 272;
+    const h = box.height || 180;
+    const gap = 18;
+    // Node position in stage space, through the same transform the SVG uses.
+    const k = this._view.k || 1;
+    const nx = node.x * k + this._view.x;
+    const ny = node.y * k + this._view.y;
+
+    // Prefer the right of the node; flip left when that would overflow.
+    let left = nx + gap + (node._r || 8) * k;
+    if (left + w > stage.width - 8) left = nx - gap - (node._r || 8) * k - w;
+    let top = ny - h / 2;
+
+    this._detail.style.left = `${clamp(left, 8, Math.max(8, stage.width - w - 8))}px`;
+    this._detail.style.top = `${clamp(top, 8, Math.max(8, stage.height - h - 8))}px`;
   }
 
   /* ------------------------------------------------------------------- loop */
@@ -1465,6 +1769,12 @@ class Z2MNetworkMap extends HTMLElement {
     }
 
     if (this._pulses.length) busy = this._animatePulses(now) || busy;
+    // Once. Recomputing which labels collide on every animation frame would both
+    // cost more than the physics and make names blink while the layout moves.
+    if (!busy) {
+      this._cullLabels();
+      this._positionDetail();
+    }
     return busy;
   }
 

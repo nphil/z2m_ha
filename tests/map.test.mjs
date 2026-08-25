@@ -23,9 +23,10 @@ globalThis.HTMLElement = class {};
 globalThis.customElements = { get: () => undefined, define: () => {} };
 globalThis.window = { customCards: [] };
 
-const { Graph, hopCost, restLength, lqiBand } = new Function(
-  `${src}\nreturn { Graph, hopCost, restLength, lqiBand };`
-)();
+const { Graph, Simulation, hopCost, restLength, lqiBand, labelText, NODE_CLEARANCE } =
+  new Function(
+    `${src}\nreturn { Graph, Simulation, hopCost, restLength, lqiBand, labelText, NODE_CLEARANCE };`
+  )();
 
 let failures = 0;
 const check = (name, cond, extra = '') => {
@@ -292,6 +293,118 @@ const link = (source, target, lqi, relationship, extra = {}) => ({
     links: [],
   });
   check('an unconnected device is not a choke point', orphan.chokePoints().length === 0);
+}
+
+/* --------------------------------------------------- dense streaming layout */
+//
+// A streamed scan creates every device BEFORE any link exists. That used to put
+// the whole fleet on one ring at fallback depth, so a dense mesh appeared with
+// devices and names drawn on top of each other. The separation pass now runs after
+// the forces are integrated, so this is checkable rather than a matter of taste.
+{
+  const nodes = [node(COORD, 'Coordinator')];
+  for (let i = 0; i < 44; i++) {
+    nodes.push(node(`0x00dense${String(i).padStart(2, '0')}`, i % 3 === 0 ? 'Router' : 'EndDevice'));
+  }
+  const graph = new Graph({ coordinator: COORD, nodes, links: [] });
+  // Radii, as the renderer assigns them.
+  for (const n of graph.nodes) {
+    n._r = n.ieee === COORD ? 13 : n.type === 'Router' ? 9 : 6.5;
+    n.x = 0;
+    n.y = 0;
+    n.vx = 0;
+    n.vy = 0;
+  }
+
+  const worstGap = () => {
+    let worst = Infinity;
+    for (let i = 0; i < graph.nodes.length; i++) {
+      for (let j = i + 1; j < graph.nodes.length; j++) {
+        const a = graph.nodes[i];
+        const b = graph.nodes[j];
+        const need = a._r + b._r + NODE_CLEARANCE;
+        worst = Math.min(worst, Math.hypot(b.x - a.x, b.y - a.y) - need);
+      }
+    }
+    return worst;
+  };
+
+  // Every device starting at the same point is the pathological case, and it is
+  // exactly what a `start` event with no links produces.
+  check('co-located nodes start overlapped', worstGap() < 0);
+
+  const sim = new Simulation(graph, 1200, 800);
+  for (let i = 0; i < 240; i++) sim.step();
+  const gap = worstGap();
+  check('a dense fleet ends up with drawable separation', gap >= -0.5, `worst gap ${gap.toFixed(1)}`);
+  check('nodes stay inside the canvas', graph.nodes.every((n) =>
+    n.x >= 0 && n.x <= 1200 && n.y >= 0 && n.y <= 800));
+
+  // Determinism: the same fleet must not land somewhere different each visit.
+  const again = new Graph({ coordinator: COORD, nodes, links: [] });
+  for (const n of again.nodes) {
+    n._r = n.ieee === COORD ? 13 : n.type === 'Router' ? 9 : 6.5;
+    n.x = 0;
+    n.y = 0;
+    n.vx = 0;
+    n.vy = 0;
+  }
+  const sim2 = new Simulation(again, 1200, 800);
+  for (let i = 0; i < 240; i++) sim2.step();
+  check('the same fleet settles the same way', again.nodes.every((n, i) =>
+    Math.abs(n.x - graph.nodes[i].x) < 0.001 && Math.abs(n.y - graph.nodes[i].y) < 0.001));
+
+  // A pinned node is the operator's decision and must not be shoved aside.
+  const pinnedGraph = new Graph({
+    coordinator: COORD,
+    nodes: [node(COORD, 'Coordinator'), node('0x00pinned', 'Router')],
+    links: [],
+  });
+  for (const n of pinnedGraph.nodes) {
+    n._r = 9;
+    n.x = 400;
+    n.y = 300;
+    n.vx = 0;
+    n.vy = 0;
+  }
+  const held = pinnedGraph.byIeee.get('0x00pinned');
+  held.pinned = true;
+  const sim3 = new Simulation(pinnedGraph, 900, 600);
+  for (let i = 0; i < 60; i++) sim3.step();
+  check('a pinned node keeps its position', held.x === 400 && held.y === 300);
+  const other = pinnedGraph.byIeee.get(COORD);
+  check('the unpinned node absorbs the whole gap',
+    Math.hypot(other.x - held.x, other.y - held.y) >= 9 + 9 + NODE_CLEARANCE - 0.5);
+}
+
+/* ------------------------------------------------------- label and semantics */
+{
+  check('a long name is truncated for the canvas',
+    labelText('Master Bedroom Ceiling Fan Light').length <= 18);
+  check('truncation is marked, not silent',
+    labelText('Master Bedroom Ceiling Fan Light').endsWith('\u2026'));
+  check('a short name is left alone', labelText('Porch Sensor') === 'Porch Sensor');
+
+  // Names are shown for EVERY device now. Hiding them is a per-label collision
+  // decision made at runtime, never a rule about the device's type.
+  check('end devices are not hidden by type', !/\.node\.enddevice text\.label \{[^}]*display:none/
+    .test(src));
+  check('crowding is what hides a label', src.includes('.node.crowded text.label { display:none; }'));
+
+  // The red ring around powered routers is gone: it marked a snapshot property as
+  // if it were a device fault.
+  check('no dependency ring is drawn', !src.includes('choke-ring'));
+  check('the dependency fact survives as words', src.includes('Only route: in this scan'));
+  check('a scan failure still gets its own ring', src.includes('.warn-ring'));
+
+  // The detail card is placed against the node, and closable from the keyboard.
+  check('the detail card is positioned, not parked', src.includes('_positionDetail'));
+  check('the close affordance is a real button',
+    src.includes('<button class="close" type="button" aria-label="Clear selection">'));
+  check('nodes are keyboard reachable', src.includes("g.setAttribute('tabindex', '0')"));
+  check('Escape clears the selection', src.includes("ev.key === 'Escape'"));
+  check('the element observes its own size', src.includes('ResizeObserver'));
+  check('there is a phone layout', src.includes('@media (max-width:'));
 }
 
 console.log(failures ? `\n${failures} CHECK(S) FAILED` : '\nALL CHECKS PASSED');
