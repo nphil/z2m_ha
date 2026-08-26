@@ -378,6 +378,8 @@ let failFeed = null;
 // against real response shapes rather than bare acks.
 let groupAddId = 7;
 
+// Service calls made by the device page's live controls.
+const called = [];
 const hass = {
   // The panel reads firmware from HA's own `update` entities and counts the label
   // rows from HA's own registry collections, so the stub carries all three just like
@@ -388,6 +390,12 @@ const hass = {
   // Area assignment after pairing is a Home Assistant registry write, so the areas
   // collection is part of the contract.
   areas: fx.registry.areas,
+  // Device-page controls call HA services, exactly like tapping the entity in HA.
+  // The recorder is what the control tests assert against.
+  callService: (domain, service, data) => {
+    called.push({ domain, service, data });
+    return Promise.resolve();
+  },
   connection: {
     sendMessagePromise: (msg) => {
       // Home Assistant assigns the websocket envelope `id` itself and overwrites
@@ -451,6 +459,13 @@ const hass = {
             to_endpoint: msg.to_endpoint,
             clusters: (msg.clusters || []).filter((c) => c !== 'genScenes'),
             failed: (msg.clusters || []).filter((c) => c === 'genScenes'),
+          });
+        case 'z2m/device/read_values':
+          return Promise.resolve({
+            requested: ['state', 'brightness'],
+            not_readable: ['linkquality'],
+            sleeping: (fx.devices.find((d) => d.ieee_address === msg.device) || {})
+              .power_source === 'Battery',
           });
         case 'config/device_registry/update':
           return Promise.resolve({ id: msg.device_id });
@@ -563,36 +578,28 @@ check('shows offline count', html().includes(`(${fx.info.offline_count} offline)
 check('shows Z2M version', html().includes(`Zigbee2MQTT ${fx.info.version}`));
 check('shows coordinator version', html().includes(fx.info.coordinator.meta.revision));
 check('shows permit-join state', html().includes('Joining closed'));
-// The FAB is gone deliberately. It was an ha-button positioned like a floating
-// action button, it floated over the content, and it toggled the radio directly --
-// so "Add device" opened the network with nothing on screen to watch it.
-check('no floating action button anywhere', !html().includes('slot="fab"')
-  && !html().includes('fabwrap'));
-check('Add device sits beside Show map', (() => {
-  const header = /My network([\s\S]*?)<\/div>\s*<div class="card-content">/.exec(html());
-  return !!header && header[1].includes('Show map') && header[1].includes('Add device');
+// Add device is back as a real FAB: fixed, labelled, and it opens the pairing
+// helper rather than toggling the radio. It is a plain button because ha-fab is
+// not registered in the bundle this panel loads into.
+check('the FAB exists and is the pairing entry', (() => {
+  const fab = find('data-act', 'pair');
+  return !!fab && String(fab.attrs.class || '').includes('fab');
 })());
-check('Add device opens the pairing helper, not the radio', !!find('data-act', 'pair'));
+check('the header carries only Show map', (() => {
+  const header = /My network([\s\S]*?)<\/div>\s*<div class="card-content">/.exec(html());
+  return !!header && header[1].includes('Show map') && !header[1].includes('Add device');
+})());
 
-console.log('=== my network card delegates into HA tables ===');
-const devHref = `/config/devices/dashboard?historyBack=1&label=${fx.info.label_id}`;
-const entHref = `/config/entities/dashboard?historyBack=1&label=${fx.info.label_id}`;
-const hrefs = p.shadowRoot
-  .querySelectorAll('[href]')
-  .map((e) => e.attrs.href);
+console.log('=== my network card is the panel\u2019s own, not HA table links ===');
 check('has a My network card', html().includes('My network'));
 check('has Show map button', html().includes('Show map'));
-check('devices row links HA device table with label', hrefs.includes(devHref), hrefs.join(' | '));
-check('entities row links HA entity table with label', hrefs.includes(entHref), hrefs.join(' | '));
-check('link rows are HA link rows', html().includes('type="link"'));
-const labelledDevices = Object.values(fx.registry.devices).filter((d) =>
-  d.labels.includes(fx.info.label_id)).length;
-const labelledEntities = Object.values(fx.registry.entities).filter((e) =>
-  e.labels.includes(fx.info.label_id)).length;
-check(`device count matches the labelled registry (${labelledDevices})`,
-  html().includes(`${labelledDevices} devices`));
-check(`entity count matches the labelled registry (${labelledEntities})`,
-  html().includes(`${labelledEntities} entities`));
+// The devices row goes to the panel's own list -- the HA device table is one filter
+// away for whoever wants it -- and the entities row is gone with it.
+check('devices row opens the panel list', !!find('data-go', 'devices'));
+check('no HA device-table link remains', !html().includes('/config/devices/dashboard'));
+check('no HA entity-table link remains', !html().includes('/config/entities/dashboard'));
+check('device count comes from the mesh summary',
+  html().includes(`${fx.info.device_count} devices`));
 check('groups row present', html().includes(`${fx.info.group_count} group`));
 
 console.log('=== every top-level row renders ===');
@@ -700,7 +707,7 @@ check('hass-subpage present: HA chrome is used again', html().includes('<hass-su
 // what broke the layout on a phone: a hand-rolled control in HA's row slot took the
 // whole row and collapsed its own label. Cold-load safety comes from waiting for the
 // component, which this page already does, not from avoiding it.
-check('never depends on ha-fab', !src.includes('ha-fab'));
+check('never renders an ha-fab element', !src.includes('<ha-fab'));
 check('device options are rendered by ha-form', src.includes('<ha-form data-form='));
 check('label-and-control rows use ha-settings-row', src.includes('<ha-settings-row'));
 check('no view renders a bare control except the search fallback', (() => {
@@ -1881,6 +1888,101 @@ check('an incomplete form is refused locally, not by the radio',
   !sent.some((m) => m.type === 'z2m/device/bind')
     && html().includes('Choose a target and at least one cluster'));
 p._go({ name: 'device', ieee: '0x0000000000000001' });
+
+/* ============================================== device page: live and organized */
+console.log('=== device page: controls and sensors come first ===');
+p._go({ name: 'device', ieee: '0x0000000000000001' });
+await tick();
+check('the page is a responsive grid', html().includes('class="devgrid"'));
+check('controls card renders for a controllable device', html().includes('>Controls<'));
+check('the light is a native tile control', html().includes('data-ctltoggle="light.hallway_dimmer"'));
+check('a dimmable light gets a brightness slider',
+  html().includes('data-ctlbright="light.hallway_dimmer"'));
+check('controls come before the identity details', (() => {
+  const h = html();
+  return h.indexOf('>Controls<') !== -1 && h.indexOf('>Controls<') < h.indexOf('Device details');
+})());
+check('identity is folded into an expansion panel',
+  html().includes('<ha-expansion-panel header="Device details">'));
+check('the chips summarize what the table used to shout',
+  html().includes('>Online<') && html().includes('>Router<'));
+check('a hidden entity stays hidden here too',
+  !html().includes('power_on_behavior'));
+check('the diagnostic linkquality is shown, subdued',
+  html().includes('data-sens="sensor.hallway_dimmer_linkquality"')
+    && /class="sens diag"/.test(html()));
+
+console.log('=== device page: controls call HA services ===');
+called.length = 0;
+const toggle = p.shadowRoot.querySelectorAll('[data-ctltoggle]')[0];
+check('the toggle reflects the live state', toggle && toggle.checked === true);
+toggle.checked = false;
+toggle.emit('change');
+check('flipping it calls the entity\u2019s own service',
+  called.length === 1 && called[0].domain === 'light' && called[0].service === 'turn_off'
+    && called[0].data.entity_id === 'light.hallway_dimmer');
+const slider = p.shadowRoot.querySelectorAll('[data-ctlbright]')[0];
+check('the slider reflects live brightness (128/255 -> 50%)',
+  slider && Number(slider.value) === 50);
+called.length = 0;
+slider.emit('value-changed', { value: 75 });
+check('sliding writes brightness_pct through light.turn_on',
+  called.length === 1 && called[0].service === 'turn_on'
+    && called[0].data.brightness_pct === 75);
+
+console.log('=== device page: hass pushes patch in place ===');
+p.hass = { ...hass, states: { ...hass.states,
+  'light.hallway_dimmer': { ...hass.states['light.hallway_dimmer'], state: 'off' } } };
+await tick();
+check('a state change flips the toggle without a render',
+  p.shadowRoot.querySelectorAll('[data-ctltoggle]')[0].checked === false);
+
+console.log('=== device page: sensors read like readings ===');
+p._go({ name: 'device', ieee: '0x0000000000000002' });
+await tick();
+check('no controls card for a sensor-only device', !html().includes('>Controls<'));
+check('sensors card renders', html().includes('>Sensors<'));
+check('display precision is honored (21.4333 -> 21.4)', html().includes('>21.4 <span>'));
+check('binary sensors say what they mean, not on/off',
+  html().includes('>Clear<') || html().includes('>Detected<'));
+check('battery is a chip up top too', html().includes('Battery 100%'));
+check('every reading names its freshness', /class="sens-t">[^<]/.test(html()));
+p._go({ name: 'dashboard' });
+await tick();
+
+console.log('=== device page: values are read from the device, not per field ===');
+sent.length = 0;
+delete p._readValues;
+p._go({ name: 'device', ieee: '0x0000000000000001' });
+await tick();
+check('opening a powered device asks it to report everything readable',
+  await soon(() => sent.some((m) => m.type === 'z2m/device/read_values'
+    && m.device === '0x0000000000000001')));
+p._go({ name: 'dashboard' });
+await tick();
+sent.length = 0;
+p._go({ name: 'device', ieee: '0x0000000000000001' });
+await tick();
+check('but only once per device, not on every visit',
+  !sent.some((m) => m.type === 'z2m/device/read_values'));
+check('a Refresh control is offered for the manual case', !!find('data-act', 'readvalues'));
+sent.length = 0;
+await act('readvalues');
+await until('the manual read to be sent',
+  () => sent.some((m) => m.type === 'z2m/device/read_values'));
+check('and it confirms in plain words',
+  await soon(() => html().includes('report its current values')));
+p._go({ name: 'device', ieee: '0x0000000000000002' });
+await tick();
+sent.length = 0;
+p._go({ name: 'dashboard' });
+await tick();
+p._go({ name: 'device', ieee: '0x0000000000000002' });
+await tick();
+check('a battery device is never read automatically',
+  !sent.some((m) => m.type === 'z2m/device/read_values'));
+p._go({ name: 'dashboard' });
+await tick();
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) =>

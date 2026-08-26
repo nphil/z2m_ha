@@ -208,6 +208,70 @@
         "in_progress": false,
         "update_percentage": null
       }
+    },
+    "light.hallway_dimmer": {
+      "entity_id": "light.hallway_dimmer",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Hallway Dimmer",
+        "supported_color_modes": [
+          "brightness"
+        ],
+        "brightness": 128
+      },
+      "last_changed": "2026-08-25T23:57:35+00:00",
+      "last_updated": "2026-08-25T23:57:35+00:00"
+    },
+    "sensor.hallway_dimmer_linkquality": {
+      "entity_id": "sensor.hallway_dimmer_linkquality",
+      "state": "84",
+      "attributes": {
+        "friendly_name": "Hallway Dimmer Linkquality",
+        "unit_of_measurement": "lqi"
+      },
+      "last_changed": "2026-08-25T23:59:35+00:00",
+      "last_updated": "2026-08-25T23:59:35+00:00"
+    },
+    "select.hallway_dimmer_power_on_behavior": {
+      "entity_id": "select.hallway_dimmer_power_on_behavior",
+      "state": "previous",
+      "attributes": {
+        "friendly_name": "Hallway Dimmer Power-on behavior"
+      },
+      "last_changed": "2026-08-25T15:40:35+00:00",
+      "last_updated": "2026-08-25T15:40:35+00:00"
+    },
+    "binary_sensor.porch_leak": {
+      "entity_id": "binary_sensor.porch_leak",
+      "state": "off",
+      "attributes": {
+        "friendly_name": "Porch Sensor Water leak",
+        "device_class": "moisture"
+      },
+      "last_changed": "2026-08-25T23:00:35+00:00",
+      "last_updated": "2026-08-25T23:00:35+00:00"
+    },
+    "sensor.porch_temperature": {
+      "entity_id": "sensor.porch_temperature",
+      "state": "21.4333",
+      "attributes": {
+        "friendly_name": "Porch Sensor Temperature",
+        "unit_of_measurement": "\u00b0C",
+        "device_class": "temperature"
+      },
+      "last_changed": "2026-08-25T23:53:35+00:00",
+      "last_updated": "2026-08-25T23:53:35+00:00"
+    },
+    "sensor.porch_battery": {
+      "entity_id": "sensor.porch_battery",
+      "state": "100",
+      "attributes": {
+        "friendly_name": "Porch Sensor Battery",
+        "unit_of_measurement": "%",
+        "device_class": "battery"
+      },
+      "last_changed": "2026-08-25T22:00:35+00:00",
+      "last_updated": "2026-08-25T22:00:35+00:00"
     }
   },
   "registry": {
@@ -217,13 +281,26 @@
         "name": "Hallway Dimmer",
         "labels": [
           "zigbee2mqtt"
-        ]
+        ],
+        "identifiers": [
+          [
+            "mqtt",
+            "zigbee2mqtt_0x0000000000000001"
+          ]
+        ],
+        "area_id": "hallway"
       },
       "dev2": {
         "id": "dev2",
         "name": "Porch Sensor",
         "labels": [
           "zigbee2mqtt"
+        ],
+        "identifiers": [
+          [
+            "mqtt",
+            "zigbee2mqtt_0x0000000000000002"
+          ]
         ]
       },
       "dev3": {
@@ -231,6 +308,12 @@
         "name": "Unknown Gadget",
         "labels": [
           "zigbee2mqtt"
+        ],
+        "identifiers": [
+          [
+            "mqtt",
+            "zigbee2mqtt_0x0000000000000003"
+          ]
         ]
       },
       "dev4": {
@@ -238,6 +321,12 @@
         "name": "Quote's Tricky Name",
         "labels": [
           "zigbee2mqtt"
+        ],
+        "identifiers": [
+          [
+            "mqtt",
+            "zigbee2mqtt_0x0000000000000004"
+          ]
         ]
       },
       "devX": {
@@ -273,7 +362,9 @@
         "device_id": "dev2",
         "labels": [
           "zigbee2mqtt"
-        ]
+        ],
+        "entity_category": "diagnostic",
+        "display_precision": 0
       },
       "update.porch_sensor": {
         "entity_id": "update.porch_sensor",
@@ -286,6 +377,31 @@
         "entity_id": "sensor.cpu",
         "device_id": "devX",
         "labels": []
+      },
+      "sensor.hallway_dimmer_linkquality": {
+        "entity_id": "sensor.hallway_dimmer_linkquality",
+        "device_id": "dev1",
+        "labels": [
+          "zigbee2mqtt"
+        ],
+        "entity_category": "diagnostic"
+      },
+      "select.hallway_dimmer_power_on_behavior": {
+        "entity_id": "select.hallway_dimmer_power_on_behavior",
+        "device_id": "dev1",
+        "labels": [
+          "zigbee2mqtt"
+        ],
+        "entity_category": "config",
+        "hidden": true
+      },
+      "sensor.porch_temperature": {
+        "entity_id": "sensor.porch_temperature",
+        "device_id": "dev2",
+        "labels": [
+          "zigbee2mqtt"
+        ],
+        "display_precision": 1
       }
     },
     "areas": {

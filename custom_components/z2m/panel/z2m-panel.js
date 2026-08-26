@@ -349,7 +349,7 @@ class Z2MPanel extends HTMLElement {
         out.push({
           value: `d:${d.ieee_address}:${epId}`,
           label: `${d.friendly_name || d.ieee_address}${
-            coordinator ? ' (coordinator)' : eps.length > 1 ? ` \u2014 endpoint ${epId}` : ''
+            coordinator ? ' (coordinator)' : eps.length > 1 ? `, endpoint ${epId}` : ''
           }`,
         });
       });
@@ -385,12 +385,12 @@ class Z2MPanel extends HTMLElement {
                     t.type === 'group'
                       ? `${t.name || `Group ${t.id}`} (group)`
                       : `${t.name || t.ieee_address}${t.coordinator ? ' (coordinator)' : ''}${
-                          t.endpoint && !t.coordinator ? ` \u2014 endpoint ${t.endpoint}` : ''
+                          t.endpoint && !t.coordinator ? `, endpoint ${t.endpoint}` : ''
                         }`;
                   return row({
                     icon: MDI.link,
                     headline: esc(clusterLabel(x.cluster)),
-                    text: `to ${esc(target)}${t.name === null ? ' \u2014 target no longer known' : ''}`,
+                    text: `to ${esc(target)}${t.name === null ? ' (target no longer known)' : ''}`,
                     end: `<ha-button slot="end" appearance="plain" size="s" data-act="unbind"
                             data-endpoint="${esc(String(ep.endpoint))}"
                             data-cluster="${esc(x.cluster)}"
@@ -418,7 +418,7 @@ class Z2MPanel extends HTMLElement {
       `<ha-card class="nav-card">
          <div class="card-header">Bindings for ${esc(d.friendly_name || ieee)}</div>
          <div class="note">A bind sends this device\u2019s commands straight to another device
-         or group, without Home Assistant or the coordinator in the path \u2014 so it keeps
+         or group, without Home Assistant or the coordinator in the path, so it keeps
          working when either is down, and it responds faster.</div>
          ${groupsHtml}
        </ha-card>` +
@@ -484,7 +484,7 @@ class Z2MPanel extends HTMLElement {
 
     return `<ha-card class="nav-card">
         <div class="card-header">Add a binding</div>
-        <div class="card-content"><ha-form data-form="${esc(key)}"></ha-form></div>
+        <div class="card-content pad"><ha-form data-form="${esc(key)}"></ha-form></div>
         <div class="note">A sleeping battery device cannot be bound until it wakes, so a
         refusal here often just means "try again while pressing a button on it".</div>
         <div class="actions">
@@ -634,6 +634,7 @@ class Z2MPanel extends HTMLElement {
       return;
     }
     this._syncFw();
+    this._syncLive();
   }
 
   set narrow(v) {
@@ -861,6 +862,90 @@ class Z2MPanel extends HTMLElement {
       .nav-card > .card-header { padding-bottom:var(--ha-space-2, 8px); }
       .card-content { padding:var(--ha-space-4, 16px); }
       .nav-card .card-content { padding:0; }
+      /* Row cards zero their padding because ha-md-list rows pad themselves. A card
+       * whose content is a form or free text opts back in with .pad -- the missing
+       * side padding here is exactly what made settings fields sit flush against the
+       * card edge on a phone. */
+      .nav-card .card-content.pad { padding:var(--ha-space-2, 8px) var(--ha-space-4, 16px)
+                                    var(--ha-space-4, 16px); }
+      .card-content.pad ha-form { display:block; }
+
+      /* Extended FAB, drawn by hand because ha-fab is not in this bundle. */
+      .fab { position:fixed; z-index:6;
+             right:calc(var(--ha-space-4, 16px) + var(--safe-area-inset-right, 0px));
+             bottom:calc(var(--ha-space-4, 16px) + var(--safe-area-inset-bottom, 0px));
+             display:inline-flex; align-items:center; gap:var(--ha-space-2, 8px);
+             height:56px; padding:0 var(--ha-space-5, 20px) 0 var(--ha-space-4, 16px);
+             border:none; border-radius:var(--ha-border-radius-lg, 16px);
+             background:var(--primary-color); color:var(--text-primary-color, #fff);
+             font-family:inherit; font-size:var(--ha-font-size-m, 14px);
+             font-weight:var(--ha-font-weight-medium, 500); letter-spacing:.1px;
+             cursor:pointer;
+             box-shadow:0 3px 5px -1px rgba(0,0,0,.2), 0 6px 10px 0 rgba(0,0,0,.14),
+                        0 1px 18px 0 rgba(0,0,0,.12); }
+      .fab:hover { box-shadow:0 5px 5px -3px rgba(0,0,0,.2), 0 8px 10px 1px rgba(0,0,0,.14),
+                   0 3px 14px 2px rgba(0,0,0,.12); }
+      .fab:focus-visible { outline:var(--ha-outline-width, 2px) solid var(--primary-color);
+                           outline-offset:var(--ha-space-1, 4px); }
+      .fab ha-svg-icon { width:var(--ha-icon-size-m, 24px); height:var(--ha-icon-size-m, 24px); }
+
+      /* Device page: live things first, admin beside them once there is room. The
+       * single 600px column left the sides of a desktop empty; the grid uses it. */
+      .devgrid { max-width:600px; margin:0 auto; display:grid; gap:0;
+                 grid-template-columns:minmax(0, 1fr); align-items:start; }
+      .devgrid ha-card { max-width:none; }
+      @media (min-width:1100px) {
+        .devgrid { max-width:1240px; gap:0 var(--ha-space-6, 24px);
+                   grid-template-columns:minmax(0, 7fr) minmax(0, 5fr); }
+      }
+      .devchips { display:flex; flex-wrap:wrap; gap:var(--ha-space-2, 8px);
+                  padding:var(--ha-space-3, 12px) var(--ha-space-4, 16px) 0; }
+      .chip2 { display:inline-flex; align-items:center; gap:var(--ha-space-1, 4px);
+               padding:2px 10px; border-radius:999px;
+               border:1px solid var(--divider-color);
+               color:var(--secondary-text-color);
+               font-size:var(--ha-font-size-s, 12px); line-height:1.8; }
+      .chip2.ok { color:var(--success-color); border-color:var(--success-color); }
+      .chip2.bad { color:var(--error-color); border-color:var(--error-color); }
+      .chip2.warn { color:var(--warning-color); border-color:var(--warning-color); }
+
+      /* One control row per controllable entity: name and state on the left, HA's
+       * own tile controls on the right, brightness on its own line. */
+      .ctl { display:flex; align-items:center; gap:var(--ha-space-3, 12px);
+             padding:var(--ha-space-2, 8px) var(--ha-space-4, 16px); }
+      .ctl + .ctl, .ctl + .ctl-slider, .ctl-slider + .ctl {
+             border-top:1px solid var(--divider-color); }
+      .ctl-info { flex:1; min-width:0; }
+      .ctl-name { font-size:var(--ha-font-size-m, 14px); }
+      .ctl-state { color:var(--secondary-text-color); font-size:var(--ha-font-size-s, 12px); }
+      .ctl ha-control-switch { width:72px; height:36px; flex:none; }
+      .ctl .ctl-btns { display:flex; gap:var(--ha-space-2, 8px); flex:none; }
+      .ctl-slider { padding:0 var(--ha-space-4, 16px) var(--ha-space-3, 12px); }
+      .ctl-slider ha-control-slider { height:36px; width:100%; }
+      .ctl-slider-cap { color:var(--secondary-text-color);
+                        font-size:var(--ha-font-size-s, 12px);
+                        padding-bottom:var(--ha-space-1, 4px); }
+      .ctl.off ha-control-switch { --control-switch-on-color:var(--primary-color); }
+
+      /* Sensor readings: value prominent, label quiet, freshness quieter. */
+      .sens-grid { display:grid; gap:var(--ha-space-2, 8px);
+                   grid-template-columns:repeat(auto-fill, minmax(150px, 1fr));
+                   padding:var(--ha-space-2, 8px) var(--ha-space-4, 16px) var(--ha-space-4, 16px); }
+      .sens { padding:var(--ha-space-2, 8px) var(--ha-space-3, 12px);
+              border-radius:var(--ha-border-radius-md, 8px);
+              background:var(--secondary-background-color); }
+      .sens-v { font-size:var(--ha-font-size-xl, 20px); line-height:1.3;
+                color:var(--primary-text-color); }
+      .sens-v span { font-size:var(--ha-font-size-s, 12px);
+                     color:var(--secondary-text-color); }
+      .sens-v.on { color:var(--primary-color); }
+      .sens-l { color:var(--secondary-text-color); font-size:var(--ha-font-size-s, 12px);
+                white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+      .sens-t { color:var(--disabled-text-color, var(--secondary-text-color));
+                font-size:var(--ha-font-size-xs, 11px); }
+      .sens-grid .diag { opacity:.75; }
+      ha-expansion-panel { --expansion-panel-summary-padding:0 var(--ha-space-4, 16px);
+                           --expansion-panel-content-padding:0; }
       ha-md-list, .mdlist { display:block; padding:0; background:none; }
       ha-md-list-item { --md-item-overflow:visible; }
       ha-alert { display:block; margin-bottom:var(--ha-space-3, 12px); }
@@ -965,11 +1050,21 @@ class Z2MPanel extends HTMLElement {
       .pair-log .log { padding-inline:var(--ha-space-3, 12px); }
 
       /* ------------------------------------------------------------ dialog */
-      /* Sized in ch so the log lines wrap where they read best, and capped so the
-       * dialog never becomes the page: HA's own dialogs go full-screen on a phone,
-       * and ha-dialog does that part itself. */
-      ha-dialog { --mdc-dialog-min-width:min(92vw, 33rem);
-                  --mdc-dialog-max-width:min(92vw, 33rem); }
+      /* A window everywhere, sized for the surface. 2026.8's ha-dialog is built on
+       * wa-dialog and sizes itself with --ha-dialog-width-md / -full; on a phone HA's
+       * global styles push those to 100vw, which is the full-screen takeover the
+       * operator asked to remove. The --mdc-dialog-* names are dead in this
+       * implementation -- overriding them does nothing. */
+      ha-dialog { --ha-dialog-width-md:min(92vw, 33rem); }
+      @media (max-width: 450px), (max-height: 500px) {
+        ha-dialog { --ha-dialog-width-md:calc(100vw - var(--ha-space-8, 32px));
+                    --ha-dialog-width-full:calc(100vw - var(--ha-space-8, 32px));
+                    --ha-dialog-max-height:min(88vh, 720px);
+                    --ha-dialog-min-height:auto;
+                    --dialog-surface-margin-top:auto;
+                    --ha-dialog-border-radius:var(--ha-border-radius-2xl, 28px); }
+        .pair-log { max-height:var(--ha-log-max-height-narrow, 132px); }
+      }
       .dlg { display:grid; gap:var(--ha-space-4, 16px);
              padding:var(--ha-space-2, 8px) 0 var(--ha-space-4, 16px); }
       .dlg .form-row { padding:0; }
@@ -1129,6 +1224,7 @@ class Z2MPanel extends HTMLElement {
         ${this._error ? `<ha-alert alert-type="error">${esc(this._error)}</ha-alert>` : ''}
         ${this._feedAlert()}
         ${this._bodyFor()}
+        ${this._fab()}
       </div>`;
 
     const top = this._view.name === 'dashboard';
@@ -1235,6 +1331,19 @@ class Z2MPanel extends HTMLElement {
     }
   }
 
+  /**
+   * The floating action button for "Add device", hand-drawn because `ha-fab` is not
+   * registered in the bundle this panel loads into (verified on 2026.8.3, same story
+   * as ha-textfield). Only where adding a device is the primary action; the container
+   * already reserves bottom padding, so it never covers the last row.
+   */
+  _fab() {
+    if (this._view.name !== 'dashboard' && this._view.name !== 'devices') return '';
+    return `<button class="fab" data-act="pair" aria-label="Add device">
+        ${icon(MDI.plus)}<span>Add device</span>
+      </button>`;
+  }
+
   _bodyFor() {
     switch (this._view.name) {
       case 'devices':
@@ -1325,6 +1434,48 @@ class Z2MPanel extends HTMLElement {
     });
     r.querySelectorAll('[data-act]').forEach((el) => {
       el.onclick = () => this._dispatch(el.dataset.act, el);
+    });
+
+    // Live device controls. All of them talk to HA's own service bus, not to Z2M:
+    // toggling a light is exactly what tapping it in HA does, so the whole state
+    // pipeline (optimistic update, retained echo) behaves identically.
+    r.querySelectorAll('[data-svc]').forEach((el) => {
+      if (el._z2mSvc) return;
+      el._z2mSvc = true;
+      el.addEventListener('click', () => {
+        const [call, eid] = el.dataset.svc.split('|');
+        const [domain, service] = call.split('.');
+        this._hass.callService(domain, service, { entity_id: eid });
+      });
+    });
+    r.querySelectorAll('[data-ctltoggle]').forEach((el) => {
+      const st = this._hass && this._hass.states && this._hass.states[el.dataset.ctltoggle];
+      if (st) el.checked = st.state === 'on';
+      if (el._z2mCtl) return;
+      el._z2mCtl = true;
+      el.addEventListener('change', () => {
+        const eid = el.dataset.ctltoggle;
+        this._hass.callService(eid.split('.')[0], el.checked ? 'turn_on' : 'turn_off', {
+          entity_id: eid,
+        });
+      });
+    });
+    r.querySelectorAll('[data-ctlbright]').forEach((el) => {
+      const st = this._hass && this._hass.states && this._hass.states[el.dataset.ctlbright];
+      if (st) {
+        const b = (st.attributes || {}).brightness;
+        el.value = st.state === 'on' && b ? Math.max(1, Math.round((b / 255) * 100)) : 0;
+      }
+      if (el._z2mCtl) return;
+      el._z2mCtl = true;
+      el.addEventListener('value-changed', (ev) => {
+        const pct = Number((ev.detail || {}).value);
+        if (!Number.isFinite(pct)) return;
+        this._hass.callService('light', pct === 0 ? 'turn_off' : 'turn_on',
+          pct === 0
+            ? { entity_id: el.dataset.ctlbright }
+            : { entity_id: el.dataset.ctlbright, brightness_pct: Math.round(pct) });
+      });
     });
     r.querySelectorAll('[data-change]').forEach((el) => {
       el.onchange = () => this._change(el.dataset.change, el);
@@ -1433,6 +1584,24 @@ class Z2MPanel extends HTMLElement {
     if (this._view.name === 'binds' && this._binds.ieee !== this._view.ieee) {
       this._openBinds(this._view.ieee);
     }
+    // Freshen what the device page shows, the way Z2M's own UI does with its
+    // per-field refresh arrows -- except all at once and unprompted. One MQTT get
+    // covers every readable attribute, so for a powered device this is a burst of
+    // unicast reads to that one device: negligible, and worth it for the operator
+    // never seeing a stale toggle. Sleeping battery devices are skipped -- they
+    // would only queue until wake-up; the Refresh button covers them honestly.
+    if (this._view.name === 'device') {
+      const d = this._dev(this._view.ieee);
+      this._readValues = this._readValues || {};
+      if (d && d.availability !== 'offline' && d.power_source === 'Mains (single phase)'
+          && !this._readValues[d.ieee_address]) {
+        this._readValues[d.ieee_address] = true;
+        this._call('z2m/device/read_values', { device: d.ieee_address }).catch(() => {
+          // A failed freshen changes nothing on screen; the page still shows HA's
+          // last known state, which is exactly what it showed before this existed.
+        });
+      }
+    }
   }
 
   /* ---------------------------------------------------------------- ticker */
@@ -1496,7 +1665,7 @@ class Z2MPanel extends HTMLElement {
     const s = this._summary || {};
     if (!s.permit_join) return 'Joining closed';
     const left = this._joinLeft();
-    return left ? `Joining open \u2014 ${left}s left` : 'Joining open';
+    return left ? `Joining open, ${left}s left` : 'Joining open';
   }
 
   _dashboard() {
@@ -1539,35 +1708,19 @@ class Z2MPanel extends HTMLElement {
 
   _networkCard() {
     const s = this._summary || {};
-    const l = this._labelled();
     const rows = [
-      l
-        ? row({
-            icon: MDI.devices,
-            headline: `${l.devices} device${l.devices === 1 ? '' : 's'}`,
-            // Deliberately not repeating the offline count from the status card
-            // above. This number is one higher than the card's on purpose: the
-            // table includes the coordinator, the mesh count does not. Saying so
-            // here is cheaper than leaving the operator to spot the discrepancy.
-            text: 'In Home Assistant\u2019s device table, incl. coordinator',
-            href: `/config/devices/dashboard?historyBack=1&label=${encodeURIComponent(l.label)}`,
-          })
-        : row({
-            // No label yet is a real state on a fresh install, so route to the
-            // panel's own list rather than emitting label=null.
-            icon: MDI.devices,
-            headline: `${s.device_count || 0} device${(s.device_count || 0) === 1 ? '' : 's'}`,
-            text: s.offline_count ? `${s.offline_count} offline` : '',
-            go: 'devices',
-          }),
-      l
-        ? row({
-            icon: MDI.entities,
-            headline: `${l.entities} entit${l.entities === 1 ? 'y' : 'ies'}`,
-            text: 'In Home Assistant\u2019s entity table',
-            href: `/config/entities/dashboard?historyBack=1&label=${encodeURIComponent(l.label)}`,
-          })
-        : '',
+      // The panel's own device list, not HA's device table: the Zigbee side of each
+      // device -- rename, reconfigure, re-interview, remove, per-device settings --
+      // is what this panel exists for. HA's table is one filter away for anyone who
+      // wants it, so it does not need a row here.
+      row({
+        icon: MDI.devices,
+        headline: `${s.device_count || 0} device${(s.device_count || 0) === 1 ? '' : 's'}`,
+        text: s.offline_count
+          ? `${s.offline_count} offline \u00b7 rename, settings, firmware and removal`
+          : 'Rename, settings, firmware and removal',
+        go: 'devices',
+      }),
       row({
         icon: MDI.groups,
         headline: `${s.group_count || 0} group${(s.group_count || 0) === 1 ? '' : 's'}`,
@@ -1575,17 +1728,16 @@ class Z2MPanel extends HTMLElement {
       }),
     ].join('');
 
-    // Add device sits here, next to Show map, rather than in a floating corner
-    // button. The old FAB was an ha-button pretending to be one, it overlapped the
-    // content it floated over, and it toggled the radio directly -- so "Add device"
-    // opened the network with nothing on screen to watch. Both actions now belong
-    // to the network they act on, and Add device opens the pairing helper.
+    // Add device lives in the floating action button, the way HA's own device pages
+    // do it. The first FAB here was removed for two faults that no longer exist: it
+    // was a hand-styled ha-button that overlapped content (the container now reserves
+    // bottom space for it), and it toggled the radio directly with nothing on screen
+    // (it now opens the pairing dialog, which watches before it touches the radio).
     return `
       <ha-card class="nav-card">
         <div class="card-header">My network
           <span class="header-actions">
             <ha-button appearance="plain" data-act="map">${icon(MDI.map)}Show map</ha-button>
-            <ha-button appearance="filled" data-act="pair">${icon(MDI.plus)}Add device</ha-button>
           </span>
         </div>
         <div class="card-content">${list(rows)}</div>
@@ -1605,18 +1757,8 @@ class Z2MPanel extends HTMLElement {
 
     return card(
       list(
-        // The row above delegates to HA's device table. This one is a different
-        // capability: the Zigbee side of each device -- rename, reconfigure,
-        // re-interview, remove, per-device Z2M options -- which HA's own device page
-        // knows nothing about.
         row({
-          icon: MDI.devices,
-          headline: 'Zigbee devices',
-          text: 'Rename, reconfigure, re-interview, remove, per-device settings',
-          go: 'devices',
-        }) +
-          row({
-            icon: MDI.options,
+          icon: MDI.options,
             headline: 'Options',
             text: `Log level, permit join and restart${
               s.log_level ? ` \u00b7 now ${esc(s.log_level)}` : ''
@@ -1721,73 +1863,352 @@ class Z2MPanel extends HTMLElement {
     const d = this._dev(ieee);
     if (!d) return `<div class="empty">Device not found.</div>`;
 
+    const live = this._liveEntities(ieee);
+    const offline = d.availability === 'offline';
 
+    // The freshen affordance rides the first live card, so it sits beside what it
+    // refreshes.
+    const refreshBtn = `<ha-button appearance="plain" size="s" data-act="readvalues">
+        ${icon(MDI.refresh)}Refresh</ha-button>`;
+    live.refreshBtn = live.controls.length || live.sensors.length || live.diags.length
+      ? refreshBtn : '';
+    const feed = this._feedMsg
+      ? `<ha-alert alert-type="success">${esc(this._feedMsg)}</ha-alert>`
+      : '';
+    // Live things first -- what the device is doing and the controls to change it --
+    // because that is what the operator opens the page for. Identity and admin sit
+    // beside them on a wide screen and after them on a phone, with the identity table
+    // folded away: it was the first thing on the old page and earned none of it.
+    return `<div class="devgrid">
+      <div>
+        ${
+          offline
+            ? `<ha-alert alert-type="warning" title="Offline">
+                 Zigbee2MQTT has not heard from this device within its availability
+                 window. Controls will queue or fail until it is heard again.
+               </ha-alert>`
+            : ''
+        }
+        ${feed}
+        ${this._controlsCard(live)}
+        ${this._sensorsCard(live)}
+        <ha-card class="nav-card"><div id="fwbox">${this._fwInner(d)}</div></ha-card>
+      </div>
+      <div>
+        <ha-card class="nav-card">
+          <div class="devchips">${this._deviceChips(d, live)}</div>
+          <ha-expansion-panel header="Device details">${this._kvs([
+            ['Friendly name', d.friendly_name],
+            ['IEEE address', d.ieee_address],
+            ['Network address', d.network_address],
+            ['Vendor', d.vendor],
+            ['Model', d.model],
+            ['Description', d.description],
+            ['Type', d.type],
+            ['Power source', d.power_source],
+            ['Firmware build', d.software_build_id],
+            ['Firmware date', d.date_code],
+          ])}</ha-expansion-panel>
+        </ha-card>
 
-    return `
-      <ha-card class="nav-card">${this._kvs([
-        ['Friendly name', d.friendly_name],
-        ['IEEE address', d.ieee_address],
-        ['Network address', d.network_address],
-        ['Vendor', d.vendor],
-        ['Model', d.model],
-        ['Description', d.description],
-        ['Type', d.type],
-        ['Power source', d.power_source],
-        ['Availability', d.availability || 'unknown'],
-        ['Firmware build', d.software_build_id],
-        ['Firmware date', d.date_code],
-        ['Supported by Z2M', d.supported === false ? 'NO - custom converter needed' : 'yes'],
-      ])}</ha-card>
+        <ha-card class="nav-card">
+          <div class="card-header">Rename</div>
+          <div class="card-content pad">
+            ${this._textField(`rename:${d.ieee_address}`, {
+              label: 'Friendly name',
+              helper: 'Changes the MQTT topic, so Home Assistant entity IDs regenerate',
+              value: d.friendly_name || '',
+            })}
+          </div>
+          <div class="actions">
+            <ha-button appearance="filled" size="s" data-act="rename">Rename</ha-button>
+          </div>
+        </ha-card>
 
-      <ha-card class="nav-card">
-        <div class="card-header">Rename</div>
-        <div class="card-content">
-          ${this._textField(`rename:${d.ieee_address}`, {
-            label: 'Friendly name',
-            helper: 'Changes the MQTT topic, so Home Assistant entity IDs regenerate',
-            value: d.friendly_name || '',
-          })}
-        </div>
-        <div class="actions">
-          <ha-button appearance="filled" size="s" data-act="rename">Rename</ha-button>
-        </div>
-      </ha-card>
+        ${this._optionsForm(d)}
 
-      ${this._optionsForm(d)}
-
-      <ha-card class="nav-card"><div id="fwbox">${this._fwInner(d)}</div></ha-card>
-
-      <ha-card class="nav-card">
-        <div class="card-header">Maintenance</div>
-        <div class="card-content">${list(
-          row({
-            icon: MDI.link,
-            headline: 'Bindings',
-            text: 'Send this device\u2019s commands straight to another device or group',
-            act: 'openbinds',
-            tap: true,
-          }) +
-          row({
-            icon: MDI.wrench,
-            headline: 'Reconfigure',
-            text: 'Re-apply reporting configuration and bindings',
-            end: rowButton('Reconfigure', 'configure'),
-          }) +
+        <ha-card class="nav-card">
+          <div class="card-header">Maintenance</div>
+          <div class="card-content">${list(
             row({
-              icon: MDI.radar,
-              headline: 'Re-interview',
-              text: 'Rebuild what Zigbee2MQTT knows about this device',
-              end: rowButton('Interview', 'interview'),
+              icon: MDI.link,
+              headline: 'Bindings',
+              text: 'Send this device\u2019s commands straight to another device or group',
+              act: 'openbinds',
+              tap: true,
             }) +
             row({
-              icon: MDI.remove,
-              headline: 'Remove from network',
-              text:
-                'Force removal does not tell the device to leave, so it needs a factory reset before it can pair again',
-              end: rowButton('Remove', 'remove'),
-            })
-        )}</div>
+              icon: MDI.wrench,
+              headline: 'Reconfigure',
+              text: 'Re-apply reporting configuration and bindings',
+              end: rowButton('Reconfigure', 'configure'),
+            }) +
+              row({
+                icon: MDI.radar,
+                headline: 'Re-interview',
+                text: 'Rebuild what Zigbee2MQTT knows about this device',
+                end: rowButton('Interview', 'interview'),
+              }) +
+              row({
+                icon: MDI.remove,
+                headline: 'Remove from network',
+                text:
+                  'Force removal does not tell the device to leave, so it needs a factory reset before it can pair again',
+                end: rowButton('Remove', 'remove'),
+              })
+          )}</div>
+        </ha-card>
+      </div>
+    </div>`;
+  }
+
+  /* ------------------------------------------------- live entities on the page */
+
+  /** The HA device that MQTT discovery created for this Zigbee device. */
+  _haDeviceFor(ieee) {
+    const devs = (this._hass && this._hass.devices) || {};
+    const tag = `zigbee2mqtt_${String(ieee || '').toLowerCase()}`;
+    for (const id in devs) {
+      for (const pair of devs[id].identifiers || []) {
+        if (String((pair || [])[1] || '').toLowerCase() === tag) return devs[id];
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The device's HA entities, classified for the page. Hidden and disabled entities
+   * stay out -- the operator hid them deliberately, and a disabled entity has no
+   * state to show. `update` is carried by the firmware card, not repeated here.
+   */
+  _liveEntities(ieee) {
+    const out = { haDevice: null, controls: [], sensors: [], diags: [] };
+    const h = this._hass;
+    if (!h || !h.entities || !h.states) return out;
+    const haDev = this._haDeviceFor(ieee);
+    if (!haDev) return out;
+    out.haDevice = haDev;
+    const CONTROL = { light: 1, switch: 1, fan: 1, lock: 1, cover: 1, valve: 1, siren: 1 };
+    for (const eid in h.entities) {
+      const e = h.entities[eid];
+      if (e.device_id !== haDev.id || e.hidden) continue;
+      const st = h.states[eid];
+      if (!st) continue;
+      const domain = eid.split('.')[0];
+      const item = { eid, domain, st, category: e.entity_category || null };
+      if (CONTROL[domain] && !item.category) out.controls.push(item);
+      else if (domain === 'sensor' || domain === 'binary_sensor') {
+        (item.category ? out.diags : out.sensors).push(item);
+      }
+    }
+    const name = (x) => this._entityName(x);
+    out.controls.sort((a, b) => name(a).localeCompare(name(b)));
+    out.sensors.sort((a, b) => name(a).localeCompare(name(b)));
+    out.diags.sort((a, b) => name(a).localeCompare(name(b)));
+    return out;
+  }
+
+  /** The entity's own name, without the device name it is prefixed with. */
+  _entityName(item) {
+    const full = (item.st.attributes || {}).friendly_name || item.eid;
+    const d = this._dev(this._view.ieee) || {};
+    const prefix = d.friendly_name || '';
+    if (prefix && full.toLowerCase().startsWith(prefix.toLowerCase())) {
+      const rest = full.slice(prefix.length).trim();
+      if (rest) return rest;
+    }
+    return full;
+  }
+
+  _deviceChips(d, live) {
+    const chips = [];
+    const off = d.availability === 'offline';
+    chips.push(`<span class="chip2 ${off ? 'bad' : 'ok'}">${off ? 'Offline' : 'Online'}</span>`);
+    if (d.type) chips.push(`<span class="chip2">${esc(d.type)}</span>`);
+    const batt = (live.diags || []).find((x) => (x.st.attributes || {}).device_class === 'battery');
+    if (batt && batt.st.state !== 'unavailable' && batt.st.state !== 'unknown') {
+      const pct = Number(batt.st.state);
+      chips.push(`<span class="chip2${pct <= 20 ? ' warn' : ''}">Battery ${esc(batt.st.state)}%</span>`);
+    } else if (d.power_source && d.power_source !== 'Mains (single phase)') {
+      chips.push(`<span class="chip2">${esc(d.power_source)}</span>`);
+    }
+    // _deviceArea answers with the area_id (that is what the registry write takes);
+    // a chip is read by a person, so it gets the area's name.
+    const areaId = live.haDevice && live.haDevice.area_id;
+    const area = areaId && (((this._hass.areas || {})[areaId] || {}).name || areaId);
+    if (area) chips.push(`<span class="chip2">${esc(area)}</span>`);
+    if (d.supported === false) {
+      chips.push('<span class="chip2 warn">Not supported, needs a custom converter</span>');
+    }
+    return chips.join('');
+  }
+
+  _controlsCard(live) {
+    if (!live.controls.length) return '';
+    const rows = live.controls.map((item) => this._controlRow(item)).join('');
+    return `<ha-card class="nav-card">
+        <div class="card-header">Controls${live.refreshBtn
+          ? `<span class="header-actions">${live.refreshBtn}</span>` : ''}</div>
+        <div class="card-content">${rows}</div>
       </ha-card>`;
+  }
+
+  /**
+   * One row per controllable entity, driven by HA's own tile controls
+   * (ha-control-switch / ha-control-slider are registered in this bundle; verified
+   * the same way ha-textfield was verified absent). Everything is wired by
+   * data-attributes in _wire, and patched in place by _syncLive on hass pushes, so
+   * a state change never re-renders the page under the operator.
+   */
+  _controlRow(item) {
+    const st = item.st;
+    const unavailable = st.state === 'unavailable' || st.state === 'unknown';
+    const name = esc(this._entityName(item));
+    const stateText = st.state;
+    const info = `<div class="ctl-info">
+        <div class="ctl-name">${name}</div>
+        <div class="ctl-state" data-ctlstate="${esc(item.eid)}">${esc(stateText)}</div>
+      </div>`;
+
+    if (item.domain === 'light' || item.domain === 'switch' || item.domain === 'fan'
+        || item.domain === 'siren') {
+      const sw = `<ha-control-switch data-ctltoggle="${esc(item.eid)}"${
+        unavailable ? ' disabled' : ''
+      }></ha-control-switch>`;
+      let slider = '';
+      if (item.domain === 'light'
+          && Array.isArray((st.attributes || {}).supported_color_modes)
+          && st.attributes.supported_color_modes.some((m) => m !== 'onoff')) {
+        slider = `<div class="ctl-slider">
+            <div class="ctl-slider-cap">Brightness</div>
+            <ha-control-slider data-ctlbright="${esc(item.eid)}" min="1" max="100" step="1"${
+              unavailable ? ' disabled' : ''
+            }></ha-control-slider>
+          </div>`;
+      }
+      return `<div class="ctl">${info}${sw}</div>${slider}`;
+    }
+
+    if (item.domain === 'lock') {
+      return `<div class="ctl">${info}
+          <span class="ctl-btns">
+            <ha-button appearance="plain" size="s" data-svc="lock.unlock|${esc(item.eid)}">Unlock</ha-button>
+            <ha-button appearance="filled" size="s" data-svc="lock.lock|${esc(item.eid)}">Lock</ha-button>
+          </span>
+        </div>`;
+    }
+
+    // cover and valve: explicit verbs, because toggle on a half-open cover is a guess.
+    const domain = item.domain;
+    const open = domain === 'cover' ? 'open_cover' : 'open_valve';
+    const close = domain === 'cover' ? 'close_cover' : 'close_valve';
+    const stop = domain === 'cover' ? `<ha-button appearance="plain" size="s"
+          data-svc="cover.stop_cover|${esc(item.eid)}">Stop</ha-button>` : '';
+    return `<div class="ctl">${info}
+        <span class="ctl-btns">
+          <ha-button appearance="plain" size="s" data-svc="${domain}.${close}|${esc(item.eid)}">Close</ha-button>
+          ${stop}
+          <ha-button appearance="filled" size="s" data-svc="${domain}.${open}|${esc(item.eid)}">Open</ha-button>
+        </span>
+      </div>`;
+  }
+
+  _sensorsCard(live) {
+    if (!live.sensors.length && !live.diags.length) return '';
+    const tile = (item, extra) => {
+      const st = item.st;
+      const a = st.attributes || {};
+      const bad = st.state === 'unavailable' || st.state === 'unknown';
+      const on = item.domain === 'binary_sensor' && st.state === 'on';
+      const value = bad
+        ? st.state
+        : item.domain === 'binary_sensor'
+          ? (st.state === 'on' ? 'Detected' : 'Clear')
+          : this._fmtState(st, item);
+      const unit = !bad && item.domain === 'sensor' && a.unit_of_measurement
+        ? ` <span>${esc(a.unit_of_measurement)}</span>` : '';
+      return `<div class="sens${extra || ''}" data-sens="${esc(item.eid)}">
+          <div class="sens-v${on ? ' on' : ''}">${esc(String(value))}${unit}</div>
+          <div class="sens-l" title="${esc(this._entityName(item))}">${esc(this._entityName(item))}</div>
+          <div class="sens-t">${esc(this._age(st.last_changed))}</div>
+        </div>`;
+    };
+    return `<ha-card class="nav-card">
+        <div class="card-header">Sensors${live.refreshBtn && !live.controls.length
+          ? `<span class="header-actions">${live.refreshBtn}</span>` : ''}</div>
+        <div class="sens-grid">
+          ${live.sensors.map((i) => tile(i)).join('')}
+          ${live.diags.map((i) => tile(i, ' diag')).join('')}
+        </div>
+      </ha-card>`;
+  }
+
+  /** Round with the registry's display precision, the way HA's own cards do. */
+  _fmtState(st, item) {
+    const e = this._hass && this._hass.entities && this._hass.entities[item.eid];
+    const n = Number(st.state);
+    if (!Number.isFinite(n)) return st.state;
+    if (e && e.display_precision !== undefined && e.display_precision !== null) {
+      return n.toFixed(e.display_precision);
+    }
+    return String(n);
+  }
+
+  _age(iso) {
+    if (!iso) return '';
+    const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+    if (s < 60) return 'just now';
+    if (s < 3600) return `${Math.round(s / 60)} min ago`;
+    if (s < 86400) return `${Math.round(s / 3600)} h ago`;
+    return `${Math.round(s / 86400)} d ago`;
+  }
+
+  /**
+   * Patch the live parts of the device page from a fresh `hass` without a render,
+   * the same bargain _syncFw makes: a state change never steals the caret from the
+   * rename field or resets the settings form.
+   */
+  _syncLive() {
+    if (this._view.name !== 'device' || !this.shadowRoot) return;
+    const states = (this._hass && this._hass.states) || {};
+    const r = this.shadowRoot;
+    r.querySelectorAll('[data-ctltoggle]').forEach((el) => {
+      const st = states[el.dataset.ctltoggle];
+      if (!st) return;
+      el.checked = st.state === 'on';
+      el.disabled = st.state === 'unavailable' || st.state === 'unknown';
+    });
+    r.querySelectorAll('[data-ctlbright]').forEach((el) => {
+      const st = states[el.dataset.ctlbright];
+      if (!st || r.activeElement === el) return;
+      const b = (st.attributes || {}).brightness;
+      el.value = st.state === 'on' && b ? Math.max(1, Math.round((b / 255) * 100)) : 0;
+    });
+    r.querySelectorAll('[data-ctlstate]').forEach((el) => {
+      const st = states[el.dataset.ctlstate];
+      if (st) el.textContent = st.state;
+    });
+    r.querySelectorAll('[data-sens]').forEach((el) => {
+      const st = states[el.dataset.sens];
+      if (!st) return;
+      const item = { eid: el.dataset.sens, domain: el.dataset.sens.split('.')[0], st };
+      const a = st.attributes || {};
+      const bad = st.state === 'unavailable' || st.state === 'unknown';
+      const v = el.querySelector('.sens-v');
+      if (v) {
+        const value = bad
+          ? st.state
+          : item.domain === 'binary_sensor'
+            ? (st.state === 'on' ? 'Detected' : 'Clear')
+            : this._fmtState(st, item);
+        const unit = !bad && item.domain === 'sensor' && a.unit_of_measurement
+          ? ` <span>${esc(a.unit_of_measurement)}</span>` : '';
+        v.innerHTML = `${esc(String(value))}${unit}`;
+        v.classList.toggle('on', item.domain === 'binary_sensor' && st.state === 'on');
+      }
+      const t = el.querySelector('.sens-t');
+      if (t) t.textContent = this._age(st.last_changed);
+    });
   }
 
   _kvs(pairs) {
@@ -1832,10 +2253,12 @@ class Z2MPanel extends HTMLElement {
 
     return `<ha-card class="nav-card">
         <div class="card-header">Device settings</div>
-        <div class="card-content">
+        <div class="card-content pad">
           <ha-form data-form="${esc(key)}"></ha-form>
         </div>
-        <div class="note">Written straight to Zigbee2MQTT.</div>
+        <div class="note">Written straight to Zigbee2MQTT. An empty field simply uses
+        the Zigbee2MQTT default for this model. These are converter settings rather than
+        values stored on the device, so there is nothing to read back.</div>
         <div class="actions">
           <ha-button appearance="filled" size="s" data-act="options">Save settings</ha-button>
         </div>
@@ -1882,7 +2305,7 @@ class Z2MPanel extends HTMLElement {
     let status = 'Up to date';
     let chip = 'ok';
     if (f.inProgress) {
-      status = `Updating${f.pct != null ? ` \u2014 ${f.pct}%` : ''}`;
+      status = `Updating${f.pct != null ? ` (${f.pct}%)` : ''}`;
       chip = 'warn';
     } else if (f.unavailable) {
       status = 'Device unreachable';
@@ -2171,11 +2594,11 @@ class Z2MPanel extends HTMLElement {
             )}New group</ha-button>
           </span>
         </div>
-        ${this._textField('gcreate', {
+        <div class="card-content pad">${this._textField('gcreate', {
           label: 'Name',
           helper: 'What the group will be called in Home Assistant',
           value: '',
-        })}
+        })}</div>
         <div class="card-content">${
           rows ? list(rows) : '<div class="empty">No Zigbee groups yet.</div>'
         }</div>
@@ -2215,7 +2638,7 @@ class Z2MPanel extends HTMLElement {
         (c) =>
           `<ha-list-item value="${esc(`${c.device.ieee_address}|${c.endpoint}`)}">${esc(
             c.device.friendly_name || c.device.ieee_address
-          )}${(c.device.endpoints || []).length > 1 ? ` \u2014 endpoint ${esc(String(c.endpoint))}` : ''}</ha-list-item>`
+          )}${(c.device.endpoints || []).length > 1 ? `, endpoint ${esc(String(c.endpoint))}` : ''}</ha-list-item>`
       )
       .join('');
 
@@ -2231,11 +2654,11 @@ class Z2MPanel extends HTMLElement {
           ['Group ID', g.id],
           ['Members', members.length],
         ])}
-        ${this._textField(`grename:${g.id}`, {
+        <div class="card-content pad">${this._textField(`grename:${g.id}`, {
           label: 'Name',
           helper: 'Renames the group and its MQTT topic',
           value: g.friendly_name || '',
-        })}
+        })}</div>
         <div class="actions">
           <ha-button appearance="plain" size="s" data-act="grouprename">Rename</ha-button>
         </div>
@@ -2274,7 +2697,7 @@ class Z2MPanel extends HTMLElement {
             row({
               icon: MDI.alert,
               headline: 'Force delete',
-              text: 'Recovery only \u2014 deletes the group without telling the devices, so they stay programmed with its address',
+              text: 'Recovery only: deletes the group without telling the devices, so they stay programmed with its address',
               end: rowButton('Force', 'groupforce'),
             })
         )}</div>
@@ -2536,7 +2959,7 @@ class Z2MPanel extends HTMLElement {
     const p = this._pairing;
     switch (p.phase) {
       case 'joined':
-        return 'Device joined \u2014 interviewing';
+        return 'Device joined, interviewing';
       case 'interview_started':
         return 'Interviewing the device';
       case 'successful':
@@ -2932,7 +3355,7 @@ class Z2MPanel extends HTMLElement {
           </span>
         </div>
         <div class="pair-log" id="pairlog">${this._pairLogRows()}</div>
-        <div class="dlg-hint">Filtered to joining, interviewing and configuring \u2014 routine
+        <div class="dlg-hint">Filtered to joining, interviewing and configuring. Routine
           traffic from devices already on the network is left out. Zigbee2MQTT is at debug
           while this window is open, and goes back on its own when you close it.</div>
       </div>`;
@@ -3064,8 +3487,8 @@ class Z2MPanel extends HTMLElement {
               icon: MDI.plus,
               headline: 'Permit joining',
               text: s.permit_join
-                ? 'Open \u2014 any Zigbee device may join right now'
-                : 'Closed \u2014 devices cannot join',
+                ? 'Open. Any Zigbee device may join right now'
+                : 'Closed. Devices cannot join',
               end: rowButton(s.permit_join ? 'Close' : 'Open for 254s', 'permit'),
             }) +
             row({
@@ -3807,6 +4230,23 @@ class Z2MPanel extends HTMLElement {
 
       case 'configure':
         return this._act('z2m/device/configure', { device });
+
+      case 'readvalues': {
+        // The manual path exists for exactly two cases the automatic read skips:
+        // battery devices, and "I just changed something at the wall, show me now".
+        return this._call('z2m/device/read_values', { device: this._view.ieee })
+          .then((res) => {
+            this._feedMsg = (res && res.sleeping)
+              ? 'Asked. A battery device answers at its next wake-up.'
+              : 'Asked the device to report its current values.';
+            this._render();
+            setTimeout(() => { this._feedMsg = null; this._render(); }, 4000);
+          })
+          .catch((err) => {
+            this._error = (err && (err.message || err.code)) || 'Could not ask the device';
+            this._render();
+          });
+      }
 
       case 'interview':
         return this._act('z2m/device/interview', { device });

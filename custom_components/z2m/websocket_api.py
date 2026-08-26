@@ -6,12 +6,13 @@ mirroring how the built-in zwave_js panel talks to its integration.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
 import voluptuous as vol
 
-from homeassistant.components import websocket_api
+from homeassistant.components import mqtt, websocket_api
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
@@ -74,6 +75,7 @@ def async_setup_websocket(hass: HomeAssistant) -> None:
         ws_group_member_remove,
         ws_remove,
         ws_set_options,
+        ws_read_values,
         ws_configure,
         ws_interview,
         ws_health_check,
@@ -686,6 +688,81 @@ async def ws_set_options(hass, connection, msg, data) -> None:
         "device/options", {"id": msg["device"], "options": msg["options"]}
     )
     connection.send_result(msg["id"])
+
+
+ACCESS_GET = 4
+
+
+def _gettable_properties(device: dict) -> tuple[list[str], list[str]]:
+    """Split a device's exposed properties into readable and write/report-only.
+
+    Z2M marks each expose with an access bitmask (1 STATE, 2 SET, 4 GET). Only
+    GET-able attributes can be asked for; converter options never can -- their
+    values live in configuration.yaml, not on the device -- which is why this
+    walks `definition.exposes` and ignores `definition.options` entirely.
+    Type exposes (light, switch, climate...) carry their real attributes one
+    level down in `features`.
+    """
+    readable: list[str] = []
+    skipped: list[str] = []
+    def _walk(items: list) -> None:
+        for e in items or []:
+            if not isinstance(e, dict):
+                continue
+            if e.get("features"):
+                _walk(e["features"])
+                continue
+            prop = e.get("property")
+            if not prop:
+                continue
+            if (e.get("access") or 0) & ACCESS_GET:
+                readable.append(prop)
+            else:
+                skipped.append(prop)
+    _walk(((device.get("definition") or {}).get("exposes")) or [])
+    return readable, skipped
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "z2m/device/read_values",
+        vol.Required("device"): str,
+    }
+)
+@websocket_api.async_response
+@_guard
+async def ws_read_values(hass, connection, msg, data) -> None:
+    """Ask the device to report every readable attribute, in one MQTT get.
+
+    Z2M accepts a multi-property payload on `<friendly_name>/get`, so the whole
+    read is one publish and, on the radio, a burst of unicast reads to exactly
+    this device -- cheap for a powered device, and a sleeping battery device
+    simply answers at its next wake-up. Answers come back on the device's state
+    topic, so they land in Home Assistant's entities with no further plumbing.
+    """
+    dev = next(
+        (
+            d
+            for d in data.devices
+            if d.get("ieee_address") == msg["device"]
+            or d.get("friendly_name") == msg["device"]
+        ),
+        None,
+    )
+    if dev is None:
+        raise Z2MError(f"Unknown device {msg['device']}")
+    readable, skipped = _gettable_properties(dev)
+    if readable:
+        topic = f"{data.base_topic}/{dev.get('friendly_name')}/get"
+        await mqtt.async_publish(
+            hass, topic, json.dumps({p: "" for p in readable}), qos=0, retain=False
+        )
+    battery = (dev.get("power_source") or "") == "Battery"
+    connection.send_result(
+        msg["id"],
+        {"requested": readable, "not_readable": skipped, "sleeping": battery},
+    )
 
 
 @websocket_api.require_admin
