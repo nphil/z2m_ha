@@ -11,6 +11,25 @@
  * nothing to show for it. Everything visual uses Home Assistant's own CSS custom
  * properties, so themes and dark mode are inherited rather than reimplemented.
  *
+ * LAYOUT. The mesh is drawn as what it topologically is: a tree with context.
+ * The coordinator is pinned at the world origin; routers hold concentric rings by
+ * routing-tree depth; end devices orbit their parent router like moons. Those
+ * targets come from a deterministic radial-tree pass (stable name ordering, sector
+ * widths by subtree size), and a live force simulation -- repulsion, tree-link
+ * springs, per-tier radial constraints -- runs on top, so the map keeps its
+ * physical feel: nodes are draggable, neighbours give way, everything resettles.
+ * Two opens of the same network look the same, because the seeds and anchors are
+ * pure functions of the topology.
+ *
+ * WORLD vs VIEW. Positions live in world coordinates centred on (0,0) and never
+ * depend on the element's size; the viewport transform fits the world to the
+ * canvas. This is a hard-won rule: an earlier build seeded and fitted against
+ * getBoundingClientRect() at mount time, and a host measured at 0x0 (hidden tab,
+ * mid-layout mount) wedged the view on a corner sliver until a scan finished --
+ * the operator saw a blank canvas for the whole walk, then everything at once.
+ * Now a degenerate rect merely defers the fit until ResizeObserver reports a
+ * real one, and the layout itself is size-independent.
+ *
  * This map is used to decide where to put hardware, so it is built to a rule: never
  * draw a claim the data does not support.
  *   - An end device's parent chain is authoritative. End devices transmit only to
@@ -19,9 +38,12 @@
  *     Those paths are marked inferred.
  *   - A neighbour row with no usable LQI is drawn as unknown, never as zero. A dead
  *     link and an unmeasured one look different, because they mean different things.
+ *   - The routing tree is structure and is drawn plainly. Every other neighbour row
+ *     is context: hidden by default, faint when shown, so it can never bury the
+ *     tree under a hairball.
  */
 
-const STORE_KEY = 'z2m-map-layout-v2';
+const STORE_KEY = 'z2m-map-layout-v3';
 
 // Zigbee neighbour-table relationship codes. Z2M drops rows above 3.
 //
@@ -70,9 +92,6 @@ const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
  */
 const NODE_CLEARANCE = 26;
 
-/** Radius assumed while seeding, before a node knows what it is. */
-const SEED_NODE_RADIUS = 9;
-
 /** Below this width the overlays reflow: HUD stacks, detail becomes a sheet. */
 const NARROW_PX = 600;
 
@@ -98,9 +117,6 @@ const LABEL_CHAR_HALF_WIDTH = 2.9;
  */
 const UNRATED_LQI = 128;
 
-/** Spring rest length: a strong link sits closer to its peer than a weak one. */
-const restLength = (lqi) => 62 + (1 - clamp(lqi ?? UNRATED_LQI, 0, 255) / 255) * 128;
-
 /**
  * Per-hop cost for path finding. The constant term keeps the search honest about hop
  * count: without it, five great links beat one decent direct link, which is not how
@@ -110,7 +126,9 @@ const hopCost = (lqi) => 1 + ((255 - clamp(lqi ?? UNRATED_LQI, 0, 255)) / 255) *
 
 /**
  * Five bands rather than three. When the question is "is this link the problem",
- * the difference between 60 and 110 matters, and a coarse ramp hides it.
+ * the difference between 60 and 110 matters, and a coarse ramp hides it. These
+ * bands colour the WORDS -- hop lists, the detail panel -- where fine grading
+ * helps. The drawn edges use linkTone below, which is deliberately coarser.
  */
 const lqiBand = (lqi) => {
   if (lqi === null || lqi === undefined) return 'unknown';
@@ -119,6 +137,18 @@ const lqiBand = (lqi) => {
   if (lqi >= 70) return 'b3';
   if (lqi >= WEAK_LQI) return 'b2';
   return 'b1';
+};
+
+/**
+ * How an edge is DRAWN. Three steps plus unknown, on purpose: a five-colour ramp
+ * across every line made the canvas read like an alarm panel. Strong and fair are
+ * the same calm ink at different weights; saturated colour is reserved for links
+ * that are genuinely weak (the diagnostic threshold), so red means something.
+ */
+const linkTone = (lqi) => {
+  if (lqi === null || lqi === undefined) return 'unknown';
+  if (lqi < WEAK_LQI) return 'weak';
+  return lqi >= 120 ? 'strong' : 'mid';
 };
 
 const ago = (epochSeconds) => {
@@ -133,6 +163,9 @@ const ago = (epochSeconds) => {
 };
 
 const linkKey = (l) => `${l.source}|${l.target}|${l.relationship}`;
+
+/** One drawn edge per device pair, whichever direction the rows came in. */
+const pairKey = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
 
 function escapeHtml(value) {
   return String(value ?? '').replace(
@@ -181,7 +214,7 @@ class Graph {
     return link.source === ieee ? link.target : link.source;
   }
 
-  /** Hop distance from the coordinator, ignoring quality. Drives the layout rings. */
+  /** Hop distance from the coordinator, ignoring quality. */
   _depths() {
     const depth = new Map();
     if (!this.coordinator || !this.byIeee.has(this.coordinator)) return depth;
@@ -337,20 +370,339 @@ class Graph {
   }
 }
 
-/* ------------------------------------------------------------------- physics */
+/* -------------------------------------------------------------------- layout */
 
-class Simulation {
-  constructor(graph, width, height) {
-    this.graph = graph;
-    this.alpha = 1;
-    this.resize(width, height);
+/**
+ * Radial-tree geometry, in world units. The world is centred on the coordinator
+ * at (0,0); the viewport fits the world to the canvas afterwards, so none of
+ * these depend on the element's size.
+ */
+const RING_BASE = 175; // radius of the first router ring
+const RING_STEP = 150; // spacing between successive router rings
+const ORBIT_BASE = 62; // end devices orbit their parent router at this radius
+const ORBIT_STEP = 36; // extra orbit shells when one router has many children
+const HALO_PAD = 135; // unparented devices sit this far beyond the outer ring
+const RING_SLOT = 2 * (9 + NODE_CLEARANCE); // arc one ringed node needs
+// Arc one orbiting end device needs. Tighter than a ringed node's slot: moon
+// labels compete under _cullLabels anyway, and a wide slot made five moons wrap
+// 260 degrees around their router, colliding with the neighbouring cluster.
+const MOON_SLOT = 44;
+
+/**
+ * Deterministic radial-tree targets: seeds for new nodes and weak anchors for the
+ * live simulation. The coordinator holds the origin; routers get concentric rings
+ * by routing-tree depth, each inside an angular sector sized by its subtree, so
+ * a router's descendants stay in its wedge and edges rarely cross; end devices
+ * orbit their parent router like moons. Unparented end devices form an outer
+ * halo -- during a streamed scan that is every end device, so the reveal reads
+ * as: halo of pending devices, then each router's reply pulls its children in.
+ *
+ * Everything is ordered by (name, ieee), never by Map iteration or arrival
+ * order, so the same fleet always lands the same way.
+ */
+function assignHomes(graph) {
+  const result = { parentOf: new Map() };
+  const nodes = graph.nodes;
+  if (!nodes.length) return result;
+
+  const coordIeee =
+    graph.coordinator && graph.byIeee.has(graph.coordinator) ? graph.coordinator : null;
+  const byName = (a, b) => {
+    const an = String(a.name || a.ieee).toLowerCase();
+    const bn = String(b.name || b.ieee).toLowerCase();
+    if (an !== bn) return an < bn ? -1 : 1;
+    return a.ieee < b.ieee ? -1 : 1;
+  };
+
+  // Effective tree parent: as reported, when it is sane. An end device can never
+  // be a parent, whatever a corrupt neighbour row claims.
+  const parentOf = result.parentOf;
+  for (const node of nodes) {
+    if (node.ieee === coordIeee) continue;
+    const p = graph.parent.get(node.ieee);
+    const pNode = p && p !== node.ieee ? graph.byIeee.get(p) : null;
+    const ok = pNode && (pNode.ieee === coordIeee || pNode.type === 'Router');
+    parentOf.set(node.ieee, ok ? pNode.ieee : null);
+  }
+  // Parent loops occur in real tables. Cut at the first revisited node, which is
+  // deterministic, so a cycle becomes a subtree hanging off ring one.
+  for (const node of nodes) {
+    if (node.ieee === coordIeee) continue;
+    const seen = new Set([node.ieee]);
+    let at = parentOf.get(node.ieee);
+    while (at && at !== coordIeee) {
+      if (seen.has(at)) {
+        parentOf.set(at, null);
+        break;
+      }
+      seen.add(at);
+      at = parentOf.get(at);
+    }
   }
 
-  resize(width, height) {
-    this.width = Math.max(width || 0, 320);
-    this.height = Math.max(height || 0, 240);
-    this.cx = this.width / 2;
-    this.cy = this.height / 2;
+  // Children per parent, stably ordered.
+  const kids = new Map();
+  const rootRouters = [];
+  const halo = [];
+  for (const node of [...nodes].sort(byName)) {
+    if (node.ieee === coordIeee) continue;
+    const p = parentOf.get(node.ieee);
+    if (p) {
+      if (!kids.has(p)) kids.set(p, []);
+      kids.get(p).push(node);
+    } else if (node.type === 'Router') rootRouters.push(node);
+    else halo.push(node);
+  }
+
+  for (const node of nodes) {
+    node._orbit = null;
+    node._orbitR = null;
+    node._ringR = null;
+    node._hx = null;
+    node._hy = null;
+    node._tier = 0;
+    node._kids = (kids.get(node.ieee) || []).length;
+  }
+
+  const coordKids = coordIeee ? kids.get(coordIeee) || [] : [];
+  const coordMoons = coordKids.filter((n) => n.type !== 'Router');
+  const ringOne = [...coordKids.filter((n) => n.type === 'Router'), ...rootRouters].sort(byName);
+
+  const moonsOf = (r) => (kids.get(r.ieee) || []).filter((n) => n.type !== 'Router');
+  const routerKidsOf = (r) => (kids.get(r.ieee) || []).filter((n) => n.type === 'Router');
+
+  /** Orbit shells: greedy fill, growing outward when one shell cannot hold them. */
+  const orbitPlan = (count, base = ORBIT_BASE) => {
+    const shells = [];
+    let left = count;
+    let shell = 0;
+    while (left > 0) {
+      const radius = base + shell * ORBIT_STEP;
+      const cap = Math.max(3, Math.floor((2 * Math.PI * radius) / MOON_SLOT));
+      const take = Math.min(cap, left);
+      shells.push({ radius, cap, take });
+      left -= take;
+      shell += 1;
+    }
+    return shells;
+  };
+  const outerOrbit = (r) => {
+    const shells = orbitPlan(moonsOf(r).length);
+    return shells.length ? shells[shells.length - 1].radius : 0;
+  };
+
+  // Arc a router needs on its ring: its own slot or its whole moon system.
+  const needOf = new Map();
+  const need = (r) => {
+    let v = needOf.get(r.ieee);
+    if (v === undefined) {
+      // The margin absorbs what repulsion adds to the nominal orbit at
+      // equilibrium, so neighbouring moon systems get real breathing room.
+      v = Math.max(RING_SLOT, 2 * (outerOrbit(r) + 40));
+      needOf.set(r.ieee, v);
+    }
+    return v;
+  };
+  // Sector weight: what this router and every router below it need. Conservative
+  // on purpose -- deeper rings have more circumference per radian to spend.
+  const weightOf = new Map();
+  const weight = (r) => {
+    let v = weightOf.get(r.ieee);
+    if (v === undefined) {
+      v = need(r);
+      for (const k of routerKidsOf(r)) v += weight(k);
+      weightOf.set(r.ieee, v);
+    }
+    return v;
+  };
+
+  // Router tiers by tree depth, then ring radii wide enough for each tier's load.
+  const tiers = new Map();
+  {
+    let frontier = ringOne;
+    let depth = 1;
+    while (frontier.length) {
+      tiers.set(depth, frontier);
+      const next = [];
+      for (const r of frontier) next.push(...routerKidsOf(r));
+      frontier = next;
+      depth += 1;
+    }
+  }
+  const maxDepth = tiers.size;
+  const radii = new Map();
+  {
+    let prev = 0;
+    for (let d = 1; d <= maxDepth; d++) {
+      const ringNeed = tiers.get(d).reduce((sum, r) => sum + need(r), 0);
+      const r = Math.max(d === 1 ? RING_BASE : prev + RING_STEP, ringNeed / (2 * Math.PI));
+      radii.set(d, r);
+      prev = r;
+    }
+  }
+
+  /**
+   * Moons sit on an arc centred on the parent's outward direction, so the space
+   * between the router and its own parent stays clear for the tree edge; a full
+   * shell wraps the whole way round.
+   */
+  const placeMoons = (parent, moons, outward, base = ORBIT_BASE) => {
+    if (!moons.length) return;
+    const shells = orbitPlan(moons.length, base);
+    let index = 0;
+    shells.forEach(({ radius, cap, take }, shellIdx) => {
+      const slotAng = MOON_SLOT / radius;
+      const full = take >= cap;
+      const step = full ? (2 * Math.PI) / take : slotAng;
+      const start = full
+        ? outward + shellIdx * 0.45
+        : outward - (slotAng * (take - 1)) / 2 + shellIdx * 0.45;
+      for (let j = 0; j < take; j++, index++) {
+        const moon = moons[index];
+        const ang = start + j * step;
+        const dx = Math.cos(ang) * radius;
+        const dy = Math.sin(ang) * radius;
+        moon._orbit = { parent: parent.ieee, dx, dy };
+        moon._orbitR = radius;
+        moon._hx = (parent._hx || 0) + dx;
+        moon._hy = (parent._hy || 0) + dy;
+        moon._tier = (parent._tier || 0) + 1;
+      }
+    });
+  };
+
+  if (coordIeee) {
+    const c = graph.byIeee.get(coordIeee);
+    c._hx = 0;
+    c._hy = 0;
+    c._tier = 0;
+  }
+
+  const place = (router, depth, a0, a1) => {
+    const angle = (a0 + a1) / 2;
+    const radius = radii.get(depth);
+    router._hx = Math.cos(angle) * radius;
+    router._hy = Math.sin(angle) * radius;
+    router._tier = depth;
+    router._ringR = radius;
+    placeMoons(router, moonsOf(router), angle);
+    const children = routerKidsOf(router);
+    if (!children.length) return;
+    const total = children.reduce((sum, k) => sum + weight(k), 0) || 1;
+    let cursor = a0;
+    for (const child of children) {
+      const span = ((a1 - a0) * weight(child)) / total;
+      place(child, depth + 1, cursor, cursor + span);
+      cursor += span;
+    }
+  };
+  {
+    const total = ringOne.reduce((sum, r) => sum + weight(r), 0) || 1;
+    let cursor = -Math.PI / 2; // first sector opens at twelve o'clock
+    for (const r of ringOne) {
+      const span = (2 * Math.PI * weight(r)) / total;
+      place(r, 1, cursor, cursor + span);
+      cursor += span;
+    }
+  }
+
+  // End devices parented directly by the coordinator orbit it, inside ring one.
+  if (coordMoons.length) {
+    const anchor = coordIeee
+      ? graph.byIeee.get(coordIeee)
+      : { ieee: null, _hx: 0, _hy: 0, _tier: 0 };
+    const base = Math.max(70, Math.min(95, (radii.get(1) || RING_BASE) - 70));
+    placeMoons(anchor, coordMoons, -Math.PI / 2, base);
+  }
+
+  // The halo: devices nothing has claimed yet. Even spread, outermost.
+  if (halo.length) {
+    const base = (radii.get(maxDepth) || RING_BASE * 0.75) + HALO_PAD;
+    let index = 0;
+    let shell = 0;
+    let left = halo.length;
+    while (left > 0) {
+      const radius = base + shell * 78;
+      const cap = Math.max(6, Math.floor((2 * Math.PI * radius) / RING_SLOT));
+      const take = Math.min(cap, left);
+      const start = -Math.PI / 2 + shell * 0.37;
+      for (let j = 0; j < take; j++, index++) {
+        const node = halo[index];
+        const ang = start + (j / take) * 2 * Math.PI;
+        node._hx = Math.cos(ang) * radius;
+        node._hy = Math.sin(ang) * radius;
+        node._tier = maxDepth + 1 + shell;
+        node._ringR = radius;
+      }
+      left -= take;
+      shell += 1;
+    }
+  }
+
+  // Anything the walk somehow missed still gets a deterministic seat.
+  {
+    let strays = 0;
+    for (const node of nodes) {
+      if (node._hx !== null || node.ieee === coordIeee) continue;
+      const radius = (radii.get(maxDepth) || RING_BASE) + HALO_PAD + 160;
+      const ang = -Math.PI / 2 + strays * 0.7;
+      node._hx = Math.cos(ang) * radius;
+      node._hy = Math.sin(ang) * radius;
+      node._tier = maxDepth + 3;
+      node._ringR = radius;
+      strays += 1;
+    }
+  }
+
+  return result;
+}
+
+/**
+ * One drawn edge per device pair: the strongest row wins. A pair on the routing
+ * tree is structure; every other pair is context. Multiple rows between the same
+ * two devices carry no extra geometry, only extra ink, so they are collapsed here
+ * -- the asymmetry diagnostic still reads the raw rows off the Graph.
+ */
+function classifyPairs(graph, parentOf) {
+  const pairs = new Map();
+  const treeKeys = new Set();
+  for (const [ieee, p] of parentOf) if (p) treeKeys.add(pairKey(ieee, p));
+  for (const link of graph.links) {
+    const key = pairKey(link.source, link.target);
+    const cur = pairs.get(key);
+    if (!cur || (link.lqi ?? -1) > (cur.link.lqi ?? -1)) {
+      pairs.set(key, { key, a: link.source, b: link.target, link, tree: treeKeys.has(key) });
+    }
+  }
+  return pairs;
+}
+
+/* ------------------------------------------------------------------- physics */
+
+/**
+ * The live simulation. Repulsion, damping and the separation pass are unchanged
+ * from the original build -- the map keeps its physical feel, and dragging a node
+ * still shoulders its neighbours aside. What changed is what the forces serve:
+ *   - springs exist only for routing-tree edges (context rows draw, they do not
+ *     pull, so an invisible sibling row can never drag a router sideways);
+ *   - each ringed node gets a radial constraint toward its tier's ring, the
+ *     d3-forceRadial shape;
+ *   - a weak anchor pulls every node toward its deterministic slot, which keeps
+ *     ring neighbours from swapping and two opens looking the same. A moon's
+ *     anchor tracks its parent's LIVE position, so dragging a router carries its
+ *     children with it.
+ * There is no canvas clamp: the world is unbounded and the view fits it.
+ */
+class Simulation {
+  constructor(graph) {
+    this.graph = graph;
+    this.alpha = 1;
+    this.springs = [];
+  }
+
+  /** Structural springs, assigned with the layout pass. */
+  setStructure(springs) {
+    this.springs = springs;
   }
 
   reheat(to = 0.7) {
@@ -383,27 +735,18 @@ class Simulation {
         a.vy -= fy;
         b.vx += fx;
         b.vy += fy;
-
-        // Soft repulsion only. The hard separation used to live here, BEFORE the
-        // springs and centering were integrated, so the very next lines could push
-        // two nodes straight back on top of each other -- which is what made a
-        // dense first paint overlap and flicker. It now runs after integration.
       }
     }
 
-    for (const link of this.graph.links) {
-      const a = this.graph.byIeee.get(link.source);
-      const b = this.graph.byIeee.get(link.target);
+    // Tree springs only: the structure pulls, the context never does.
+    for (const s of this.springs) {
+      const a = this.graph.byIeee.get(s.a);
+      const b = this.graph.byIeee.get(s.b);
+      if (!a || !b) continue;
       const dx = b.x - a.x;
       const dy = b.y - a.y;
       const d = Math.sqrt(dx * dx + dy * dy) || 0.01;
-      const rest = restLength(link.lqi);
-      // Parent/child links describe real structure, so they pull harder than a
-      // sibling row. That makes the drawn hierarchy match the actual one.
-      const structural = link.relationship === REL_CHILD || link.relationship === REL_PARENT;
-      const stiffness =
-        (structural ? 0.05 : 0.012) + (clamp(link.lqi ?? 0, 0, 255) / 255) * 0.03;
-      const push = (d - rest) * stiffness;
+      const push = (d - s.rest) * s.k;
       const fx = (dx / d) * push;
       const fy = (dy / d) * push;
       a.vx += fx;
@@ -413,10 +756,36 @@ class Simulation {
     }
 
     for (const node of nodes) {
-      const isCoord = node.ieee === this.graph.coordinator;
-      const pull = isCoord ? 0.07 : 0.006;
-      node.vx += (this.cx - node.x) * pull;
-      node.vy += (this.cy - node.y) * pull;
+      // The coordinator holds the origin: firm enough to anchor the map, soft
+      // enough that a drag still feels physical and it glides back on release.
+      if (node.ieee === this.graph.coordinator) {
+        node.vx -= node.x * 0.12;
+        node.vy -= node.y * 0.12;
+        continue;
+      }
+      // Tier discipline: routers hold their ring, halo devices hold the halo.
+      if (node._ringR != null) {
+        const r = Math.hypot(node.x, node.y) || 1;
+        const f = (node._ringR - r) * 0.1;
+        node.vx += (node.x / r) * f;
+        node.vy += (node.y / r) * f;
+      }
+      // Weak anchor toward the deterministic slot. For moons the anchor rides the
+      // parent's live position, so the family moves as one.
+      let hx = node._hx;
+      let hy = node._hy;
+      if (node._orbit) {
+        const p = this.graph.byIeee.get(node._orbit.parent);
+        if (p) {
+          hx = p.x + node._orbit.dx;
+          hy = p.y + node._orbit.dy;
+        }
+      }
+      if (hx !== null && hx !== undefined) {
+        const k = node._orbit ? 0.03 : 0.012;
+        node.vx += (hx - node.x) * k;
+        node.vy += (hy - node.y) * k;
+      }
     }
 
     let moved = 0;
@@ -437,9 +806,6 @@ class Simulation {
       const dy = node.vy * alpha;
       node.x += dx;
       node.y += dy;
-      const pad = (node._r || 8) + 14;
-      node.x = clamp(node.x, pad, this.width - pad);
-      node.y = clamp(node.y, pad, this.height - pad);
       moved += Math.abs(dx) + Math.abs(dy);
     }
 
@@ -468,9 +834,8 @@ class Simulation {
           let dy = b.y - a.y;
           let d = Math.sqrt(dx * dx + dy * dy);
           if (d === 0) {
-            // Perfectly co-located, which is exactly what a streamed start
-            // produces before any link arrives. Deterministic nudge, so the same
-            // fleet always lands the same way.
+            // Perfectly co-located. Deterministic nudge, so the same fleet always
+            // lands the same way.
             dx = ((i % 7) - 3) * 0.7 + 0.35;
             dy = ((j % 5) - 2) * 0.7 + 0.35;
             d = Math.sqrt(dx * dx + dy * dy) || 1;
@@ -495,11 +860,6 @@ class Simulation {
         }
       }
     }
-    for (const node of nodes) {
-      const pad = (node._r || 8) + 14;
-      node.x = clamp(node.x, pad, this.width - pad);
-      node.y = clamp(node.y, pad, this.height - pad);
-    }
   }
 }
 
@@ -515,7 +875,9 @@ class Z2MNetworkMap extends HTMLElement {
     this._hass = null;
     this._diagnostics = true;
     this._reveal = false;
-    this._showPeers = true;
+    // Context links are hidden until asked for: the routing tree is the map, the
+    // rest of the neighbour rows are the reason the old map looked like string art.
+    this._showPeers = false;
     this._frozen = false;
     this._query = '';
     this._matches = null;
@@ -523,12 +885,16 @@ class Z2MNetworkMap extends HTMLElement {
     this._hovered = null;
     this._scan = { generated: null, scanning: false, phase: null, done: 0, total: 0 };
     this._view = { x: 0, y: 0, k: 1 };
+    this._viewAnim = null;
+    this._needsFit = false;
     this._raf = null;
     this._nodeEls = new Map();
     this._linkEls = new Map();
     this._pos = new Map();
     this._pulses = [];
     this._live = null;
+    this._probed = null;
+    this._parentOf = new Map();
     this._reduceMotion =
       window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     this._onResize = () => this._resize();
@@ -540,9 +906,16 @@ class Z2MNetworkMap extends HTMLElement {
 
   set topology(value) {
     this._topology = value;
-    this._live = value ? { ...value, links: [...(value.links || [])] } : null;
+    // Copies all the way down to the node objects: the graph annotates nodes as it
+    // works (positions, failure flags), and the caller's array is its cache.
+    this._live = value
+      ? { ...value, nodes: (value.nodes || []).map((n) => ({ ...n })), links: [...(value.links || [])] }
+      : null;
     if (value?.generated) this._scan.generated = value.generated;
-    if (this.isConnected) this._sync({ animate: this._reveal });
+    if (this.isConnected) {
+      this._sync({ animate: this._reveal });
+      if (!this._userMoved) this._fit();
+    }
     this._reveal = false;
   }
 
@@ -552,7 +925,7 @@ class Z2MNetworkMap extends HTMLElement {
 
   set diagnostics(value) {
     this._diagnostics = !!value;
-    if (this.isConnected && this._graph) this._sync({ animate: false });
+    if (this.isConnected && this._graph) this._sync({ animate: false, heat: 0.2 });
   }
 
   set reveal(value) {
@@ -569,14 +942,18 @@ class Z2MNetworkMap extends HTMLElement {
     window.addEventListener('resize', this._onResize);
     // A window resize is not the only way this element changes size: as a Lovelace
     // card it resizes when the dashboard column does, and in the panel when the
-    // sidebar collapses. Without this the simulation keeps its old bounds and the
-    // layout is clamped to a viewport that no longer exists.
+    // sidebar collapses. It is also how a host that measured 0x0 at mount reports
+    // its real size, which is what un-defers a deferred fit.
     if (typeof ResizeObserver === 'function') {
       this._observer = new ResizeObserver(() => this._resize());
       this._observer.observe(this);
     }
     this._loadLayout();
-    if (this._live) this._sync({ animate: false });
+    if (this._live) {
+      // Everything streamed while detached is already in _live; draw it now.
+      this._sync({ animate: false });
+      if (!this._userMoved) this._fit();
+    }
     this._renderHud();
   }
 
@@ -594,13 +971,26 @@ class Z2MNetworkMap extends HTMLElement {
    * Consume one event from a streaming scan.
    *
    * The point of streaming: `start` puts every device on screen before any radio
-   * traffic, then each `device` event attaches that device's links, and the
-   * simulation pulls the children into place. Nothing ever says "please wait".
+   * traffic -- coordinator centred, routers ringed, end devices in a pending halo
+   * -- then each `device` event attaches that device's links and its children
+   * glide to their orbits. Nothing ever says "please wait".
+   *
+   * State is ingested UNCONDITIONALLY. An earlier build returned early when the
+   * element happened to be detached (the panel re-hosts it across renders), which
+   * silently discarded streamed events; a lost `start` meant every later `device`
+   * event was dropped too and the canvas stayed blank until `done` popped the
+   * whole graph in at once. Now only the DRAWING is deferred: connectedCallback
+   * syncs whatever arrived while detached.
    */
   applyScanEvent(event) {
-    if (!event || !this.isConnected) return;
+    if (!event) return;
     if (event.phase === 'start') {
-      this._live = { coordinator: event.coordinator, nodes: event.nodes || [], links: [] };
+      this._live = {
+        coordinator: event.coordinator,
+        nodes: (event.nodes || []).map((n) => ({ ...n })),
+        links: [],
+      };
+      this._probed = new Set();
       this._scan = {
         ...this._scan,
         scanning: true,
@@ -608,32 +998,49 @@ class Z2MNetworkMap extends HTMLElement {
         done: 0,
         total: event.total || 0,
       };
-      this._sync({ animate: true });
+      this._syncNow({ animate: true, heat: 0.85, fit: 'initial' });
     } else if (event.phase === 'device') {
       if (!this._live) return;
       this._scan = { ...this._scan, done: this._scan.done + 1, phase: 'device' };
+      if (event.ieee) this._probed?.add(event.ieee);
       if (event.ok && event.links?.length) {
         const known = new Set(this._live.links.map(linkKey));
         for (const l of event.links) if (!known.has(linkKey(l))) this._live.links.push(l);
-        this._sync({ animate: true });
+        // Modest heat: the new links re-home only the devices they name, so the
+        // rest of the graph must not jump.
+        this._syncNow({ animate: true, heat: 0.3 });
       } else if (!event.ok) {
         const node = this._live.nodes.find((n) => n.ieee === event.ieee);
         if (node) node.failed = [...(node.failed || []), event.error || 'no reply'];
-        this._sync({ animate: false });
+        this._syncNow({ animate: false, heat: 0.15 });
+      } else {
+        // Probed clean but reported nothing new: still stops being "pending".
+        this._syncNow({ animate: false, heat: 0.1 });
       }
     } else if (event.phase === 'done') {
       this._scan = { ...this._scan, scanning: false, phase: 'done', generated: event.generated };
       this._topology = event;
-      this._live = { ...event, links: [...(event.links || [])] };
-      this._sync({ animate: true });
-      // The layout moves a long way between "ring of unconnected devices" and the
-      // settled mesh, so refit once at the end -- unless the operator has zoomed or
-      // panned, in which case their view is theirs.
-      if (!this._userMoved) setTimeout(() => this._fit(), 900);
+      this._live = {
+        ...event,
+        nodes: (event.nodes || []).map((n) => ({ ...n })),
+        links: [...(event.links || [])],
+      };
+      // Reconciled by ieee inside _sync: positions carry over and glide, nothing
+      // teleports. The view refit is animated for the same reason.
+      this._syncNow({ animate: true, heat: 0.5, fit: 'settle' });
     } else if (event.phase === 'error') {
       this._scan = { ...this._scan, scanning: false, phase: 'error' };
+      if (this._live) this._syncNow({ animate: false, heat: 0 });
     }
-    this._renderHud();
+    if (this._statusEl) this._renderHud();
+  }
+
+  /** Draw if attached; otherwise the state waits for connectedCallback. */
+  _syncNow({ fit, ...opts }) {
+    if (!this.isConnected) return;
+    this._sync(opts);
+    if (fit === 'initial' && !this._userMoved) this._fit();
+    else if (fit === 'settle' && !this._userMoved) this._fit({ animate: true });
   }
 
   /* ---------------------------------------------------------------- markup */
@@ -649,20 +1056,25 @@ class Z2MNetworkMap extends HTMLElement {
       .stage.panning { cursor:grabbing; }
       svg { display:block; width:100%; height:100%; }
 
-      /* Five LQI bands: at troubleshooting time the gap between 60 and 110 matters. */
-      .link { stroke-width:1.6; fill:none; transition:opacity .18s ease; }
-      .link.b5 { stroke:var(--success-color, #4caf50); opacity:.6; }
-      .link.b4 { stroke:#7cb342; opacity:.55; }
-      .link.b3 { stroke:var(--warning-color, #ff9800); opacity:.55; }
-      .link.b2 { stroke:#ef6c00; opacity:.55; }
-      .link.b1 { stroke:var(--error-color, #f44336); opacity:.6; }
-      .link.unknown { stroke:var(--disabled-text-color, #bdbdbd);
-                      stroke-dasharray:1 5; opacity:.5; }
-      .link.peer { stroke-dasharray:3 4; opacity:.22; }
-      .link.dim { opacity:.1; }
+      /* Edge hierarchy. The routing tree is structure: plain ink, weight by
+         quality, red reserved for genuinely weak links. Everything else is
+         context: hidden by default, faint when shown, never louder than the
+         tree. This is what keeps forty-five devices from becoming string art. */
+      .link { fill:none; stroke-linecap:round; transition:opacity .18s ease; }
+      .link.tree { stroke:var(--primary-text-color, #212121); }
+      .link.tree.strong { stroke-width:1.8; opacity:.5; }
+      .link.tree.mid { stroke-width:1.4; opacity:.3; }
+      .link.tree.weak { stroke:var(--error-color, #f44336); stroke-width:2.4;
+                        opacity:.85; }
+      .link.tree.unknown { stroke:var(--disabled-text-color, #bdbdbd);
+                           stroke-width:1.4; stroke-dasharray:2 5; opacity:.55; }
+      .link.peer { stroke:var(--secondary-text-color, #727272); stroke-width:1;
+                   stroke-dasharray:3 4; opacity:.16; }
+      .link.dim { opacity:.06; }
       .link.route { stroke:var(--primary-color, #03a9f4); stroke-width:3.4;
                     opacity:1; stroke-linecap:round; stroke-dasharray:none; }
-      svg.hide-peers .link.peer { display:none; }
+      /* A traced route may ride a context row; the trace always wins the toggle. */
+      svg.hide-peers .link.peer:not(.route) { display:none; }
 
       .node { cursor:pointer; }
       .halo { fill:none; stroke:var(--primary-color,#03a9f4); stroke-width:2.5;
@@ -670,12 +1082,17 @@ class Z2MNetworkMap extends HTMLElement {
       .node.on-route .halo, .node.selected .halo, .node.match .halo { opacity:1; }
       .node.match .halo { stroke:var(--accent-color, #ff9800); }
       .body { stroke:var(--card-background-color,#fff); stroke-width:2; }
+      .core { fill:var(--card-background-color,#fff); pointer-events:none; }
       .node.coordinator .body { fill:var(--primary-color, #03a9f4); }
       .node.router .body { fill:var(--state-icon-color, #44739e); }
       .node.enddevice .body { fill:var(--secondary-text-color, #727272); }
       .node.offline .body { fill:var(--card-background-color,#fff);
                             stroke:var(--error-color,#f44336);
                             stroke-dasharray:3 3; }
+      /* Not heard from in THIS scan yet: present, placed, and visibly waiting.
+         This is the progressive-reveal state, never a spinner. */
+      .node.pending { opacity:.35; }
+      .node.pending text.label { fill:var(--disabled-text-color, #bdbdbd); }
       /* Dimmed context stays readable. Fading it away made one route obvious but
          destroyed the shape of the mesh around it, which is why you opened the map. */
       .node.dim { opacity:.3; }
@@ -696,7 +1113,8 @@ class Z2MNetworkMap extends HTMLElement {
       /* Every device is named, including battery end devices: the map is used to
          find a specific device, and an unlabelled dot cannot be found. They are
          quieter than a router's name rather than hidden, and any label that would
-         collide with another is dropped -- see _cullLabels. */
+         collide with another is dropped -- see _cullLabels. The coordinator and
+         routers are never dropped. */
       .node.enddevice text.label { font-size:var(--ha-font-size-xs, 10px);
                    fill:var(--secondary-text-color, #727272); }
       .node.crowded text.label { display:none; }
@@ -750,6 +1168,11 @@ class Z2MNetworkMap extends HTMLElement {
                 padding:4px 8px; max-width:calc(100% - 16px); }
       .legend i { display:inline-block; width:13px; height:3px; border-radius:2px;
                   margin-right:3px; vertical-align:middle; }
+      .legend i.ln-strong { background:var(--primary-text-color,#212121); opacity:.55; }
+      .legend i.ln-mid { background:var(--primary-text-color,#212121); opacity:.28; }
+      .legend i.ln-weak { background:var(--error-color,#f44336); }
+      .legend i.ln-unknown { background:repeating-linear-gradient(90deg,
+                  var(--disabled-text-color,#bdbdbd) 0 3px, transparent 3px 6px); }
       .legend b { font-weight:500; color:var(--primary-text-color,#212121); }
 
       /* Desktop and tablet: parked bottom-right, opposite the legend, so it never
@@ -829,10 +1252,13 @@ class Z2MNetworkMap extends HTMLElement {
 
     const svg = svgEl('svg');
     const viewport = svgEl('g', { class: 'viewport' });
+    // Paint order bottom-up: context links, tree links, pulses, nodes. The tree
+    // must sit above the context so structure is never buried under it.
+    this._gPeers = svgEl('g', { class: 'peers' });
     this._gLinks = svgEl('g', { class: 'links' });
     this._gPulses = svgEl('g', { class: 'pulses' });
     this._gNodes = svgEl('g', { class: 'nodes' });
-    viewport.append(this._gLinks, this._gPulses, this._gNodes);
+    viewport.append(this._gPeers, this._gLinks, this._gPulses, this._gNodes);
     svg.append(viewport);
 
     const hudLeft = document.createElement('div');
@@ -850,7 +1276,7 @@ class Z2MNetworkMap extends HTMLElement {
       `<button class="tool" data-act="zoom-in" title="Zoom in">${this._icon(ICON.zoomIn)}</button>` +
       `<button class="tool" data-act="zoom-out" title="Zoom out">${this._icon(ICON.zoomOut)}</button>` +
       `<button class="tool" data-act="fit" title="Fit">${this._icon(ICON.fit)}</button>` +
-      `<button class="tool" data-act="peers" aria-pressed="true" title="Show neighbour links">${this._icon(ICON.peers)}</button>` +
+      `<button class="tool" data-act="peers" aria-pressed="false" title="Show neighbour links">${this._icon(ICON.peers)}</button>` +
       `<button class="tool" data-act="freeze" aria-pressed="true" title="Pause layout">${this._icon(ICON.pause)}</button>`;
 
     const legend = document.createElement('div');
@@ -906,8 +1332,12 @@ class Z2MNetworkMap extends HTMLElement {
   /* ------------------------------------------------------------ reconciling */
 
   _radius(node) {
-    if (node.ieee === this._graph.coordinator) return 13;
-    return node.type === 'Router' ? 9 : 6.5;
+    if (node.ieee === this._graph.coordinator) return 14;
+    if (node.type === 'Router') {
+      // A busy router is a bigger landmark. Capped: size is a hint, not a chart.
+      return 8.5 + Math.min(3, (node._kids || 0) * 0.35);
+    }
+    return 5.5;
   }
 
   _rank(node) {
@@ -920,9 +1350,10 @@ class Z2MNetworkMap extends HTMLElement {
    *
    * Rebuilding wholesale on every streamed device event would restart the physics
    * and throw away the operator's selection, so nodes and links are diffed by
-   * identity and only genuinely new ones animate in.
+   * identity and only genuinely new ones animate in. Positions carry over by ieee;
+   * layout targets are recomputed and the simulation glides everyone there.
    */
-  _sync({ animate }) {
+  _sync({ animate, heat } = {}) {
     if (!this._live) return;
     for (const node of this._graph?.nodes || []) {
       this._pos.set(node.ieee, { x: node.x, y: node.y, pinned: node.pinned });
@@ -937,40 +1368,81 @@ class Z2MNetworkMap extends HTMLElement {
       return;
     }
 
-    const rect = this._stage.getBoundingClientRect();
-    if (!this._sim) this._sim = new Simulation(this._graph, rect.width, rect.height);
-    else {
-      this._sim.graph = this._graph;
-      this._sim.resize(rect.width, rect.height);
+    if (!this._sim) this._sim = new Simulation(this._graph);
+    else this._sim.graph = this._graph;
+
+    // Deterministic radial-tree targets; the live forces do the rest.
+    const layout = assignHomes(this._graph);
+    this._parentOf = layout.parentOf;
+    const pairs = classifyPairs(this._graph, layout.parentOf);
+
+    // Keep known positions, seat new nodes straight on their layout slot.
+    for (const node of this._graph.nodes) {
+      const saved = this._pos.get(node.ieee);
+      if (saved && Number.isFinite(saved.x)) {
+        node.x = saved.x;
+        node.y = saved.y;
+        node.pinned = !!saved.pinned;
+      } else {
+        node.x = node._hx ?? 0;
+        node.y = node._hy ?? 0;
+        node.pinned = false;
+      }
+      node.vx = node.vx || 0;
+      node.vy = node.vy || 0;
+      node.dragging = false;
     }
-    this._seedPositions();
+
+    // Structural springs: tree edges only. Moons rest at their orbit, routers at
+    // their ring gap, so the springs and the radial constraints agree.
+    const springs = [];
+    for (const [, pair] of pairs) {
+      if (!pair.tree) continue;
+      const a = this._graph.byIeee.get(pair.a);
+      const b = this._graph.byIeee.get(pair.b);
+      if (!a || !b) continue;
+      const child = this._parentOf.get(a.ieee) === b.ieee ? a : b;
+      const parent = child === a ? b : a;
+      const rest = child._orbitR || Math.max(90, (child._ringR || 0) - (parent._ringR || 0));
+      // Moons are sprung harder: repulsion would otherwise balloon the orbit and
+      // blur which router a device belongs to. Trunk links stay soft; the radial
+      // constraint owns ring placement.
+      springs.push({ a: pair.a, b: pair.b, rest, k: child._orbitR ? 0.09 : 0.05 });
+    }
+    this._sim.setStructure(springs);
+
     this._choke = new Map(this._graph.chokePoints().map((c) => [c.ieee, c.stranded]));
 
     const now = performance.now();
     const wantAnimate = animate && !this._reduceMotion;
+    const scanning = !!this._scan.scanning;
 
-    // Links
-    const seenLinks = new Set();
-    for (const link of this._graph.links) {
-      const key = linkKey(link);
-      seenLinks.add(key);
+    // Links: one element per device pair, tree above context.
+    const seenPairs = new Set();
+    for (const [key, pair] of pairs) {
+      seenPairs.add(key);
       let entry = this._linkEls.get(key);
       if (!entry) {
-        const el = svgEl('line', { class: 'link' });
-        entry = { el, appear: wantAnimate ? now : 0 };
+        entry = { el: svgEl('line', { class: 'link' }), appear: wantAnimate ? Math.max(1, now) : 0 };
         this._linkEls.set(key, entry);
-        this._gLinks.append(el);
       }
-      entry.link = link;
-      const cls = ['link', lqiBand(link.lqi)];
-      // Only parent/child rows describe the tree. Sibling and "none" rows are
-      // neighbours the device is not parented through, so they are drawn faint;
-      // solid would read as structure that is not there.
-      if (link.relationship >= REL_SIBLING) cls.push('peer');
-      entry.el.setAttribute('class', cls.join(' '));
+      entry.link = pair.link;
+      entry.a = pair.a;
+      entry.b = pair.b;
+      entry.el.setAttribute('class', `link ${pair.tree ? 'tree' : 'peer'} ${linkTone(pair.link.lqi)}`);
+      const host = pair.tree ? this._gLinks : this._gPeers;
+      if (entry.el.parentNode !== host) host.append(entry.el);
+      // Stamp endpoints immediately: the first paint after a streamed event must
+      // already show the attachment, not wait for a later frame.
+      const a = this._graph.byIeee.get(pair.a);
+      const b = this._graph.byIeee.get(pair.b);
+      entry.el.setAttribute('x1', a.x.toFixed(1));
+      entry.el.setAttribute('y1', a.y.toFixed(1));
+      entry.el.setAttribute('x2', b.x.toFixed(1));
+      entry.el.setAttribute('y2', b.y.toFixed(1));
     }
     for (const [key, entry] of [...this._linkEls]) {
-      if (!seenLinks.has(key)) {
+      if (!seenPairs.has(key)) {
         entry.el.remove();
         this._linkEls.delete(key);
       }
@@ -979,14 +1451,9 @@ class Z2MNetworkMap extends HTMLElement {
     // Nodes, painted so routers and the coordinator sit above end devices.
     const ordered = [...this._graph.nodes].sort((a, b) => this._rank(a) - this._rank(b));
     const seenNodes = new Set();
-    const perDepth = new Map();
     for (const node of ordered) {
       seenNodes.add(node.ieee);
       node._r = this._radius(node);
-      const depth = this._graph.depth.get(node.ieee) ?? 3;
-      const idx = perDepth.get(depth) || 0;
-      perDepth.set(depth, idx + 1);
-      node._revealIndex = idx;
 
       let els = this._nodeEls.get(node.ieee);
       if (!els) {
@@ -995,21 +1462,39 @@ class Z2MNetworkMap extends HTMLElement {
         // No dependency ring: it read as a fault on healthy hardware.
         const warn = svgEl('circle', { class: 'warn-ring' });
         const body = svgEl('circle', { class: 'body' });
+        const core = svgEl('circle', { class: 'core', r: 0 });
         const pin = svgEl('circle', { class: 'pin-dot', r: 1.8 });
         const label = svgEl('text', { class: 'label' });
-        g.append(halo, warn, body, pin, label);
+        g.append(halo, warn, body, core, pin, label);
         g.dataset.ieee = node.ieee;
         // Reachable and operable from the keyboard, not just the mouse.
         g.setAttribute('role', 'button');
         g.setAttribute('tabindex', '0');
-        els = { g, body, halo, warn, pin, label, appear: wantAnimate ? now : 0 };
+        // The reveal ripples outward by tier: coordinator, rings, moons, halo.
+        els = {
+          g,
+          body,
+          core,
+          halo,
+          warn,
+          pin,
+          label,
+          // max(1, ...): zero is the "not animating" sentinel, and a clock that
+          // reads exactly 0 must not silently skip the coordinator's reveal.
+          appear: wantAnimate ? Math.max(1, now + Math.min(480, (node._tier || 0) * 90)) : 0,
+        };
         this._nodeEls.set(node.ieee, els);
         this._gNodes.append(g);
+        // Stamp the position now: a node must be at its seat on the very first
+        // paint, even if the animation loop has not run yet.
+        g.setAttribute('transform', `translate(${node.x.toFixed(1)} ${node.y.toFixed(1)})`);
+        if (els.appear) g.style.opacity = '0';
       }
       els.node = node;
       els.halo.setAttribute('r', node._r + 5);
       els.warn.setAttribute('r', node._r + 3);
       els.body.setAttribute('r', node._r);
+      els.core.setAttribute('r', node.ieee === this._graph.coordinator ? 4 : 0);
       els.pin.setAttribute('cy', -node._r - 6);
       els.label.setAttribute('y', node._r + 13);
       // Truncated for the canvas only. The full name stays on the group's
@@ -1024,9 +1509,16 @@ class Z2MNetworkMap extends HTMLElement {
           : node.type === 'Router'
             ? 'router'
             : 'enddevice';
+      // "Pending" is a statement about THIS scan: the device is known and seated,
+      // but no reply has mentioned it yet.
+      const pending =
+        scanning &&
+        node.ieee !== this._graph.coordinator &&
+        !this._probed?.has(node.ieee) &&
+        !(this._graph.adj.get(node.ieee) || []).length;
       els.g.setAttribute(
         'class',
-        `node ${kind}${node.availability === 'offline' ? ' offline' : ''}`
+        `node ${kind}${node.availability === 'offline' ? ' offline' : ''}${pending ? ' pending' : ''}`
       );
       els.warn.style.display = this._diagnostics && node.failed?.length ? '' : 'none';
     }
@@ -1040,96 +1532,8 @@ class Z2MNetworkMap extends HTMLElement {
     this._renderLegend();
     this._applySearch(this._query, { silent: true });
     // _applySearch already reapplied emphasis, which covers the selection.
-    if (this._firstFit !== true) {
-      this._firstFit = true;
-      this._fit();
-    }
-    this._sim.reheat(wantAnimate ? 0.9 : 0.5);
+    this._sim.reheat(heat ?? (wantAnimate ? 0.85 : 0.5));
     this._startLoop();
-  }
-
-  /**
-   * Place new nodes on their hop ring; keep known positions stable.
-   *
-   * The depth fallback matters more than it looks. A streamed scan creates every
-   * device before a single link exists, so every one of them has no depth and used
-   * to land on ONE ring: 40 devices on a circle whose circumference cannot hold
-   * them, overlapping until the springs sorted it out. Nodes with no depth are
-   * therefore spread across as many concentric rings as they need, each ring
-   * holding only what fits at the clearance the renderer actually draws.
-   */
-  _seedPositions() {
-    const byDepth = new Map();
-    for (const node of this._graph.nodes) {
-      // `null` rather than 3: "not known yet" and "three hops out" are different
-      // things, and only the first one needs spreading.
-      const d = this._graph.depth.get(node.ieee) ?? null;
-      if (!byDepth.has(d)) byDepth.set(d, []);
-      byDepth.get(d).push(node);
-    }
-    const depths = [...byDepth.keys()].filter((d) => d !== null);
-    const maxDepth = Math.max(1, ...depths);
-    const span = Math.min(this._sim.width, this._sim.height) / 2 - 70;
-
-    for (const [depth, group] of byDepth) {
-      const rings = depth === null ? this._ringsFor(group.length, span) : null;
-      let placed = 0;
-      let ring = 0;
-      group.forEach((node, i) => {
-        const saved = this._pos.get(node.ieee);
-        if (saved && Number.isFinite(saved.x)) {
-          node.x = saved.x;
-          node.y = saved.y;
-          node.pinned = !!saved.pinned;
-        } else if (rings) {
-          while (ring < rings.length - 1 && placed >= rings[ring].capacity) {
-            placed = 0;
-            ring += 1;
-          }
-          const { radius, capacity } = rings[ring];
-          // Offset every other ring by half a slot so radial spokes do not line
-          // up and read as one thick line.
-          const angle =
-            ((placed + (ring % 2) * 0.5) / Math.max(capacity, 1)) * Math.PI * 2 + ring * 0.3;
-          node.x = this._sim.cx + Math.cos(angle) * radius;
-          node.y = this._sim.cy + Math.sin(angle) * radius;
-          node.pinned = false;
-          placed += 1;
-        } else {
-          const radius = depth === 0 ? 0 : (span * Math.max(depth, 1)) / maxDepth;
-          const angle = (i / Math.max(group.length, 1)) * Math.PI * 2 + depth * 0.7;
-          node.x = this._sim.cx + Math.cos(angle) * radius;
-          node.y = this._sim.cy + Math.sin(angle) * radius;
-          node.pinned = false;
-        }
-        node.vx = node.vx || 0;
-        node.vy = node.vy || 0;
-        node.dragging = false;
-      });
-    }
-  }
-
-  /**
-   * Concentric rings that can actually hold `count` nodes at drawing clearance.
-   * Capacity is geometry, not a guess: a ring of radius r fits its circumference
-   * divided by the space one node needs.
-   */
-  _ringsFor(count, span) {
-    const slot = 2 * (SEED_NODE_RADIUS + NODE_CLEARANCE);
-    const rings = [];
-    let remaining = count;
-    let index = 1;
-    while (remaining > 0) {
-      // Rings step outward by one slot, and stop growing past the canvas: beyond
-      // that the fit transform shrinks everything anyway.
-      const radius = Math.min(index * slot, Math.max(span, slot));
-      const capacity = Math.max(1, Math.floor((2 * Math.PI * radius) / slot));
-      rings.push({ radius, capacity });
-      remaining -= capacity;
-      index += 1;
-      if (index > 64) break; // no fleet is this big; never spin
-    }
-    return rings;
   }
 
   _loadLayout() {
@@ -1175,12 +1579,13 @@ class Z2MNetworkMap extends HTMLElement {
     const asym = this._graph.asymmetric().length;
     const failed = this._graph.nodes.filter((n) => n.failed?.length).length;
 
+    // Three tones and unknown, matching the drawn edges. The words carry the
+    // diagnostics; the lines stay calm.
     const bits = [
-      `<span><i style="background:var(--success-color,#4caf50)"></i>200+</span>`,
-      `<span><i style="background:#7cb342"></i>120+</span>`,
-      `<span><i style="background:var(--warning-color,#ff9800)"></i>70+</span>`,
-      `<span><i style="background:#ef6c00"></i>45+</span>`,
-      `<span><i style="background:var(--error-color,#f44336)"></i>&lt;45</span>`,
+      `<span><i class="ln-strong"></i>good</span>`,
+      `<span><i class="ln-mid"></i>fair</span>`,
+      `<span><i class="ln-weak"></i>weak</span>`,
+      `<span><i class="ln-unknown"></i>unmeasured</span>`,
     ];
     if (this._diagnostics) {
       if (weak) bits.push(`<span><b>${weak}</b> weak</span>`);
@@ -1227,14 +1632,13 @@ class Z2MNetworkMap extends HTMLElement {
    */
   _applyEmphasis() {
     const onRoute = new Set();
-    const routeLinks = new Set();
+    const routePairs = new Set();
     if (this._selected && this._route) {
       onRoute.add(this._selected);
       for (const hop of this._route.hops) {
         onRoute.add(hop.from);
         onRoute.add(hop.to);
-        const link = this._graph.linkBetween(hop.from, hop.to);
-        if (link) routeLinks.add(linkKey(link));
+        routePairs.add(pairKey(hop.from, hop.to));
       }
     }
     const narrowed = !!this._selected || !!this._matches;
@@ -1252,7 +1656,7 @@ class Z2MNetworkMap extends HTMLElement {
       els.g.classList.toggle('selected', node.ieee === this._selected);
     }
     for (const [key, entry] of this._linkEls) {
-      const isRoute = routeLinks.has(key);
+      const isRoute = routePairs.has(key);
       entry.el.classList.toggle('route', isRoute);
       entry.el.classList.toggle('dim', narrowed && !isRoute);
     }
@@ -1265,7 +1669,8 @@ class Z2MNetworkMap extends HTMLElement {
    * overlap. The old answer was to hide EVERY end device's name, which made the
    * common task -- find this specific sensor -- impossible. This hides a name only
    * when its own box overlaps a box already kept, in a fixed priority order, so the
-   * result is stable rather than flickering between frames.
+   * result is stable rather than flickering between frames. The coordinator and
+   * routers are structural landmarks and are never dropped.
    *
    * Cheap and deliberately not per-frame: it runs when the layout settles, on
    * selection, search, zoom and resize.
@@ -1273,8 +1678,8 @@ class Z2MNetworkMap extends HTMLElement {
   _cullLabels() {
     if (!this._graph) return;
     const scale = this._view.k || 1;
-    // Priority: the coordinator, then routers, then anything the operator is
-    // currently interested in, then the rest by a stable key.
+    // Priority: whatever the operator is interested in, then the landmarks, then
+    // the rest by a stable key.
     const priority = (node) => {
       if (node.ieee === this._selected || node.ieee === this._hovered) return 0;
       if (this._matches?.has(node.ieee)) return 1;
@@ -1297,7 +1702,9 @@ class Z2MNetworkMap extends HTMLElement {
       const cx = node.x * scale;
       const cy = (node.y + node._r + 13) * scale;
       const box = { x1: cx - halfW, x2: cx + halfW, y1: cy - halfH, y2: cy + halfH };
-      const always = priority(node) <= 1;
+      // The coordinator and routers are always named; so is anything the operator
+      // has picked out. Only end-device labels compete for space.
+      const always = priority(node) <= 3;
       const clash =
         !always &&
         kept.some((k) => box.x1 < k.x2 && box.x2 > k.x1 && box.y1 < k.y2 && box.y2 > k.y1);
@@ -1394,6 +1801,7 @@ class Z2MNetworkMap extends HTMLElement {
 
       if (panFrom) {
         this._userMoved = true;
+        this._viewAnim = null;
         this._view.x = panFrom.vx + (ev.clientX - panFrom.x);
         this._view.y = panFrom.vy + (ev.clientY - panFrom.y);
         this._applyTransform();
@@ -1492,9 +1900,8 @@ class Z2MNetworkMap extends HTMLElement {
     else if (act === 'zoom-out') this._zoomTo(this._view.k / 1.25, rect.width / 2, rect.height / 2);
     else if (act === 'fit') {
       this._userMoved = false;
-      this._fit();
-    }
-    else if (act === 'peers') {
+      this._fit({ animate: true });
+    } else if (act === 'peers') {
       this._showPeers = !this._showPeers;
       button.setAttribute('aria-pressed', String(this._showPeers));
       this._svg.classList.toggle('hide-peers', !this._showPeers);
@@ -1513,7 +1920,8 @@ class Z2MNetworkMap extends HTMLElement {
 
   _zoomTo(k, ax, ay) {
     this._userMoved = true;
-    const next = clamp(k, 0.25, 4);
+    this._viewAnim = null;
+    const next = clamp(k, 0.2, 4);
     const scale = next / this._view.k;
     this._view.x = ax - (ax - this._view.x) * scale;
     this._view.y = ay - (ay - this._view.y) * scale;
@@ -1521,19 +1929,42 @@ class Z2MNetworkMap extends HTMLElement {
     this._applyTransform();
   }
 
-  _fit() {
+  /**
+   * Fit the world to the canvas.
+   *
+   * Never against a degenerate rect: a host that is hidden or not yet laid out
+   * measures 0x0, and a fit computed from that wedges the view on a corner sliver
+   * -- which is exactly the blank-canvas-then-pop bug this map used to have. Such
+   * a fit is deferred; the ResizeObserver delivers the real size and _resize
+   * retries. The world layout itself never depends on the rect at all.
+   */
+  _fit({ animate = false } = {}) {
     if (!this._graph?.nodes.length) return;
+    const rect = this._stage.getBoundingClientRect();
+    if (rect.width < 50 || rect.height < 50) {
+      this._needsFit = true;
+      return;
+    }
+    this._needsFit = false;
     const xs = this._graph.nodes.map((n) => n.x);
     const ys = this._graph.nodes.map((n) => n.y);
     // Pad for the HUD strips so nothing important hides behind them.
     const w = Math.max(...xs) - Math.min(...xs) + 120;
     const h = Math.max(...ys) - Math.min(...ys) + 130;
-    const rect = this._stage.getBoundingClientRect();
-    const k = clamp(Math.min(rect.width / w, rect.height / h), 0.25, 1.7);
-    this._view.k = k;
-    this._view.x = rect.width / 2 - ((Math.min(...xs) + Math.max(...xs)) / 2) * k;
-    this._view.y = rect.height / 2 - ((Math.min(...ys) + Math.max(...ys)) / 2) * k;
-    this._applyTransform();
+    const k = clamp(Math.min(rect.width / w, rect.height / h), 0.2, 1.6);
+    const to = {
+      k,
+      x: rect.width / 2 - ((Math.min(...xs) + Math.max(...xs)) / 2) * k,
+      y: rect.height / 2 - ((Math.min(...ys) + Math.max(...ys)) / 2) * k,
+    };
+    if (animate && !this._reduceMotion) {
+      this._viewAnim = { from: { ...this._view }, to, start: performance.now() };
+      this._startLoop();
+    } else {
+      this._viewAnim = null;
+      this._view = to;
+      this._applyTransform();
+    }
   }
 
   _applyTransform() {
@@ -1546,12 +1977,16 @@ class Z2MNetworkMap extends HTMLElement {
     this._cullLabels();
   }
 
+  /**
+   * The element changed size. The world layout is size-independent, so nothing
+   * about the physics needs to move -- but the VIEW does: refit unless the
+   * operator has taken the camera, and always retry a fit that was deferred
+   * because the host measured 0x0.
+   */
   _resize() {
-    if (!this._sim) return;
-    const rect = this._stage.getBoundingClientRect();
-    this._sim.resize(rect.width, rect.height);
-    this._sim.reheat(0.3);
-    this._startLoop();
+    if (!this._graph) return;
+    if (this._needsFit || !this._userMoved) this._fit();
+    else this._cullLabels();
   }
 
   /** Navigate with Home Assistant's own router rather than a bare link. */
@@ -1678,12 +2113,28 @@ class Z2MNetworkMap extends HTMLElement {
     let busy = false;
     if (!this._frozen) busy = this._sim.step();
 
+    // The camera glide used after `done`: the graph must not teleport, and
+    // neither should the view.
+    if (this._viewAnim) {
+      const anim = this._viewAnim;
+      const t = clamp((now - anim.start) / 260, 0, 1);
+      const e = 1 - Math.pow(1 - t, 3);
+      this._view = {
+        x: anim.from.x + (anim.to.x - anim.from.x) * e,
+        y: anim.from.y + (anim.to.y - anim.from.y) * e,
+        k: anim.from.k + (anim.to.k - anim.from.k) * e,
+      };
+      this._applyTransform();
+      if (t >= 1) this._viewAnim = null;
+      else busy = true;
+    }
+
     for (const [, els] of this._nodeEls) {
       const node = els.node;
       if (!node) continue;
       let scale = 1;
       if (els.appear) {
-        const t = clamp((now - els.appear - (node._revealIndex || 0) * 22) / 300, 0, 1);
+        const t = clamp((now - els.appear) / 240, 0, 1);
         if (t < 1) {
           const eased = 1 - Math.pow(1 - t, 3);
           scale = eased * (1 + 0.22 * (1 - eased));
@@ -1702,8 +2153,8 @@ class Z2MNetworkMap extends HTMLElement {
     }
 
     for (const [, entry] of this._linkEls) {
-      const a = this._graph.byIeee.get(entry.link.source);
-      const b = this._graph.byIeee.get(entry.link.target);
+      const a = this._graph.byIeee.get(entry.a);
+      const b = this._graph.byIeee.get(entry.b);
       if (!a || !b) continue;
       entry.el.setAttribute('x1', a.x.toFixed(1));
       entry.el.setAttribute('y1', a.y.toFixed(1));
@@ -1711,7 +2162,7 @@ class Z2MNetworkMap extends HTMLElement {
       entry.el.setAttribute('y2', b.y.toFixed(1));
       if (entry.appear) {
         // Draw the link on, so a device visibly attaches to its router.
-        const t = clamp((now - entry.appear) / 420, 0, 1);
+        const t = clamp((now - entry.appear) / 320, 0, 1);
         const len = Math.hypot(b.x - a.x, b.y - a.y) || 1;
         if (t < 1) {
           entry.el.style.strokeDasharray = `${len}`;

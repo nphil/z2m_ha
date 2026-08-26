@@ -765,5 +765,175 @@
         }
       }
     ]
+  },
+  "overview": {
+    "edges": [
+      {
+        "source": {
+          "ieee_address": "0x0000000000000001",
+          "name": "Hallway Dimmer",
+          "endpoint": 1
+        },
+        "cluster": "genOnOff",
+        "target": {
+          "type": "endpoint",
+          "ieee_address": "0x00124b0039db98bf",
+          "endpoint": 1,
+          "name": "Coordinator",
+          "endpoint_name": null,
+          "coordinator": true
+        }
+      },
+      {
+        "source": {
+          "ieee_address": "0x0000000000000001",
+          "name": "Hallway Dimmer",
+          "endpoint": 1
+        },
+        "cluster": "seMetering",
+        "target": {
+          "type": "endpoint",
+          "ieee_address": "0x00124b0039db98bf",
+          "endpoint": 1,
+          "name": "Coordinator",
+          "endpoint_name": null,
+          "coordinator": true
+        }
+      },
+      {
+        "source": {
+          "ieee_address": "0x0000000000000001",
+          "name": "Hallway Dimmer",
+          "endpoint": 1
+        },
+        "cluster": "genLevelCtrl",
+        "target": {
+          "type": "endpoint",
+          "ieee_address": "0x00158d00ffdeadbe",
+          "endpoint": 1,
+          "name": null,
+          "endpoint_name": null,
+          "coordinator": false
+        }
+      },
+      {
+        "source": {
+          "ieee_address": "0x0000000000000001",
+          "name": "Hallway Dimmer",
+          "endpoint": 2
+        },
+        "cluster": "genOnOff",
+        "target": {
+          "type": "group",
+          "id": 5,
+          "name": "Kitchen",
+          "default_bind_group": false
+        }
+      },
+      {
+        "source": {
+          "ieee_address": "0x0000000000000001",
+          "name": "Hallway Dimmer",
+          "endpoint": 2
+        },
+        "cluster": "manuSpecificInovelli",
+        "target": {
+          "type": "endpoint",
+          "ieee_address": "0x00124b0039db98bf",
+          "endpoint": 1,
+          "name": "Coordinator",
+          "endpoint_name": null,
+          "coordinator": true
+        }
+      },
+      {
+        "source": {
+          "ieee_address": "0x0000000000000004",
+          "name": "Quote's \"Tricky\" <Name> & Co",
+          "endpoint": 1
+        },
+        "cluster": "genOnOff",
+        "target": {
+          "type": "endpoint",
+          "ieee_address": "0x0000000000000001",
+          "endpoint": 1,
+          "name": "Hallway Dimmer",
+          "endpoint_name": "1",
+          "coordinator": false
+        }
+      },
+      {
+        "source": {
+          "ieee_address": "0x0000000000000004",
+          "name": "Quote's \"Tricky\" <Name> & Co",
+          "endpoint": 1
+        },
+        "cluster": "genLevelCtrl",
+        "target": {
+          "type": "endpoint",
+          "ieee_address": "0x0000000000000001",
+          "endpoint": 1,
+          "name": "Hallway Dimmer",
+          "endpoint_name": "1",
+          "coordinator": false
+        }
+      }
+    ],
+    "devices": [
+      {
+        "ieee_address": "0x0000000000000001",
+        "name": "Hallway Dimmer",
+        "type": "Router",
+        "endpoints": [
+          {
+            "endpoint": 1,
+            "sends": [],
+            "accepts": [
+              "genOnOff",
+              "genLevelCtrl",
+              "genScenes"
+            ]
+          },
+          {
+            "endpoint": 2,
+            "sends": [
+              "genOnOff"
+            ],
+            "accepts": [
+              "genOnOff",
+              "genScenes"
+            ]
+          }
+        ]
+      },
+      {
+        "ieee_address": "0x0000000000000002",
+        "name": "Porch Sensor",
+        "type": "EndDevice",
+        "endpoints": []
+      },
+      {
+        "ieee_address": "0x0000000000000003",
+        "name": "Unknown Gadget",
+        "type": "EndDevice",
+        "endpoints": []
+      },
+      {
+        "ieee_address": "0x0000000000000004",
+        "name": "Quote's \"Tricky\" <Name> & Co",
+        "type": "EndDevice",
+        "endpoints": [
+          {
+            "endpoint": 1,
+            "sends": [
+              "genOnOff",
+              "genLevelCtrl",
+              "genScenes"
+            ],
+            "accepts": []
+          }
+        ]
+      }
+    ]
   }
 }

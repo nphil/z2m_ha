@@ -16,6 +16,21 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repo = join(here, '..');
 
 const fx = JSON.parse(readFileSync(join(here, 'fixture.json'), 'utf8'));
+// The fixture's timestamps are re-anchored to the moment the suite runs. Baked
+// absolute times make relative-age text ("42 min ago") drift with the wall clock,
+// which once collided with an unrelated substring assertion and failed the suite
+// depending on WHEN it ran. Offsets are preserved, so ordering stays meaningful.
+{
+  const anchor = Date.parse(
+    Object.values(fx.states).reduce((max, s) =>
+      s.last_updated && s.last_updated > max ? s.last_updated : max, '1970-01-01')
+  );
+  for (const s of Object.values(fx.states)) {
+    for (const k of ['last_changed', 'last_updated']) {
+      if (s[k]) s[k] = new Date(Date.now() - (anchor - Date.parse(s[k]))).toISOString();
+    }
+  }
+}
 // Anchor the cached-map epoch to now. The summary is what the panel probes for a
 // cache; the map is handed the epoch and ages it itself.
 fx.networkmap.generated = Date.now() / 1000 - 4 * 60;
@@ -460,6 +475,8 @@ const hass = {
             clusters: (msg.clusters || []).filter((c) => c !== 'genScenes'),
             failed: (msg.clusters || []).filter((c) => c === 'genScenes'),
           });
+        case 'z2m/binds/overview':
+          return Promise.resolve(fx.overview);
         case 'z2m/device/read_values':
           return Promise.resolve({
             requested: ['state', 'brightness'],
@@ -1799,53 +1816,57 @@ check('registering the element twice is not fatal', (() => {
 })());
 
 /* ================================================================ bindings */
-console.log('=== bindings: what is bound, and to what ===');
+console.log('=== bindings: read as sentences, in both directions ===');
 p._go({ name: 'binds', ieee: '0x0000000000000001' });
-// Both reads are in flight at once, so wait for the state they land in rather than for a
-// duration that only happens to be long enough on this machine.
-check('reads the device\u2019s endpoints and binds',
-  await soon(() => !!p._binds.clusters && !!p._binds.binds));
+check('reads endpoints, binds and the mesh overview',
+  await soon(() => !!p._binds.clusters && !!p._binds.binds && !!p._binds.overview));
 check('titled Bindings', html().includes('header="Bindings"'));
-check('says what a bind actually does', html().includes('without Home Assistant or'));
-check('groups binds by the endpoint that owns them',
-  html().includes('Endpoint 1') && html().includes('Endpoint 2'));
-// The jargon is unavoidable -- it is what Z2M and the device docs use -- so both the
-// plain name and the identifier have to be on screen.
-check('every cluster is named in English and by its identifier',
-  html().includes('On/off (genOnOff)') && html().includes('Energy metering (seMetering)'));
-check('a manufacturer cluster with no plain name still shows its identifier',
-  html().includes('>manuSpecificInovelli<'));
-check('the coordinator is named as the coordinator',
-  html().includes('Coordinator (coordinator)'));
-check('a group target is named as a group', html().includes('Kitchen (group)'));
-check('a bind whose target has left the network is still shown',
-  html().includes('target no longer known'));
-// Endpoint 242 is the green-power endpoint: nothing bound, nothing bindable. Showing
-// it would be noise the operator can do nothing with.
-check('an endpoint that can bind nothing is left out entirely',
-  !html().includes('Endpoint 242'));
+check('says what a bind actually does', html().includes('straight to the other device'));
+// Direction one: what this device drives. Clusters merge into one row per pair.
+check('control rows read as sentences',
+  html().includes('Sends On/off to Kitchen (group)'));
+check('a dangling target is still shown, in words',
+  html().includes('no longer on the network'));
+check('a multi-endpoint device says which side a bind is from',
+  html().includes('from endpoint 2'));
+// Direction two: who drives this device. Only the overview can answer.
+check('controlled-by lists the remote that binds to this device',
+  html().includes('Controlled by') &&
+  html().includes('sends On/off, Brightness to this device'));
+// The reporting path is separated and explained, not mixed into control rows.
+check('coordinator binds live under Reports to Zigbee2MQTT',
+  html().includes('Reports to Zigbee2MQTT') &&
+  html().includes('keep Home Assistant updated'));
+check('reporting rows name capabilities in plain words',
+  html().includes('Sends On/off, Energy metering'));
+
+console.log('=== bindings: the create form reads as a sentence ===');
 const bindSpec = p._forms['bind:0x0000000000000001'];
-check('the create form is an ha-form with three fields',
-  html().includes('<ha-form data-form="bind:') &&
-  bindSpec.schema.map((s) => s.name).join(',') === 'endpoint,target,clusters');
+check('the form is From, Send, To',
+  bindSpec.schema.map((s) => s.name).join(',') === 'endpoint,clusters,target');
+check('endpoints are described by what they send, not just a number',
+  bindSpec.schema[0].selector.select.options.every((o) => /\(.+\)/.test(o.label)));
 check('endpoint 242 is not offered as a source: it can bind nothing',
   !bindSpec.schema[0].selector.select.options.some((o) => o.value === '242'));
-check('clusters are the endpoint\u2019s bindable set, not everything it speaks',
-  bindSpec.schema[2].selector.select.options.map((o) => o.value).join(',')
-    === 'genScenes,genOnOff,genLevelCtrl');
+check('clusters are the endpoint\u2019s bindable set with plain names',
+  bindSpec.schema[1].selector.select.options.map((o) => o.value).join(',')
+    === 'genScenes,genOnOff,genLevelCtrl'
+  && bindSpec.schema[1].selector.select.options[1].label === 'On/off (genOnOff)');
 check('clusters can be chosen several at a time',
-  bindSpec.schema[2].selector.select.multiple === true);
-check('targets include groups and the other devices',
-  bindSpec.schema[1].selector.select.options.some((o) => o.label.includes('(group)')) &&
-  bindSpec.schema[1].selector.select.options.some((o) => o.value.startsWith('d:')));
+  bindSpec.schema[1].selector.select.multiple === true);
+const targetOpts = bindSpec.schema[2].selector.select.options;
+check('groups are offered as targets',
+  targetOpts.some((o) => o.label.includes('(group)')));
+check('only devices that can ACCEPT something are offered',
+  !targetOpts.some((o) => o.label.includes('Porch Sensor'))
+  && !targetOpts.some((o) => o.label.includes('Tricky')));
 check('the device never offers itself as its own target',
-  !bindSpec.schema[1].selector.select.options.some((o) =>
-    o.value.includes('0x0000000000000001')));
+  !targetOpts.some((o) => o.value.includes('0x0000000000000001')));
 // Choosing endpoint 2 must narrow the cluster list: it speaks fewer of them.
 bindSpec.data = { ...bindSpec.data, endpoint: '2' };
 p._render();
 check('changing endpoint re-narrows the clusters',
-  p._forms['bind:0x0000000000000001'].schema[2].selector.select.options
+  p._forms['bind:0x0000000000000001'].schema[1].selector.select.options
     .map((o) => o.value).join(',') === 'genScenes,genOnOff');
 
 console.log('=== bindings: writing, and the partial failure Z2M calls success ===');
@@ -1868,25 +1889,68 @@ check('the refusal explains the usual cause', html().includes('asleep'));
 check('the list is re-read from Zigbee2MQTT afterwards',
   sent.filter((m) => m.type === 'z2m/device/binds').length >= 1);
 
-console.log('=== bindings: removing one cluster ===');
+console.log('=== bindings: removal carries the whole merged row ===');
 sent.length = 0;
 await act('unbind');
 await until('the unbind command to be sent',
   () => sent.some((m) => m.type === 'z2m/device/unbind'));
 const unbindMsg = sent.find((m) => m.type === 'z2m/device/unbind');
-check('unbinds exactly the cluster on the row', !!unbindMsg
-  && unbindMsg.clusters.length === 1);
-check('and addresses the target that bind pointed at', !!unbindMsg
-  && (unbindMsg.to === '0x00124b0039db98bf' || typeof unbindMsg.to === 'number'));
-check('nothing is written without a target and a cluster', (() => {
-  p._forms['bind:0x0000000000000001'].data = { endpoint: '1', target: '', clusters: [] };
-  sent.length = 0;
-  return true;
-})());
+check('unbinds every cluster the row named', !!unbindMsg
+  && unbindMsg.clusters.length >= 1 && Array.isArray(unbindMsg.clusters));
+check('and addresses a real target', !!unbindMsg
+  && (typeof unbindMsg.to === 'number' || String(unbindMsg.to).startsWith('0x')));
+
+console.log('=== bindings: the reporting path defends itself ===');
+let confirmAsked = 0;
+let confirmAnswer = false;
+globalThis.confirm = (text) => {
+  confirmAsked += 1;
+  confirmText = String(text);
+  return confirmAnswer;
+};
+let confirmText = '';
+sent.length = 0;
+const guardBtn = p.shadowRoot.querySelectorAll('[data-guard="report"]')[0];
+check('a coordinator unbind is guarded', !!guardBtn);
+guardBtn.onclick();
+await tick();
+check('declining sends nothing', confirmAsked === 1
+  && !sent.some((m) => m.type === 'z2m/device/unbind'));
+check('the warning says what actually breaks',
+  confirmText.includes('stop reporting') && confirmText.includes('Home Assistant'));
+confirmAnswer = true;
+guardBtn.onclick();
+await until('the guarded unbind to be sent',
+  () => sent.some((m) => m.type === 'z2m/device/unbind'));
+check('accepting removes exactly that reporting bind',
+  sent.find((m) => m.type === 'z2m/device/unbind').from === '0x0000000000000001');
+globalThis.confirm = () => true;
+
+console.log('=== bindings: nothing is written without a target and clusters ===');
+p._forms['bind:0x0000000000000001'].data = { endpoint: '1', target: '', clusters: [] };
+sent.length = 0;
 await act('bind');
 check('an incomplete form is refused locally, not by the radio',
   !sent.some((m) => m.type === 'z2m/device/bind')
     && html().includes('Choose a target and at least one cluster'));
+
+console.log('=== bindings: the mesh-wide overview ===');
+p._go({ name: 'dashboard' });
+await tick();
+check('the dashboard offers the overview', !!find('data-go', 'bindsall'));
+p._go({ name: 'bindsall' });
+check('the overview loads', await soon(() => !!p._bindsAll.data));
+check('control edges are grouped by the controlling device',
+  html().includes('Direct control') && html().includes('Tricky'));
+check('rows read as sentences with merged capabilities',
+  html().includes('Sends On/off, Brightness to Hallway Dimmer'));
+check('every group offers a Manage link into the device page',
+  !!find('data-act', 'gotobinds'));
+check('reporting binds are collapsed and read-only here',
+  html().includes('Reporting to Zigbee2MQTT') &&
+  html().includes('Manage them from each device'));
+check('overview rows can remove a bind with the full triple',
+  /data-act="unbind"[\s\S]{0,300}?data-from="0x[0-9a-f]+"[\s\S]{0,300}?data-clusters="[^"]+"/.test(html()));
 p._go({ name: 'device', ieee: '0x0000000000000001' });
 
 /* ============================================== device page: live and organized */

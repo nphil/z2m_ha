@@ -285,8 +285,11 @@ class Z2MPanel extends HTMLElement {
       failed: [],
       clusters: null,
       binds: null,
+      // The mesh-wide edge list: what controls what, in both directions.
+      overview: null,
       busy: false,
     };
+    this._bindsAll = { loading: false, error: null, data: null };
   }
 
   async _openBinds(ieee) {
@@ -297,13 +300,15 @@ class Z2MPanel extends HTMLElement {
     b.error = null;
     this._render();
     try {
-      const [clusters, binds] = await Promise.all([
+      const [clusters, binds, overview] = await Promise.all([
         this._call('z2m/device/clusters', { device: ieee }),
         this._call('z2m/device/binds', { device: ieee }),
+        this._call('z2m/binds/overview'),
       ]);
       if (this._binds.ieee !== ieee) return;
       b.clusters = clusters;
       b.binds = binds;
+      b.overview = overview;
     } catch (err) {
       if (this._binds.ieee !== ieee) return;
       b.error = this._feedMessage(err, 'Could not read this device\u2019s bindings');
@@ -320,17 +325,68 @@ class Z2MPanel extends HTMLElement {
     const ieee = this._binds.ieee;
     if (!ieee) return;
     try {
-      const [clusters, binds] = await Promise.all([
+      const [clusters, binds, overview] = await Promise.all([
         this._call('z2m/device/clusters', { device: ieee }),
         this._call('z2m/device/binds', { device: ieee }),
+        this._call('z2m/binds/overview'),
       ]);
       if (this._binds.ieee !== ieee) return;
       this._binds.clusters = clusters;
       this._binds.binds = binds;
+      this._binds.overview = overview;
     } catch (_) {
       /* the write already reported its own outcome; a stale list is not a new error */
     }
     this._render();
+  }
+
+  async _openBindsAll() {
+    const s = this._bindsAll;
+    if (s.loading) return;
+    s.loading = true;
+    s.error = null;
+    this._render();
+    try {
+      s.data = await this._call('z2m/binds/overview');
+    } catch (err) {
+      s.error = this._feedMessage(err, 'Could not read the mesh\u2019s bindings');
+    } finally {
+      s.loading = false;
+      this._render();
+    }
+  }
+
+  /** Clusters as capabilities a person can read: "On/off, Brightness". */
+  _caps(clusters) {
+    return (clusters || []).map((c) => CLUSTER_NAMES[c] || c).join(', ');
+  }
+
+  /** A bind target as a name, never an address, with its kind only when it matters. */
+  _targetPhrase(t) {
+    if (!t) return 'an unknown target';
+    if (t.type === 'group') {
+      if (t.default_bind_group) return 'Zigbee2MQTT\u2019s default group';
+      return `${t.name || `Group ${t.id}`} (group)`;
+    }
+    if (t.coordinator) return 'Zigbee2MQTT';
+    return `${t.name || t.ieee_address}${t.name === null ? ' (no longer on the network)' : ''}`;
+  }
+
+  /**
+   * Merge raw one-cluster edges into one row per source-target pair, which is the
+   * unit the operator thinks in: "the remote controls the kitchen lights", not four
+   * separate cluster rows. Cluster order follows Z2M's candidate order.
+   */
+  _mergeEdges(edges) {
+    const byKey = new Map();
+    for (const e of edges) {
+      const t = e.target || {};
+      const tKey = t.type === 'group' ? `g:${t.id}` : `d:${t.ieee_address}:${t.endpoint}`;
+      const key = `${e.source.ieee_address}|${e.source.endpoint}|${tKey}`;
+      if (!byKey.has(key)) byKey.set(key, { source: e.source, target: t, clusters: [] });
+      if (!byKey.get(key).clusters.includes(e.cluster)) byKey.get(key).clusters.push(e.cluster);
+    }
+    return [...byKey.values()];
   }
 
   /** Everything a bind can point at: the coordinator, a group, or another endpoint. */
@@ -369,44 +425,106 @@ class Z2MPanel extends HTMLElement {
     }
 
     const endpoints = b.clusters.endpoints || [];
-    const existing = b.binds.binds || [];
+    const name = d.friendly_name || ieee;
+    const raw = (b.binds.binds || []).map((x) => ({
+      source: { ieee_address: ieee, name, endpoint: x.endpoint },
+      cluster: x.cluster,
+      target: x.target,
+    }));
+    const merged = this._mergeEdges(raw);
+    const controls = merged.filter((e) => !(e.target || {}).coordinator);
+    const reports = merged.filter((e) => (e.target || {}).coordinator);
+    const multiEp = new Set(raw.map((e) => e.source.endpoint)).size > 1;
 
-    // Grouped by source endpoint, because that is what owns the bind.
-    const groupsHtml = endpoints
-      .map((ep) => {
-        const mine = existing.filter((x) => x.endpoint === ep.endpoint);
-        if (!mine.length && !(ep.bindable || []).length) return '';
-        const rows = mine.length
-          ? list(
-              mine
-                .map((x) => {
-                  const t = x.target || {};
-                  const target =
-                    t.type === 'group'
-                      ? `${t.name || `Group ${t.id}`} (group)`
-                      : `${t.name || t.ieee_address}${t.coordinator ? ' (coordinator)' : ''}${
-                          t.endpoint && !t.coordinator ? `, endpoint ${t.endpoint}` : ''
-                        }`;
-                  return row({
-                    icon: MDI.link,
-                    headline: esc(clusterLabel(x.cluster)),
-                    text: `to ${esc(target)}${t.name === null ? ' (target no longer known)' : ''}`,
-                    end: `<ha-button slot="end" appearance="plain" size="s" data-act="unbind"
-                            data-endpoint="${esc(String(ep.endpoint))}"
-                            data-cluster="${esc(x.cluster)}"
-                            data-target="${esc(
-                              t.type === 'group' ? `g:${t.id}` : `d:${t.ieee_address}:${t.endpoint}`
-                            )}">Remove</ha-button>`,
-                  });
+    // Incoming edges: who controls THIS device. Only the overview knows.
+    const incoming = this._mergeEdges(
+      ((b.overview || {}).edges || []).filter(
+        (e) => (e.target || {}).type === 'endpoint' && e.target.ieee_address === ieee
+      )
+    );
+
+    const controlRow = (e, removable) => {
+      const t = e.target || {};
+      const from = multiEp ? ` from endpoint ${e.source.endpoint}` : '';
+      return row({
+        icon: MDI.link,
+        headline: `Sends ${esc(this._caps(e.clusters))} to ${esc(this._targetPhrase(t))}`,
+        text: `Radio to radio${from}. Works even when Home Assistant is down.`,
+        end: removable
+          ? `<ha-button slot="end" appearance="plain" size="s" data-act="unbind"
+               data-from="${esc(e.source.ieee_address)}"
+               data-endpoint="${esc(String(e.source.endpoint))}"
+               data-clusters="${esc(e.clusters.join(','))}"
+               data-target="${esc(
+                 t.type === 'group' ? `g:${t.id}` : `d:${t.ieee_address}:${t.endpoint}`
+               )}">Remove</ha-button>`
+          : undefined,
+      });
+    };
+
+    const controlsCard = `<ha-card class="nav-card">
+        <div class="card-header">This device controls</div>
+        <div class="note">A bind sends commands straight to the other device, radio to
+        radio, so it keeps working when Home Assistant is down and it responds faster.</div>
+        <div class="card-content">${
+          controls.length
+            ? list(controls.map((e) => controlRow(e, true)).join(''))
+            : '<div class="empty">Nothing yet. Add one below.</div>'
+        }</div>
+      </ha-card>`;
+
+    const controlledCard = incoming.length
+      ? `<ha-card class="nav-card">
+          <div class="card-header">Controlled by</div>
+          <div class="card-content">${list(
+            incoming
+              .map((e) =>
+                row({
+                  icon: MDI.link,
+                  headline: `${esc(e.source.name || e.source.ieee_address)} sends ${esc(
+                    this._caps(e.clusters)
+                  )} to this device`,
+                  end: `<ha-button slot="end" appearance="plain" size="s" data-act="unbind"
+                          data-from="${esc(e.source.ieee_address)}"
+                          data-endpoint="${esc(String(e.source.endpoint))}"
+                          data-clusters="${esc(e.clusters.join(','))}"
+                          data-target="d:${esc(ieee)}:${esc(String(e.target.endpoint))}"
+                        >Remove</ha-button>`,
                 })
-                .join('')
-            )
-          : '<div class="note">Nothing bound from this endpoint.</div>';
-        return `<div class="ota-group">Endpoint ${esc(String(ep.endpoint))}${
-          ep.name && ep.name !== String(ep.endpoint) ? ` \u00b7 ${esc(ep.name)}` : ''
-        }</div>${rows}`;
-      })
-      .join('');
+              )
+              .join('')
+          )}</div>
+        </ha-card>`
+      : '';
+
+    const reportsCard = reports.length
+      ? `<ha-card class="nav-card">
+          <div class="card-header">Reports to Zigbee2MQTT</div>
+          <div class="note">These keep Home Assistant updated: the device sends its state
+          changes to the coordinator. They are created automatically and removing one
+          stops those updates.</div>
+          <div class="card-content">${list(
+            reports
+              .map((e) =>
+                row({
+                  icon: MDI.info,
+                  headline: `Sends ${esc(this._caps(e.clusters))}${
+                    multiEp ? ` from endpoint ${esc(String(e.source.endpoint))}` : ''
+                  }`,
+                  end: `<ha-button slot="end" appearance="plain" size="s" data-act="unbind"
+                          data-guard="report"
+                          data-from="${esc(e.source.ieee_address)}"
+                          data-endpoint="${esc(String(e.source.endpoint))}"
+                          data-clusters="${esc(e.clusters.join(','))}"
+                          data-target="d:${esc(e.target.ieee_address)}:${esc(
+                            String(e.target.endpoint)
+                          )}">Remove</ha-button>`,
+                })
+              )
+              .join('')
+          )}</div>
+        </ha-card>`
+      : '';
 
     return (
       (b.notice ? `<ha-alert alert-type="success">${esc(b.notice)}</ha-alert>` : '') +
@@ -415,17 +533,12 @@ class Z2MPanel extends HTMLElement {
            clusters were refused: ${esc(b.failed.map(clusterLabel).join(', '))}. That usually
            means the device does not speak them, or it was asleep.</ha-alert>`
         : '') +
-      `<ha-card class="nav-card">
-         <div class="card-header">Bindings for ${esc(d.friendly_name || ieee)}</div>
-         <div class="note">A bind sends this device\u2019s commands straight to another device
-         or group, without Home Assistant or the coordinator in the path, so it keeps
-         working when either is down, and it responds faster.</div>
-         ${groupsHtml}
-       </ha-card>` +
-      this._bindCreateCard(endpoints)
+      controlsCard +
+      this._bindCreateCard(endpoints) +
+      controlledCard +
+      reportsCard
     );
   }
-
   _bindCreateCard(endpoints) {
     const b = this._binds;
     const bindable = endpoints.filter((ep) => (ep.bindable || []).length);
@@ -436,41 +549,72 @@ class Z2MPanel extends HTMLElement {
       );
     }
 
+    // An endpoint means nothing as a number, so it is described by what it can send.
+    const epLabel = (ep) => {
+      const sends = (ep.output || []).filter((c) => (ep.bindable || []).includes(c));
+      const what = this._caps(sends.length ? sends : ep.bindable);
+      return `Endpoint ${ep.endpoint}${what ? ` (${what})` : ''}${
+        ep.name && ep.name !== String(ep.endpoint) ? `, ${ep.name}` : ''
+      }`;
+    };
+
     const key = `bind:${b.ieee}`;
     const spec = this._formSpec(key, () => ({
       schema: [],
       data: { endpoint: String(bindable[0].endpoint), target: '', clusters: [] },
       label: (s) =>
-        ({ endpoint: 'From endpoint', target: 'To', clusters: 'Clusters' })[s.name],
+        ({ endpoint: 'From', target: 'To', clusters: 'Send' })[s.name],
       helper: (s) =>
         ({
-          endpoint: 'The endpoint on this device whose commands will be sent',
-          target: 'The device, group or the coordinator that should receive them',
-          clusters: 'Only what this endpoint can actually bind is offered',
+          endpoint: 'The side of this device whose commands will be sent',
+          target: 'The device or group that should follow it',
+          clusters: 'What gets sent. Only what both sides speak is offered',
         })[s.name],
     }));
 
     const chosen =
       bindable.find((ep) => String(ep.endpoint) === String(spec.data.endpoint)) || bindable[0];
+
+    // Offer only targets that can actually accept what is being sent: the overview
+    // knows every device's accepted clusters. Groups accept anything their members
+    // speak, so they are always offered.
+    const chosenClusters = (spec.data.clusters || []).length
+      ? spec.data.clusters
+      : chosen.bindable || [];
+    const targets = [];
+    (this._groups || []).forEach((g) => {
+      targets.push({ value: `g:${g.id}`, label: `${g.friendly_name || `Group ${g.id}`} (group)` });
+    });
+    const capDevices = ((b.overview || {}).devices || []);
+    capDevices.forEach((dev) => {
+      if (dev.ieee_address === b.ieee) return;
+      const eps = (dev.endpoints || []).filter((ep) =>
+        (ep.accepts || []).some((c) => chosenClusters.includes(c)));
+      eps.forEach((ep) => {
+        targets.push({
+          value: `d:${dev.ieee_address}:${ep.endpoint}`,
+          label: `${dev.name || dev.ieee_address}${
+            eps.length > 1 ? `, endpoint ${ep.endpoint} (${this._caps(ep.accepts)})` : ''
+          }`,
+        });
+      });
+    });
+
     spec.schema = [
-      {
-        name: 'endpoint',
-        selector: {
-          select: {
-            mode: 'dropdown',
-            options: bindable.map((ep) => ({
-              value: String(ep.endpoint),
-              label: `Endpoint ${ep.endpoint}${
-                ep.name && ep.name !== String(ep.endpoint) ? ` \u00b7 ${ep.name}` : ''
-              }`,
-            })),
-          },
-        },
-      },
-      {
-        name: 'target',
-        selector: { select: { mode: 'dropdown', options: this._bindTargets() } },
-      },
+      ...(bindable.length > 1
+        ? [{
+            name: 'endpoint',
+            selector: {
+              select: {
+                mode: 'dropdown',
+                options: bindable.map((ep) => ({
+                  value: String(ep.endpoint),
+                  label: epLabel(ep),
+                })),
+              },
+            },
+          }]
+        : []),
       {
         name: 'clusters',
         selector: {
@@ -480,10 +624,16 @@ class Z2MPanel extends HTMLElement {
           },
         },
       },
+      {
+        name: 'target',
+        selector: { select: { mode: 'dropdown', options: targets } },
+      },
     ];
 
     return `<ha-card class="nav-card">
         <div class="card-header">Add a binding</div>
+        <div class="note">Reads as a sentence: this device sends the chosen commands to
+        the target, directly over the radio.</div>
         <div class="card-content pad"><ha-form data-form="${esc(key)}"></ha-form></div>
         <div class="note">A sleeping battery device cannot be bound until it wakes, so a
         refusal here often just means "try again while pressing a button on it".</div>
@@ -493,6 +643,108 @@ class Z2MPanel extends HTMLElement {
           }>${b.busy ? 'Binding\u2026' : 'Bind'}</ha-button>
         </div>
       </ha-card>`;
+  }
+
+  /* ------------------------------------------------- mesh-wide bindings view */
+
+  _bindsAllView() {
+    const s = this._bindsAll;
+    if (s.error) {
+      return `<ha-alert alert-type="error">${esc(s.error)}</ha-alert>`;
+    }
+    if (!s.data) return card('<div class="note">Reading the mesh\u2019s bindings\u2026</div>');
+
+    const merged = this._mergeEdges(s.data.edges || []);
+    const controls = merged.filter((e) => !(e.target || {}).coordinator);
+    const reports = merged.filter((e) => (e.target || {}).coordinator);
+    const epCount = Object.fromEntries(
+      (s.data.devices || []).map((d) => [d.ieee_address, (d.endpoints || []).length])
+    );
+
+    const bySource = new Map();
+    controls.forEach((e) => {
+      const k = e.source.ieee_address;
+      if (!bySource.has(k)) bySource.set(k, []);
+      bySource.get(k).push(e);
+    });
+
+    const groupsHtml = [...bySource.values()]
+      .sort((a, b2) => (a[0].source.name || '').localeCompare(b2[0].source.name || ''))
+      .map((edges) => {
+        const src = edges[0].source;
+        const rows = edges
+          .map((e) =>
+            row({
+              icon: MDI.link,
+              headline: `Sends ${esc(this._caps(e.clusters))} to ${esc(this._targetPhrase(e.target))}`,
+              text: (epCount[src.ieee_address] || 1) > 1
+                ? `From endpoint ${esc(String(e.source.endpoint))}` : '',
+              end: `<ha-button slot="end" appearance="plain" size="s" data-act="unbind"
+                      data-from="${esc(src.ieee_address)}"
+                      data-endpoint="${esc(String(e.source.endpoint))}"
+                      data-clusters="${esc(e.clusters.join(','))}"
+                      data-target="${esc(
+                        e.target.type === 'group'
+                          ? `g:${e.target.id}`
+                          : `d:${e.target.ieee_address}:${e.target.endpoint}`
+                      )}">Remove</ha-button>`,
+            })
+          )
+          .join('');
+        return `<div class="ota-group">
+            <span>${esc(src.name || src.ieee_address)}</span>
+            <ha-button appearance="plain" size="s" data-act="gotobinds"
+              data-fromieee="${esc(src.ieee_address)}">Manage</ha-button>
+          </div>${list(rows)}`;
+      })
+      .join('');
+
+    const reportRows = [...this._mergeReportsBySource(reports).entries()]
+      .sort((a, b2) => a[0].localeCompare(b2[0]))
+      .map(([name2, clusters]) =>
+        row({
+          icon: MDI.info,
+          headline: `${esc(name2)} sends ${esc(this._caps(clusters))}`,
+        })
+      )
+      .join('');
+
+    return (
+      ((this._binds.notice)
+        ? `<ha-alert alert-type="success">${esc(this._binds.notice)}</ha-alert>` : '') +
+      `<ha-card class="nav-card">
+        <div class="card-header">Direct control</div>
+        <div class="note">A bind sends one device\u2019s commands straight to another,
+        radio to radio, with nothing relaying in between. These keep working when Home
+        Assistant is down.</div>
+        ${
+          controls.length
+            ? groupsHtml
+            : `<div class="empty">No device controls another directly yet. Open a device
+               and use its Bindings page to add one.</div>`
+        }
+      </ha-card>` +
+      (reports.length
+        ? `<ha-card class="nav-card">
+            <ha-expansion-panel header="Reporting to Zigbee2MQTT (${reports.length})">
+              <div class="note">Created automatically so Home Assistant sees state
+              changes. Manage them from each device\u2019s own Bindings page.</div>
+              ${list(reportRows)}
+            </ha-expansion-panel>
+          </ha-card>`
+        : '')
+    );
+  }
+
+  /** Coordinator reports collapsed to one row per device. */
+  _mergeReportsBySource(reports) {
+    const out = new Map();
+    for (const e of reports) {
+      const name = e.source.name || e.source.ieee_address;
+      if (!out.has(name)) out.set(name, []);
+      for (const c of e.clusters) if (!out.get(name).includes(c)) out.get(name).push(c);
+    }
+    return out;
   }
 
   /** One bind or unbind, with Z2M's partial-failure list kept. */
@@ -520,7 +772,14 @@ class Z2MPanel extends HTMLElement {
       b.error = this._feedMessage(err, 'Zigbee2MQTT refused the change');
     } finally {
       b.busy = false;
-      await this._reloadBinds();
+      // Writes made from the overview refresh the overview; writes made from a
+      // device's page refresh that page. Both re-read Z2M as the authority.
+      if (this._view.name === 'bindsall') {
+        this._bindsAll.data = null;
+        await this._openBindsAll();
+      } else {
+        await this._reloadBinds();
+      }
     }
   }
 
@@ -1322,6 +1581,8 @@ class Z2MPanel extends HTMLElement {
         return 'Logs';
       case 'binds':
         return 'Bindings';
+      case 'bindsall':
+        return 'Bindings';
       case 'diagnostics':
         return 'Diagnostics';
       case 'options':
@@ -1364,6 +1625,8 @@ class Z2MPanel extends HTMLElement {
         return this._logsView();
       case 'binds':
         return this._bindsView(this._view.ieee);
+      case 'bindsall':
+        return this._bindsAllView();
       case 'diagnostics':
         return this._diagView();
       case 'options':
@@ -1584,6 +1847,9 @@ class Z2MPanel extends HTMLElement {
     if (this._view.name === 'binds' && this._binds.ieee !== this._view.ieee) {
       this._openBinds(this._view.ieee);
     }
+    if (this._view.name === 'bindsall' && !this._bindsAll.data && !this._bindsAll.loading) {
+      this._openBindsAll();
+    }
     // Freshen what the device page shows, the way Z2M's own UI does with its
     // per-field refresh arrows -- except all at once and unprompted. One MQTT get
     // covers every readable attribute, so for a powered device this is a burst of
@@ -1764,6 +2030,12 @@ class Z2MPanel extends HTMLElement {
               s.log_level ? ` \u00b7 now ${esc(s.log_level)}` : ''
             }`,
             go: 'options',
+          }) +
+          row({
+            icon: MDI.link,
+            headline: 'Bindings',
+            text: 'Which devices control each other directly, radio to radio',
+            go: 'bindsall',
           }) +
           row({
             icon: MDI.diagnostics,
@@ -4220,13 +4492,24 @@ class Z2MPanel extends HTMLElement {
         });
       }
 
-      case 'unbind':
+      case 'unbind': {
+        // Rows carry their whole triple, so removal works from any page: the device's
+        // own list, the "controlled by" section, and the mesh overview.
+        if (el.dataset.guard === 'report'
+            && !confirm('This device would stop reporting these values to Zigbee2MQTT, '
+              + 'so Home Assistant would stop seeing its state changes. Remove it anyway?')) {
+          return undefined;
+        }
         return this._bindWrite('z2m/device/unbind', {
-          from: this._binds.ieee,
+          from: el.dataset.from || this._binds.ieee,
           from_endpoint: Number(el.dataset.endpoint),
           ...this._bindTarget(el.dataset.target),
-          clusters: [el.dataset.cluster],
+          clusters: (el.dataset.clusters || el.dataset.cluster || '').split(',').filter(Boolean),
         });
+      }
+
+      case 'gotobinds':
+        return this._go({ name: 'binds', ieee: el.dataset.fromieee });
 
       case 'configure':
         return this._act('z2m/device/configure', { device });

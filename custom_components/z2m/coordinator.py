@@ -1324,6 +1324,61 @@ class Z2MData:
         }
 
     @callback
+    def binds_overview(self) -> dict[str, Any]:
+        """Every bind in the mesh, plus what each device could send or accept.
+
+        One flat edge list rather than a per-device tree, because the questions the
+        overview answers are cross-device: "what controls this light" needs the
+        edges whose TARGET is the light, and no per-device shape serves both
+        directions at once. `sends`/`accepts` per endpoint is what lets a picker
+        offer capabilities instead of endpoint numbers: an endpoint is described by
+        what it can do, which is the part a person can reason about.
+
+        Costs nothing on the radio -- entirely the retained inventory reshaped.
+        """
+        edges: list[dict[str, Any]] = []
+        devices: list[dict[str, Any]] = []
+        for d in self.devices:
+            if d.get("type") == "Coordinator":
+                continue
+            ieee = d.get("ieee_address")
+            name = d.get("friendly_name")
+            endpoints: list[dict[str, Any]] = []
+            for number, endpoint in self._sorted_endpoints(d):
+                clusters = endpoint.get("clusters")
+                clusters = clusters if isinstance(clusters, dict) else {}
+                outs = [c for c in BINDABLE_CLUSTERS if c in (clusters.get("output") or [])]
+                ins = [c for c in BINDABLE_CLUSTERS if c in (clusters.get("input") or [])]
+                if outs or ins:
+                    endpoints.append({"endpoint": number, "sends": outs, "accepts": ins})
+                for entry in endpoint.get("bindings") or []:
+                    if not isinstance(entry, dict):
+                        continue
+                    target = self._bind_target(entry.get("target"))
+                    if target is None:
+                        continue
+                    edges.append(
+                        {
+                            "source": {
+                                "ieee_address": ieee,
+                                "name": name,
+                                "endpoint": number,
+                            },
+                            "cluster": entry.get("cluster"),
+                            "target": target,
+                        }
+                    )
+            devices.append(
+                {
+                    "ieee_address": ieee,
+                    "name": name,
+                    "type": d.get("type"),
+                    "endpoints": endpoints,
+                }
+            )
+        return {"edges": edges, "devices": devices}
+
+    @callback
     def scenes_for(self, target: Any) -> dict[str, Any]:
         """Scenes stored on one device or group, from the retained inventory.
 

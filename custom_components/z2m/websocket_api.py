@@ -89,6 +89,7 @@ def async_setup_websocket(hass: HomeAssistant) -> None:
         ws_bind,
         ws_unbind,
         ws_binds,
+        ws_binds_overview,
         ws_clusters,
         ws_configure_reporting,
         ws_touchlink_scan,
@@ -1145,6 +1146,20 @@ async def ws_binds(hass, connection, msg, data) -> None:
     left pointing at a removed device is exactly what the operator needs to see.
     """
     connection.send_result(msg["id"], data.device_binds(msg["device"]))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): "z2m/binds/overview"})
+@websocket_api.async_response
+@_guard
+async def ws_binds_overview(hass, connection, msg, data) -> None:
+    """Every bind in the mesh at once, with per-endpoint capabilities.
+
+    The overview page and the per-device "controlled by" section both need edges
+    keyed by TARGET, which no per-device call can answer. Entirely a reshape of the
+    retained inventory, so it costs nothing on the radio.
+    """
+    connection.send_result(msg["id"], data.binds_overview())
 
 
 @websocket_api.require_admin
