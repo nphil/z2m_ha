@@ -1322,6 +1322,15 @@ class Z2MPanel extends HTMLElement {
       }
       .devchips { display:flex; flex-wrap:wrap; gap:var(--ha-space-2, 8px);
                   padding:var(--ha-space-3, 12px) var(--ha-space-4, 16px) 0; }
+      /* Home Assistant's own card CSS pulls a .card-content that is not the first
+       * child up by 8px, assuming a .card-header with bottom padding sits above it.
+       * After a chips row -- which has no bottom padding to give back -- that
+       * negative margin lands the content ON TOP of the chips. Give it a real gap. */
+      .devchips + .card-content { margin-top:var(--ha-space-2, 8px); }
+      /* Same rule, same assumption: a .nav-card header is deliberately trimmed to
+       * 8px of bottom padding, which is precisely what the pull takes back, leaving
+       * the content flush against the heading. Give it nothing to take. */
+      .nav-card > .card-header + .card-content { margin-top:0; }
       .chip2 { display:inline-flex; align-items:center; gap:var(--ha-space-1, 4px);
                padding:2px 10px; border-radius:999px;
                border:1px solid var(--divider-color);
@@ -1529,7 +1538,10 @@ class Z2MPanel extends HTMLElement {
        * wa-dialog and sizes itself with --ha-dialog-width-md / -full; on a phone HA's
        * global styles push those to 100vw, which is the full-screen takeover the
        * operator asked to remove. The --mdc-dialog-* names are dead in this
-       * implementation -- overriding them does nothing. */
+       * implementation -- overriding them does nothing -- but
+       * --dialog-surface-margin-top IS read by wa-dialog::part(dialog), and a value of
+       * auto on both margins is what centres the surface. It only reaches the surface
+       * because the element is not type="standard"; see _ensurePairDialog. */
       ha-dialog { --ha-dialog-width-md:min(92vw, 33rem); }
       @media (max-width: 450px), (max-height: 500px) {
         ha-dialog { --ha-dialog-width-md:calc(100vw - var(--ha-space-8, 32px));
@@ -1983,13 +1995,14 @@ class Z2MPanel extends HTMLElement {
     const pairLog = r.querySelector('#pairlog');
     if (pairLog) {
       // Scrolling up is itself a request to stop following; scrolling back to the
-      // bottom resumes it. The button stays as the explicit control, but the
-      // gesture should not fight it.
+      // bottom resumes it. Only the button is re-labelled here: a full repaint
+      // would replace this very element, and that is what used to throw the
+      // operator back to the top of the buffer mid-read.
       pairLog.onscroll = () => {
         const atBottom = pairLog.scrollHeight - pairLog.scrollTop - pairLog.clientHeight < 24;
         if (this._pairing.follow !== atBottom) {
           this._pairing.follow = atBottom;
-          this._paintPairDialog();
+          this._syncPairFollow();
         }
       };
       // A repaint replaces this element, so the pin has to be re-applied.
@@ -3421,9 +3434,13 @@ class Z2MPanel extends HTMLElement {
    *
    * At debug level a 42-device network emits a line per received message and per
    * MQTT publish, so an unfiltered view scrolls the interview off screen faster
-   * than it can be read. The rule is deliberately about the SUBJECT of the line:
-   * anything concerning the device being paired is kept, anything that is routine
-   * traffic from a device already on the network is dropped.
+   * than it can be read. The rule is about the SUBJECT of the line: the interview
+   * conversation with the joining device is kept in full -- that detail is the
+   * reason to run at debug at all -- and routine traffic is dropped.
+   *
+   * State publishes are dropped even for the device being paired. A device starts
+   * reporting the moment it is interviewed, and `last_seen` republishes on its own
+   * schedule, which is exactly the spam that buried the interview on a phone.
    */
   _pairLogRelevant(message) {
     const text = String(message);
@@ -3432,19 +3449,28 @@ class Z2MPanel extends HTMLElement {
     const name = (p.event && p.event.friendly_name) || null;
     const mentionsTarget =
       (target && text.includes(target)) || (name && name !== target && text.includes(name));
+
+    // Publishes are judged by TOPIC first, before the target earns its exemption
+    // below: a joining device's own state is still state.
+    const publish = text.match(/^z2m:mqtt: MQTT publish: topic '([^']*)'/);
+    if (publish) {
+      const topic = publish[1];
+      // Device topics carry state, never pairing -- the target's included.
+      if (!/\/bridge\//.test(topic)) return false;
+      // Among bridge topics, only the pairing conversation. The rest is the
+      // retained inventory republishing, or this panel's own log-level flip.
+      return /\/bridge\/(event|request\/permit_join|response\/(permit_join|device\/))/.test(
+        topic
+      );
+    }
+    // A state payload under any other prefix is still state.
+    if (/"last_seen"/.test(text)) return false;
+
+    // Anything else naming the device being paired is kept: at debug level this is
+    // the interview and configure conversation, read as it happens.
     if (mentionsTarget) return true;
 
-    // Routine device traffic. These are the lines that drown everything else, and
-    // none of them concern a device that is joining -- a device Z2M is still
-    // interviewing has no state to publish and no converter to publish it with.
-    if (/^z2m:mqtt: MQTT publish: topic '[^']*'/.test(text)) {
-      // Bridge topics are the pairing conversation itself; device topics are not.
-      if (!/topic '[^'/]*\/bridge\//.test(text)) return false;
-      // Even among bridge topics, the retained inventory republishes on every
-      // state change and says nothing about pairing.
-      if (/\/bridge\/(devices|groups|info|state|logging|health)'/.test(text)) return false;
-      return true;
-    }
+    // Routine traffic from devices already on the network.
     if (/^z2m: Received Zigbee message from '/.test(text)) return false;
     if (/No converter available/.test(text)) return true;
 
@@ -3459,30 +3485,55 @@ class Z2MPanel extends HTMLElement {
     if (p.run !== run || !entry || !entry.message) return;
     if (!this._pairLogRelevant(entry.message)) return;
     p.logs.push(entry);
-    if (p.logs.length > PAIR_LOG_MAX) p.logs.splice(0, p.logs.length - PAIR_LOG_MAX);
+    const overflow = Math.max(0, p.logs.length - PAIR_LOG_MAX);
+    if (overflow) p.logs.splice(0, overflow);
     // Patch the log box in place: a full render would drop the operator's typing
-    // in the name field once a device has joined.
+    // in the name field once a device has joined. The row is APPENDED rather than
+    // the box re-written, because assigning innerHTML resets scrollTop -- which is
+    // what threw a paused reader back to the top on every arriving line.
+    //
+    // While paused the box is allowed to grow past the buffer cap: trimming from
+    // the top would slide the text the operator is reading. Resuming re-renders
+    // from the capped buffer, which is the one moment trimming costs nothing.
+    const box = this.shadowRoot && this.shadowRoot.getElementById('pairlog');
+    if (!box) return;
+    box.insertAdjacentHTML('beforeend', this._pairLogRow(entry));
+    if (!p.follow) return;
+    if (overflow) box.innerHTML = this._pairLogRows();
+    box.scrollTop = box.scrollHeight;
+  }
+
+  /** Pin the log to its newest line, discarding what paused reading held on to. */
+  _scrollPairLog() {
     const box = this.shadowRoot && this.shadowRoot.getElementById('pairlog');
     if (!box) return;
     box.innerHTML = this._pairLogRows();
-    if (p.follow) box.scrollTop = box.scrollHeight;
+    box.scrollTop = box.scrollHeight;
   }
 
-  /** Pin the pairing log to its newest line. */
-  _scrollPairLog() {
-    const box = this.shadowRoot && this.shadowRoot.getElementById('pairlog');
-    if (box) box.scrollTop = box.scrollHeight;
+  /**
+   * Re-label the follow control on its own.
+   *
+   * The gesture and the button share one piece of state, and the log lives inside
+   * the dialog: repainting the dialog to show a label change would rebuild the
+   * very element being scrolled, losing the position the operator scrolled to.
+   */
+  _syncPairFollow() {
+    const btn = this.shadowRoot && this.shadowRoot.getElementById('pairfollow');
+    if (!btn) return;
+    btn.setAttribute('aria-pressed', String(this._pairing.follow));
+    btn.textContent = this._pairing.follow ? 'Following' : 'Jump to latest';
   }
 
   _pairLogRows() {
-    return this._pairing.logs
-      .map(
-        (e) =>
-          `<div class="log ${esc(e.level || 'info')}"><span class="l">${esc(
-            e.level || 'info'
-          )}</span><span class="m">${esc(e.message)}</span></div>`
-      )
-      .join('');
+    return this._pairing.logs.map((e) => this._pairLogRow(e)).join('');
+  }
+
+  _pairLogRow(e) {
+    const level = esc(e.level || 'info');
+    return `<div class="log ${level}"><span class="l">${level}</span><span class="m">${esc(
+      e.message
+    )}</span></div>`;
   }
 
   /**
@@ -3588,6 +3639,14 @@ class Z2MPanel extends HTMLElement {
     const el = document.createElement(native ? 'ha-dialog' : 'div');
     const d = { el, native, painted: null, opened: false };
     if (native) {
+      // NOT `type="standard"`, which is what ha-dialog defaults itself to. On a
+      // narrow screen HA styles a standard dialog as a full-screen takeover, and
+      // that rule sets `margin-top:0` as a literal -- not through
+      // `--dialog-surface-margin-top`. The width and height of the takeover can be
+      // overridden with custom properties (see the CSS), but the pin to the top of
+      // the viewport cannot, so a standard dialog can never be centred vertically.
+      // Any other type keeps HA's own centred window: `margin:auto` on the surface.
+      el.setAttribute('type', 'dialog');
       // No `hideActions`: the footer is where Home Assistant puts a dialog's buttons,
       // and using it is most of what makes this look native. The title is ours too --
       // `ha-dialog`'s `heading` attribute renders the close button and leaves the
@@ -3752,10 +3811,6 @@ class Z2MPanel extends HTMLElement {
       // and "any router" is a real choice the operator makes, not the absence of one.
       data: { via: 'any', duration: String(PAIR_OPEN_SECONDS) },
       label: (s) => (s.name === 'via' ? 'Join through' : 'Open for'),
-      helper: (s) =>
-        s.name === 'via'
-          ? 'A device that refuses to join often pairs first time through a router sitting next to it, instead of whichever one answers first from across the house.'
-          : 'How long the network stays open. 254 seconds is Zigbee2MQTT\u2019s maximum.',
       changed: (data) => {
         p.via = data.via && data.via !== 'any' ? data.via : null;
         p.duration = Number(data.duration) || PAIR_OPEN_SECONDS;
@@ -3792,9 +3847,7 @@ class Z2MPanel extends HTMLElement {
     ];
     spec.data = { via: p.via || 'any', duration: String(p.duration) };
 
-    return `<div class="dlg-lead">The network stays closed until you press Start. Have the
-        device ready: joining is usually a long press, or power-cycling it a few times.</div>
-      <ha-form data-form="pair"></ha-form>`;
+    return '<ha-form data-form="pair"></ha-form>';
   }
 
   /** The window is open and nothing has joined yet. */
@@ -3819,8 +3872,6 @@ class Z2MPanel extends HTMLElement {
     return `<ha-alert alert-type="warning">The window closed after ${esc(
       p.duration
     )} seconds and no device joined.</ha-alert>
-      <div class="dlg-hint">Try again with the device held in pairing mode BEFORE you press
-        the button, or join through a router closer to it.</div>
       ${this._pairSetupStep()}`;
   }
 
@@ -3912,10 +3963,6 @@ class Z2MPanel extends HTMLElement {
         area: (dev && dev.device_id && this._deviceArea(dev.device_id)) || undefined,
       },
       label: (s) => (s.name === 'name' ? 'Name' : 'Area'),
-      helper: (s) =>
-        s.name === 'name'
-          ? 'Used for the Zigbee friendly name and the Home Assistant display name'
-          : 'Where the device is, in Home Assistant\u2019s own areas',
     }));
     return (
       `<ha-form data-form="${esc(`pairsetup:${p.target}`)}"></ha-form>` +
@@ -3935,14 +3982,13 @@ class Z2MPanel extends HTMLElement {
                 ? '<span class="chip ok">debug</span>'
                 : ''
             }
-            <ha-button appearance="plain" size="s" data-act="pairfollow"
-              aria-pressed="${p.follow}">${p.follow ? 'Following' : 'Follow'}</ha-button>
+            <ha-button appearance="plain" size="s" data-act="pairfollow" id="pairfollow"
+              aria-pressed="${p.follow}">${
+                p.follow ? 'Following' : 'Jump to latest'
+              }</ha-button>
           </span>
         </div>
         <div class="pair-log" id="pairlog">${this._pairLogRows()}</div>
-        <div class="dlg-hint">Filtered to joining, interviewing and configuring. Routine
-          traffic from devices already on the network is left out. Zigbee2MQTT is at debug
-          while this window is open, and goes back on its own when you close it.</div>
       </div>`;
   }
 
@@ -5104,7 +5150,7 @@ class Z2MPanel extends HTMLElement {
       // rather than watch the newest one arrive.
       case 'pairfollow': {
         this._pairing.follow = !this._pairing.follow;
-        this._paintPairDialog();
+        this._syncPairFollow();
         if (this._pairing.follow) this._scrollPairLog();
         return undefined;
       }

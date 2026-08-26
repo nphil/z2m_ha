@@ -20,5 +20,5 @@
     "zigpy-znp==1.1.0"
   ],
   "single_config_entry": true,
-  "version": "1.7.0"
+  "version": "1.8.0"
 }

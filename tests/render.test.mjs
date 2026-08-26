@@ -97,6 +97,13 @@ class El {
   get innerHTML() {
     return this._html;
   }
+  insertAdjacentHTML(position, html) {
+    // Only 'beforeend' is exercised: the panel appends log rows to keep the
+    // reader's scroll position, which is the behaviour under test.
+    if (position !== 'beforeend') throw new Error(`unsupported position: ${position}`);
+    this._html = `${this._html}${String(html)}`;
+    this._els = null;
+  }
   setAttribute(name, value) {
     this.attrs[name] = String(value);
   }
@@ -1734,7 +1741,11 @@ check('subscribing is what asks for it', hasSub('z2m/pairing/subscribe'));
 p._summary = { ...p._summary, log_level: 'debug' };
 p._paintPairDialog();
 check('the raised level is shown while it lasts', dlg().includes('>debug<'));
-check('and it is described as self-restoring', dlg().includes('goes back on its own'));
+// The prose is gone by request: the chip is the only thing that says the log is
+// turned up, and nothing explains it at the cost of a phone screen.
+check('no explanatory prose is left in the dialog',
+  !dlg().includes('goes back on its own') && !dlg().includes('Filtered to joining')
+  && !dlg().includes('network stays closed'));
 // Debug on a 42-device mesh is mostly other devices talking, and none of it is
 // about the device being paired.
 const noise = [
@@ -1769,13 +1780,35 @@ push('z2m/logs/subscribe', { time: Date.now() / 1000, level: 'debug',
   message: "z2m: Received Zigbee message from '0x00158d0002ab34cd', type 'readResponse'" });
 await tick();
 check('traffic from the joining device itself is kept', logRows().includes('readResponse'));
+// The device that just joined starts reporting the moment it is interviewed, and
+// its own state publishes are what buried the interview on a phone.
+const beforeState = p._pairing.logs.length;
+push('z2m/logs/subscribe', { time: Date.now() / 1000, level: 'debug',
+  message: "z2m:mqtt: MQTT publish: topic 'zigbee2mqtt/0x00158d0002ab34cd', payload"
+    + ' \'{"last_seen":"2026-08-26T01:02:03","linkquality":72}\'' });
+push('z2m/logs/subscribe', { time: Date.now() / 1000, level: 'debug',
+  message: "z2m:mqtt: MQTT publish: topic 'zigbee2mqtt/bridge/response/options', payload"
+    + ' \'{"status":"ok"}\'' });
+await tick();
+check("the joining device's own state publishes are dropped",
+  p._pairing.logs.length === beforeState,
+  `${p._pairing.logs.length - beforeState} state line(s) kept`);
+push('z2m/logs/subscribe', { time: Date.now() / 1000, level: 'debug',
+  message: "z2m:mqtt: MQTT publish: topic 'zigbee2mqtt/bridge/event', payload"
+    + ' \'{"type":"device_interview","data":{"status":"started"}}\'' });
+await tick();
+check('the pairing conversation itself is kept', logRows().includes('bridge/event'));
 
 console.log('=== pairing helper: auto-scroll, with a way to stop it ===');
 check('the log follows the newest line by default', p._pairing.follow === true
   && p.shadowRoot.getElementById('pairlog').scrollTop > 0);
 await act('pairfollow');
 check('Follow can be turned off', p._pairing.follow === false);
-check('the button says what it will do next', dlg().includes('>Follow<'));
+const followBtn = () => p.shadowRoot.getElementById('pairfollow');
+check('the button offers the action, not the state',
+  followBtn().textContent === 'Jump to latest');
+check('and its pressed state is honest',
+  followBtn().getAttribute('aria-pressed') === 'false');
 const parked = p.shadowRoot.getElementById('pairlog').scrollTop;
 push('z2m/logs/subscribe', { time: Date.now() / 1000, level: 'debug',
   message: "z2m: Configuring '0x00158d0002ab34cd' endpoint 1" });
@@ -1785,6 +1818,7 @@ check('a new line does not yank the view while paused',
 await act('pairfollow');
 check('Follow can be turned back on and re-pins', p._pairing.follow === true
   && p.shadowRoot.getElementById('pairlog').scrollTop > 0);
+check('and the label returns to the live state', followBtn().textContent === 'Following');
 // Scrolling up is itself a request to stop following.
 const pairBox = p.shadowRoot.getElementById('pairlog');
 pairBox.scrollTop = 0;
