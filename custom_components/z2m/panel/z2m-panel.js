@@ -99,6 +99,29 @@ const esc = (s) =>
     (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]
   );
 
+/**
+ * Straighten what a phone keyboard curls.
+ *
+ * iOS and Android substitute typographic punctuation as you type, so a name
+ * entered on a phone arrives as "Isabel\u2019s Lamp" while the same name typed on a
+ * desktop is "Isabel's Lamp". That single invisible difference forks in three
+ * places at once: Zigbee2MQTT keys the MQTT topic AND its state cache on the
+ * string, Home Assistant slugifies it into entity ids (isabels_ versus
+ * isabel_s_), and a name that matches an area creates a SECOND area rather than
+ * joining the existing one. Normalising on the way in is the only cheap moment.
+ *
+ * Non-breaking spaces are included because they are invisible in a name field and
+ * survive into topics, where they are impossible to spot afterwards.
+ */
+const typedName = (s) =>
+  String(s ?? '')
+    .replace(/[\u2018\u2019\u201a\u201b\u02bc\u2032]/g, "'")
+    .replace(/[\u201c\u201d\u201e\u201f\u2033]/g, '"')
+    .replace(/[\u2013\u2014\u2212]/g, '-')
+    .replace(/\u2026/g, '...')
+    .replace(/[\u00a0\u2007\u202f]/g, ' ')
+    .trim();
+
 /** `.path` is assigned as a JS property during hydration; markup carries data-* only. */
 const icon = (path, slot = 'start') =>
   `<ha-svg-icon${slot ? ` slot="${slot}"` : ''} data-path="${path}"></ha-svg-icon>`;
@@ -949,10 +972,15 @@ class Z2MPanel extends HTMLElement {
     return { to: a, to_endpoint: Number(b) };
   }
 
-  /** What the operator typed into a one-field form, trimmed. */
+  /**
+   * What the operator typed into a one-field form, trimmed and de-curled.
+   *
+   * Every caller is a name that becomes an MQTT topic, so the normalisation
+   * belongs here rather than at each call site.
+   */
   _textValue(key) {
     const spec = (this._forms || {})[key];
-    return spec ? String(spec.data.value || '').trim() : '';
+    return spec ? typedName(spec.data.value) : '';
   }
 
   /** Home Assistant selectors for one Zigbee2MQTT option, from Z2M's own schema. */
@@ -4048,7 +4076,7 @@ class Z2MPanel extends HTMLElement {
   async _savePairSetup() {
     const p = this._pairing;
     const spec = (this._forms || {})[`pairsetup:${p.target}`] || { data: {} };
-    const name = String(spec.data.name || '').trim();
+    const name = typedName(spec.data.name);
     const areaId = spec.data.area || null;
     if (!p.target) return;
 

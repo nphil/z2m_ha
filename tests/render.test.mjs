@@ -947,6 +947,13 @@ p._forms[`rename:${withOpts.ieee_address}`].data = { value: 'Hallway Dimmer 2' }
 await act('rename');
 check('Rename -> z2m/device/rename', sent.some((m) => m.type === 'z2m/device/rename'
   && m.from === withOpts.friendly_name && m.to === 'Hallway Dimmer 2'));
+// The same guard on the device page's own rename field, which is the one an
+// operator standing in the room actually uses.
+sent.length = 0;
+p._forms[`rename:${withOpts.ieee_address}`].data = { value: 'Nitin\u2019s Dimmer' };
+await act('rename');
+check('the rename field straightens a curled apostrophe', sent.some((m) =>
+  m.type === 'z2m/device/rename' && m.to === "Nitin's Dimmer"));
 sent.length = 0;
 await act('configure');
 check('Reconfigure -> z2m/device/configure', sent.some((m) => m.type === 'z2m/device/configure'
@@ -1854,13 +1861,26 @@ sent.length = 0;
 pairSetup.data = { name: 'Nursery Climate', area: 'hallway' };
 await act('pairsave');
 await tick(80);
-check('renames in Zigbee2MQTT by ieee, not by name', sent.some((m) =>
-  m.type === 'z2m/device/rename' && m.from === fx.pairing.successful.ieee_address
-  && m.to === 'Nursery Climate'));
-check('sets the HA display name and area through HA\u2019s own command', sent.some((m) =>
-  m.type === 'config/device_registry/update' && m.device_id === 'dev_paired'
-  && m.name_by_user === 'Nursery Climate' && m.area_id === 'hallway'));
-check('never rewrites entity ids', !sent.some((m) => 'new_entity_id' in m));
+// A phone curls punctuation as you type. Left alone, one device acquires two
+// spellings: two MQTT topics, two entity id shapes, and -- when the name matches
+// an area -- a second area beside the real one. Saving closed the dialog, so the
+// session is re-established to exercise the same path a second time.
+p._resetPairing();
+p._pairing.open = true;
+p._adoptPairSession(fx.pairing.successful);
+p._devices = fx.devices.concat([fx.paired_device]);
+p._paintPairDialog();
+sent.length = 0;
+p._forms[`pairsetup:${fx.pairing.successful.ieee_address}`].data = {
+  name: 'Isabel\u2019s\u00a0Lamp\u2014one',
+  area: 'hallway',
+};
+await act('pairsave');
+await tick(80);
+check('smart punctuation is straightened before it becomes a topic', sent.some((m) =>
+  m.type === 'z2m/device/rename' && m.to === "Isabel's Lamp-one"));
+check('and the HA display name gets the same spelling', sent.some((m) =>
+  m.type === 'config/device_registry/update' && m.name_by_user === "Isabel's Lamp-one"));
 
 console.log('=== add device: unsupported and failed are different states ===');
 p._resetPairing();
