@@ -134,6 +134,34 @@ BACKUP_TIMEOUT = 120
 # Everything else answers immediately.
 REQUEST_TIMEOUT = 30
 
+# Channel energy scan. The coordinator can only serve one master: Zigbee2MQTT holds
+# the TCP socket to the radio, so a scan stops the add-on, borrows the radio over
+# that same socket with zigpy-znp, and starts the add-on again no matter how the
+# scan went. The slug is this install's instance of the Zigbee2MQTT add-on.
+ENERGY_SCAN_ADDON = "45df7312_zigbee2mqtt"
+# Used only if bridge/info's serial.port cannot be parsed into host:port. It names
+# the same adapter that value carries today (tcp://192.168.1.104:7638), just in the
+# socket:// form pyserial and zigpy-znp expect.
+ENERGY_SCAN_SERIAL_FALLBACK = "socket://192.168.1.104:7638"
+# How long to give the stopped add-on to publish bridge/state offline and release
+# the socket. Z2M announces offline on graceful stop, so this is normally seconds;
+# the grace only bounds the wait when that publish never comes.
+ENERGY_SCAN_STOP_GRACE = 15
+# Borrowing the radio is seconds of work: connect, read-only network start, then 16
+# channels of ZDO energy detect. A hard deadline means a wedged socket surfaces as
+# an error instead of holding the add-on down until someone notices.
+ENERGY_SCAN_RADIO_TIMEOUT = 120
+# addon_start plus Z2M's own startup until bridge/state says online again.
+ENERGY_SCAN_RESTART_DEADLINE = 120
+# ZDO Mgmt_NWK_Update_req parameters: scan duration exponent 4, three sweeps per
+# channel. Roughly a quarter second of listening per channel per sweep.
+ENERGY_SCAN_DURATION_EXP = 4
+ENERGY_SCAN_COUNT = 3
+# Persisted scan history, newest first, so scans can be compared across weeks.
+ENERGY_SCAN_STORE_KEY = "z2m.energy_scans"
+ENERGY_SCAN_STORE_VERSION = 1
+ENERGY_SCAN_KEEP = 50
+
 # Touchlink takes the radio OFF the operating channel and sweeps the InterPAN
 # channels, so it is slow AND it stalls every other Zigbee conversation while it
 # runs. Derived from zigbee-herdsman v10.8.0 (the version 2.13.0 pins),

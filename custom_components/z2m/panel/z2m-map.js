@@ -401,7 +401,7 @@ const MOON_SLOT = 44;
  * order, so the same fleet always lands the same way.
  */
 function assignHomes(graph) {
-  const result = { parentOf: new Map() };
+  const result = { parentOf: new Map(), inferred: new Set() };
   const nodes = graph.nodes;
   if (!nodes.length) return result;
 
@@ -423,6 +423,36 @@ function assignHomes(graph) {
     const pNode = p && p !== node.ieee ? graph.byIeee.get(p) : null;
     const ok = pNode && (pNode.ieee === coordIeee || pNode.type === 'Router');
     parentOf.set(node.ieee, ok ? pNode.ieee : null);
+  }
+
+  // A device whose neighbour tables reported no usable parent still reaches the
+  // coordinator somehow, and a node floating unconnected reads as broken. Attach
+  // it by the first hop of the same inferred route the detail panel shows (the
+  // strongest measured path), validated to land on a router or the coordinator;
+  // if even that fails, fall back to its strongest directly measured router
+  // neighbour. The edge is recorded as inferred and drawn as a hypothesis
+  // (dotted, amber), never as reported structure.
+  for (const node of nodes) {
+    if (node.ieee === coordIeee) continue;
+    if (parentOf.get(node.ieee)) continue;
+    const route = graph.routeToCoordinator(node.ieee);
+    let upNode = null;
+    if (route.kind === 'inferred' && route.hops.length) {
+      const first = graph.byIeee.get(route.hops[0].to);
+      if (first && (first.ieee === coordIeee || first.type === 'Router')) upNode = first;
+    }
+    if (!upNode) {
+      let best = null;
+      for (const link of graph.adj.get(node.ieee) || []) {
+        const other = graph.byIeee.get(graph.other(link, node.ieee));
+        if (!other || (other.ieee !== coordIeee && other.type !== 'Router')) continue;
+        if (!best || (link.lqi ?? -1) > (best.link.lqi ?? -1)) best = { other, link };
+      }
+      upNode = best ? best.other : null;
+    }
+    if (!upNode) continue;
+    parentOf.set(node.ieee, upNode.ieee);
+    result.inferred.add(pairKey(node.ieee, upNode.ieee));
   }
   // Parent loops occur in real tables. Cut at the first revisited node, which is
   // deterministic, so a cycle becomes a subtree hanging off ring one.
@@ -663,7 +693,7 @@ function assignHomes(graph) {
  * two devices carry no extra geometry, only extra ink, so they are collapsed here
  * -- the asymmetry diagnostic still reads the raw rows off the Graph.
  */
-function classifyPairs(graph, parentOf) {
+function classifyPairs(graph, parentOf, inferred) {
   const pairs = new Map();
   const treeKeys = new Set();
   for (const [ieee, p] of parentOf) if (p) treeKeys.add(pairKey(ieee, p));
@@ -671,7 +701,15 @@ function classifyPairs(graph, parentOf) {
     const key = pairKey(link.source, link.target);
     const cur = pairs.get(key);
     if (!cur || (link.lqi ?? -1) > (cur.link.lqi ?? -1)) {
-      pairs.set(key, { key, a: link.source, b: link.target, link, tree: treeKeys.has(key) });
+      const tree = treeKeys.has(key);
+      pairs.set(key, {
+        key,
+        a: link.source,
+        b: link.target,
+        link,
+        tree,
+        inferred: tree && !!inferred && inferred.has(key),
+      });
     }
   }
   return pairs;
@@ -1068,6 +1106,11 @@ class Z2MNetworkMap extends HTMLElement {
                         opacity:.85; }
       .link.tree.unknown { stroke:var(--disabled-text-color, #bdbdbd);
                            stroke-width:1.4; stroke-dasharray:2 5; opacity:.55; }
+      /* An inferred attachment: the device reported no usable parent, so this is
+         the strongest measured path to a router, drawn as a hypothesis rather
+         than a report. Dotted and amber to match the "inferred path" chip. */
+      .link.tree.inferred { stroke:var(--warning-color, #ff9800);
+                            stroke-dasharray:1.5 4; stroke-width:1.6; opacity:.6; }
       .link.peer { stroke:var(--secondary-text-color, #727272); stroke-width:1;
                    stroke-dasharray:3 4; opacity:.16; }
       .link.dim { opacity:.06; }
@@ -1173,6 +1216,8 @@ class Z2MNetworkMap extends HTMLElement {
       .legend i.ln-weak { background:var(--error-color,#f44336); }
       .legend i.ln-unknown { background:repeating-linear-gradient(90deg,
                   var(--disabled-text-color,#bdbdbd) 0 3px, transparent 3px 6px); }
+      .legend i.ln-inferred { background:repeating-linear-gradient(90deg,
+                  var(--warning-color,#ff9800) 0 2px, transparent 2px 6px); }
       .legend b { font-weight:500; color:var(--primary-text-color,#212121); }
 
       /* Desktop and tablet: parked bottom-right, opposite the legend, so it never
@@ -1374,7 +1419,8 @@ class Z2MNetworkMap extends HTMLElement {
     // Deterministic radial-tree targets; the live forces do the rest.
     const layout = assignHomes(this._graph);
     this._parentOf = layout.parentOf;
-    const pairs = classifyPairs(this._graph, layout.parentOf);
+    const pairs = classifyPairs(this._graph, layout.parentOf, layout.inferred);
+    this._inferredCount = layout.inferred.size;
 
     // Keep known positions, seat new nodes straight on their layout slot.
     for (const node of this._graph.nodes) {
@@ -1429,7 +1475,10 @@ class Z2MNetworkMap extends HTMLElement {
       entry.link = pair.link;
       entry.a = pair.a;
       entry.b = pair.b;
-      entry.el.setAttribute('class', `link ${pair.tree ? 'tree' : 'peer'} ${linkTone(pair.link.lqi)}`);
+      entry.el.setAttribute(
+        'class',
+        `link ${pair.tree ? 'tree' : 'peer'}${pair.inferred ? ' inferred' : ''} ${linkTone(pair.link.lqi)}`
+      );
       const host = pair.tree ? this._gLinks : this._gPeers;
       if (entry.el.parentNode !== host) host.append(entry.el);
       // Stamp endpoints immediately: the first paint after a streamed event must
@@ -1578,6 +1627,7 @@ class Z2MNetworkMap extends HTMLElement {
     const chokes = this._choke?.size || 0;
     const asym = this._graph.asymmetric().length;
     const failed = this._graph.nodes.filter((n) => n.failed?.length).length;
+    const inferred = this._inferredCount || 0;
 
     // Three tones and unknown, matching the drawn edges. The words carry the
     // diagnostics; the lines stay calm.
@@ -1586,6 +1636,13 @@ class Z2MNetworkMap extends HTMLElement {
       `<span><i class="ln-mid"></i>fair</span>`,
       `<span><i class="ln-weak"></i>weak</span>`,
       `<span><i class="ln-unknown"></i>unmeasured</span>`,
+      // Only when one is actually drawn: most opens have a complete tree, and a
+      // legend entry for an edge that is not on screen is noise.
+      ...(inferred
+        ? [
+            `<span title="No parent was reported for these devices; the dotted amber edge is the strongest measured path instead."><i class="ln-inferred"></i>inferred</span>`,
+          ]
+        : []),
     ];
     if (this._diagnostics) {
       if (weak) bits.push(`<span><b>${weak}</b> weak</span>`);
@@ -2056,7 +2113,7 @@ class Z2MNetworkMap extends HTMLElement {
       this._route?.kind === 'parent'
         ? '<span class="chip parent">parent chain</span>'
         : this._route?.kind === 'inferred'
-          ? '<span class="chip inferred">inferred path</span>'
+          ? '<span class="chip inferred" title="This device reported no parent in the neighbour tables, so the map shows the strongest measured path instead. It is drawn dotted and amber on the mesh.">inferred path</span>'
           : '<span class="chip bad">no path</span>';
 
     const hopList = hops

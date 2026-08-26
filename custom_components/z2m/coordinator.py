@@ -36,6 +36,7 @@ import logging
 from pathlib import Path
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from homeassistant.components import mqtt
 from homeassistant.config_entries import ConfigEntry
@@ -51,6 +52,8 @@ from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
     async_dispatcher_send,
 )
+from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 
 from .const import (
     BINDABLE_CLUSTERS,
@@ -59,6 +62,16 @@ from .const import (
     COORDINATOR_CHECK_TIMEOUT,
     DEFAULT_BIND_GROUP_ID,
     DOMAIN,
+    ENERGY_SCAN_ADDON,
+    ENERGY_SCAN_COUNT,
+    ENERGY_SCAN_DURATION_EXP,
+    ENERGY_SCAN_KEEP,
+    ENERGY_SCAN_RADIO_TIMEOUT,
+    ENERGY_SCAN_RESTART_DEADLINE,
+    ENERGY_SCAN_SERIAL_FALLBACK,
+    ENERGY_SCAN_STOP_GRACE,
+    ENERGY_SCAN_STORE_KEY,
+    ENERGY_SCAN_STORE_VERSION,
     EXTENSION_NAME,
     EXTENSION_SAVE_TIMEOUT,
     EXTENSION_WAIT,
@@ -337,6 +350,11 @@ class Z2MData:
         self.devices: list[dict[str, Any]] = []
         self.groups: list[dict[str, Any]] = []
         self.health: dict[str, Any] = {}
+        # When bridge/health last arrived (epoch seconds). The topic is retained, so
+        # on reload this says "now" for a payload that may be older; it still bounds
+        # staleness, because Z2M republishes health on a fixed interval and a stale
+        # timestamp means the bridge has stopped doing so.
+        self.health_received_at: float | None = None
         self.bridge_state: str | None = None
         self.availability: dict[str, str] = {}
         # Latest normalized join/interview state per IEEE address. bridge/event is
@@ -391,6 +409,22 @@ class Z2MData:
         self._dispatch_lock = asyncio.Lock()
         self._next_dispatch = 0.0
         self._transaction = 0
+        # Channel energy scan. One at a time, ever: the scan stops the whole add-on
+        # to borrow the radio. The status flag is flipped synchronously at the
+        # websocket edge, which is what closes the gap between two near-simultaneous
+        # run commands; the lock serialises the job itself.
+        self._energy_lock = asyncio.Lock()
+        self._energy_status: dict[str, Any] = {
+            "running": False,
+            "stage": "idle",
+            "detail": None,
+            "started_at": None,
+        }
+        self._energy_store: Store[list[dict[str, Any]]] = Store(
+            hass, ENERGY_SCAN_STORE_VERSION, ENERGY_SCAN_STORE_KEY
+        )
+        # Loaded lazily on first use; None distinguishes "not read yet" from "empty".
+        self._energy_scans: list[dict[str, Any]] | None = None
         self._unsubs: list[Any] = []
 
     # ---------------------------------------------------------------- subscribe
@@ -513,6 +547,7 @@ class Z2MData:
             groups_changed = True
         elif suffix == TOPIC_HEALTH and isinstance(payload, dict):
             self.health = payload
+            self.health_received_at = time.time()
         elif suffix == TOPIC_STATE:
             if isinstance(payload, dict):
                 self.bridge_state = payload.get("state")
@@ -1706,14 +1741,21 @@ class Z2MData:
 
     # --------------------------------------------------------------- network map
 
-    async def async_networkmap(self, force: bool = False) -> dict[str, Any]:
+    async def async_networkmap(
+        self, force: bool = False, cached_only: bool = False
+    ) -> dict[str, Any]:
         """The normalized topology, from cache unless it is stale or forced.
 
         A scan asks every router for its neighbour table and takes tens of seconds,
         with some routers never answering at all, so it is emphatically not
         something to run on every page view.
+
+        `cached_only` returns whatever cache exists even when it is stale, and only
+        falls through to a scan when there is no cache at all. The panel opens with
+        it so a stale map draws instantly with its age shown, instead of freezing
+        the view behind a blocking walk.
         """
-        if not force and self._map_fresh():
+        if not force and (self._map_fresh() or (cached_only and self.map is not None)):
             return self._map_result(cached=True)
 
         scan = self._async_ensure_scan()
@@ -2374,6 +2416,207 @@ class Z2MData:
             "rxOnWhenIdle": rx_on_when_idle,
             "routes": list(routes),
         }
+
+    # ------------------------------------------------------------- energy scan
+    #
+    # A channel energy scan asks the coordinator itself how noisy each of the 16
+    # Zigbee channels is, which Zigbee2MQTT offers no request for. The radio serves
+    # one master at a time -- Z2M holds the TCP socket to it -- so the scan STOPS
+    # THE WHOLE ADD-ON, borrows the radio read-only with zigpy-znp over the same
+    # socket, and restarts the add-on afterwards no matter how the scan went. The
+    # mesh is down for the duration (about a minute, dominated by Z2M's restart),
+    # which is why the panel treats this as a deliberate maintenance action.
+
+    @callback
+    def energy_scan_status(self) -> dict[str, Any]:
+        """Where the scan currently is, shaped for the panel."""
+        return dict(self._energy_status)
+
+    async def _energy_records(self) -> list[dict[str, Any]]:
+        """The persisted scan history, newest first, loaded once."""
+        if self._energy_scans is None:
+            self._energy_scans = await self._energy_store.async_load() or []
+        return self._energy_scans
+
+    async def async_energy_scan_list(self) -> list[dict[str, Any]]:
+        return list(await self._energy_records())
+
+    async def async_energy_scan_delete(self, scan_id: str) -> bool:
+        scans = await self._energy_records()
+        kept = [s for s in scans if s.get("id") != scan_id]
+        if len(kept) == len(scans):
+            return False
+        self._energy_scans = kept
+        await self._energy_store.async_save(kept)
+        return True
+
+    async def async_energy_scan(self) -> dict[str, Any]:
+        """Run one scan end to end and return the saved record.
+
+        The work runs as its own task behind a shield: a browser giving up on a
+        five-minute command must not cancel the job while the add-on is stopped,
+        or nothing would ever start it again.
+        """
+        if self._energy_status["running"] or self._energy_lock.locked():
+            raise Z2MError("An energy scan is already running")
+        self._energy_state(
+            running=True,
+            stage="stopping",
+            detail=None,
+            started_at=dt_util.utcnow().isoformat(),
+        )
+        return await asyncio.shield(
+            self.hass.async_create_task(self._energy_scan_job(), "z2m-energy-scan")
+        )
+
+    @callback
+    def _energy_state(self, **changes: Any) -> None:
+        self._energy_status.update(changes)
+
+    async def _energy_scan_job(self) -> dict[str, Any]:
+        async with self._energy_lock:
+            started_at = self._energy_status["started_at"]
+            stopped = False
+            failure: str | None = None
+            record: dict[str, Any] | None = None
+            came_back = True
+            try:
+                # Read the serial path and channel from the retained bridge/info
+                # BEFORE stopping the add-on: the mirror stays populated, but a
+                # scan should not depend on that.
+                serial = self._energy_serial_path()
+                channel = self._energy_channel()
+                await self.hass.services.async_call(
+                    "hassio", "addon_stop", {"addon": ENERGY_SCAN_ADDON}, blocking=True
+                )
+                stopped = True
+                await self._energy_wait_offline()
+                self._energy_state(stage="scanning")
+                async with asyncio.timeout(ENERGY_SCAN_RADIO_TIMEOUT):
+                    energy = await self._energy_read_radio(serial)
+                record = {
+                    "id": dt_util.utcnow().strftime("%Y%m%d%H%M%S"),
+                    "started_at": started_at,
+                    "finished_at": dt_util.utcnow().isoformat(),
+                    "channel": channel,
+                    "energy": energy,
+                    "duration_exp": ENERGY_SCAN_DURATION_EXP,
+                    "count": ENERGY_SCAN_COUNT,
+                }
+                # Persist before restarting, so the measurement survives even if
+                # Zigbee2MQTT never comes back.
+                scans = await self._energy_records()
+                scans.insert(0, record)
+                del scans[ENERGY_SCAN_KEEP:]
+                await self._energy_store.async_save(scans)
+            except Exception as err:  # noqa: BLE001
+                failure = str(err) or type(err).__name__
+            finally:
+                # The add-on MUST come back whatever happened above, including
+                # cancellation: a stopped Zigbee2MQTT is a dead mesh.
+                if stopped:
+                    self._energy_state(stage="restarting")
+                    came_back = await self._energy_restart_addon()
+
+            if failure is not None:
+                detail = f"Energy scan failed: {failure}"
+                if not came_back:
+                    detail += ", and Zigbee2MQTT did not come back within 2 minutes"
+                self._energy_state(running=False, stage="error", detail=detail)
+                raise Z2MError(detail)
+            if not came_back:
+                detail = "Scan saved, but Zigbee2MQTT did not come back within 2 minutes"
+                self._energy_state(running=False, stage="error", detail=detail)
+                raise Z2MError(detail)
+            self._energy_state(running=False, stage="done", detail=None)
+            return record
+
+    @callback
+    def _energy_serial_path(self) -> str:
+        """The radio's socket path, from bridge/info's serial.port.
+
+        Z2M writes it as tcp://host:port; pyserial (and therefore zigpy-znp)
+        spells the same transport socket://host:port.
+        """
+        port = ((self.info.get("config") or {}).get("serial") or {}).get("port")
+        if isinstance(port, str):
+            parts = urlsplit(port.strip())
+            try:
+                if parts.hostname and parts.port:
+                    return f"socket://{parts.hostname}:{parts.port}"
+            except ValueError:
+                pass
+        return ENERGY_SCAN_SERIAL_FALLBACK
+
+    @callback
+    def _energy_channel(self) -> int | None:
+        """The channel Z2M operates on, so the scan can mark it in the results."""
+        channel = (self.info.get("network") or {}).get("channel")
+        if not isinstance(channel, int):
+            channel = (
+                ((self.info.get("config") or {}).get("advanced") or {}).get("channel")
+            )
+        return channel if isinstance(channel, int) else None
+
+    async def _energy_wait_offline(self) -> None:
+        """Wait for the stopped bridge to announce offline and release the socket.
+
+        Z2M publishes bridge/state offline on graceful stop, so this normally
+        returns in a second or two; the grace bounds the wait when it does not.
+        """
+        deadline = time.monotonic() + ENERGY_SCAN_STOP_GRACE
+        while self.bridge_state == "online" and time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+
+    async def _energy_read_radio(self, serial: str) -> dict[str, float]:
+        """Borrow the radio and measure every channel, leaving the socket closed.
+
+        Mirrors zigpy-znp's own tools/energy_scan.py: connect, start the network
+        read-only (no NVRAM writes), issue the ZDO energy detect, shut down. The
+        shutdown is load-bearing -- a half-open socket would block Zigbee2MQTT
+        from reconnecting when it restarts.
+        """
+
+        def _import():
+            # zigpy-znp imports slowly enough to trip the event-loop watchdog.
+            from zigpy.types import Channels
+            from zigpy_znp.zigbee.application import ControllerApplication
+
+            return Channels, ControllerApplication
+
+        channels_t, controller_cls = await self.hass.async_add_executor_job(_import)
+        # The raw dict, validated once by __init__. Running SCHEMA here and again
+        # in __init__ crashes zigpy 2.1.0: cv_ota_provider does not accept its own
+        # output. Same construction as zigpy-znp's tools/energy_scan.py.
+        app = controller_cls({"device": {"path": serial}})
+        await app.connect()
+        try:
+            await app.start_network(read_only=True)
+            raw = await app.energy_scan(
+                channels=channels_t.ALL_CHANNELS,
+                duration_exp=ENERGY_SCAN_DURATION_EXP,
+                count=ENERGY_SCAN_COUNT,
+            )
+        finally:
+            await app.shutdown()
+        # zigpy reports 0-255 per channel; the panel shows a percentage.
+        return {str(ch): round(value * 100 / 255, 1) for ch, value in raw.items()}
+
+    async def _energy_restart_addon(self) -> bool:
+        """Start the add-on again and wait for the bridge to say online."""
+        try:
+            await self.hass.services.async_call(
+                "hassio", "addon_start", {"addon": ENERGY_SCAN_ADDON}, blocking=True
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Zigbee2MQTT add-on did not start after energy scan")
+            return False
+        deadline = time.monotonic() + ENERGY_SCAN_RESTART_DEADLINE
+        while time.monotonic() < deadline:
+            if self.bridge_state == "online":
+                return True
+            await asyncio.sleep(1.0)
+        return False
 
     # -------------------------------------------------------------------- views
 

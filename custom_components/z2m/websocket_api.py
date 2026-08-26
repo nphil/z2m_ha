@@ -66,6 +66,11 @@ def async_setup_websocket(hass: HomeAssistant) -> None:
         ws_logs,
         ws_logs_subscribe,
         ws_coordinator_check,
+        ws_health,
+        ws_energy_scan_run,
+        ws_energy_scan_status,
+        ws_energy_scan_list,
+        ws_energy_scan_delete,
         ws_permit_join,
         ws_rename,
         ws_group_add,
@@ -329,6 +334,7 @@ async def ws_pairing_subscribe(hass, connection, msg, data) -> None:
     {
         vol.Required("type"): "z2m/networkmap",
         vol.Optional("force", default=False): bool,
+        vol.Optional("cached_only", default=False): bool,
     }
 )
 @websocket_api.async_response
@@ -338,7 +344,9 @@ async def ws_networkmap(hass, connection, msg, data) -> None:
 
     `force` is admin-only: a forced scan has the coordinator interrogate every
     router for tens of seconds, which is the one thing here a dashboard viewer
-    should not be able to set off.
+    should not be able to set off. `cached_only` is the opposite promise: never
+    scan, hand back whatever cache exists even when stale, so opening the map
+    costs nothing on the radio.
     """
     if msg["force"] and not connection.user.is_admin:
         connection.send_error(
@@ -347,7 +355,10 @@ async def ws_networkmap(hass, connection, msg, data) -> None:
             "Forcing a network scan requires an administrator",
         )
         return
-    connection.send_result(msg["id"], await data.async_networkmap(force=msg["force"]))
+    connection.send_result(
+        msg["id"],
+        await data.async_networkmap(force=msg["force"], cached_only=msg["cached_only"]),
+    )
 
 
 @websocket_api.websocket_command({vol.Required("type"): "z2m/networkmap/subscribe"})
@@ -446,6 +457,69 @@ async def ws_coordinator_check(hass, connection, msg, data) -> None:
     """
     connection.send_result(
         msg["id"], {"missing_routers": await data.async_coordinator_check()}
+    )
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): "z2m/health"})
+@websocket_api.async_response
+@_guard
+async def ws_health(hass, connection, msg, data) -> None:
+    """The retained bridge/health snapshot, verbatim, with its arrival time.
+
+    Admin like the log commands: the payload echoes raw per-device counters
+    keyed by IEEE address. `received_at` is epoch seconds, or null before the
+    first health publish lands.
+    """
+    connection.send_result(
+        msg["id"],
+        {"received_at": data.health_received_at, "health": data.health or None},
+    )
+
+
+# ------------------------------------------------------------------ energy scan
+#
+# The scan stops the whole Zigbee2MQTT add-on to borrow the radio, so `run` is a
+# deliberate maintenance action that takes the mesh down for about a minute. All
+# of the orchestration lives in Z2MData.async_energy_scan; the command holds the
+# websocket open for the duration (up to five minutes) and answers with the saved
+# record, and the scan itself survives the browser giving up early.
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): "z2m/energy_scan/run"})
+@websocket_api.async_response
+@_guard
+async def ws_energy_scan_run(hass, connection, msg, data) -> None:
+    connection.send_result(msg["id"], await data.async_energy_scan())
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): "z2m/energy_scan/status"})
+@websocket_api.async_response
+@_guard
+async def ws_energy_scan_status(hass, connection, msg, data) -> None:
+    connection.send_result(msg["id"], data.energy_scan_status())
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): "z2m/energy_scan/list"})
+@websocket_api.async_response
+@_guard
+async def ws_energy_scan_list(hass, connection, msg, data) -> None:
+    connection.send_result(msg["id"], {"scans": await data.async_energy_scan_list()})
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    # `scan`, not `id`: the envelope owns `id`. See the device-command NOTE below.
+    {vol.Required("type"): "z2m/energy_scan/delete", vol.Required("scan"): str}
+)
+@websocket_api.async_response
+@_guard
+async def ws_energy_scan_delete(hass, connection, msg, data) -> None:
+    connection.send_result(
+        msg["id"], {"deleted": await data.async_energy_scan_delete(msg["scan"])}
     )
 
 

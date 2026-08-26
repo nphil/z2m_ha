@@ -430,6 +430,58 @@ const link = (source, target, lqi, relationship, extra = {}) => ({
   check('an unreachable device reports no path', route.kind === 'none' && !route.hops.length);
 }
 
+/* ----------------------------------------- inferred attachments are drawn as such */
+{
+  // A device with only sibling rows reports no parent. It must still be attached
+  // to the mesh: parented for layout by its strongest measured router path, with
+  // the edge marked inferred so it draws as a hypothesis, not a report.
+  const g = new Graph({
+    coordinator: COORD,
+    nodes: [
+      node(COORD, 'Coordinator'),
+      node('0x00router', 'Router'),
+      node('0x00lost', 'EndDevice'),
+      node('0x00leaf', 'EndDevice'),
+    ],
+    links: [
+      link('0x00router', COORD, 200, 1), // reported: router is the coordinator's child
+      link('0x00leaf', '0x00router', 90, 1), // reported: leaf is the router's child
+      link('0x00lost', '0x00router', 120, 2), // sibling row only: no parent claim
+    ],
+  });
+  const layout = assignHomes(g);
+  check(
+    'a parentless device is attached by inference',
+    layout.parentOf.get('0x00lost') === '0x00router',
+    `got ${layout.parentOf.get('0x00lost')}`
+  );
+  check(
+    'the inferred attachment is recorded as inferred',
+    layout.inferred.has(pairKey('0x00lost', '0x00router'))
+  );
+  check(
+    'a reported parent edge is never marked inferred',
+    !layout.inferred.has(pairKey('0x00leaf', '0x00router'))
+  );
+  const pairs = classifyPairs(g, layout.parentOf, layout.inferred);
+  const lost = pairs.get(pairKey('0x00lost', '0x00router'));
+  const leaf = pairs.get(pairKey('0x00leaf', '0x00router'));
+  check('the inferred pair is tree and inferred', !!lost && lost.tree && lost.inferred);
+  check('the reported pair is tree and not inferred', !!leaf && leaf.tree && !leaf.inferred);
+
+  // A genuinely unreachable device stays unattached: no invented edges.
+  const g2 = new Graph({
+    coordinator: COORD,
+    nodes: [node(COORD, 'Coordinator'), node('0x00orphan', 'EndDevice')],
+    links: [],
+  });
+  const layout2 = assignHomes(g2);
+  check(
+    'an unreachable device is not given an invented parent',
+    !layout2.parentOf.get('0x00orphan') && layout2.inferred.size === 0
+  );
+}
+
 /* ---------------------------------------------------------------- choke points */
 {
   // leaf sits behind exactly one router; spare sits on a redundant pair.

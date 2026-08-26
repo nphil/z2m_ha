@@ -166,6 +166,79 @@
       "endpoints": [
         1
       ]
+    },
+    {
+      "ieee_address": "0x0000000000000005",
+      "friendly_name": "Attic Repeater",
+      "network_address": 4001,
+      "vendor": "Inovelli",
+      "model": "VZM31-SN",
+      "description": "2-in-1 switch + dimmer",
+      "type": "Router",
+      "power_source": "Mains (single phase)",
+      "availability": "online",
+      "supported": true,
+      "software_build_id": "",
+      "date_code": "",
+      "options": [
+        {
+          "type": "binary",
+          "name": "state_action",
+          "property": "state_action",
+          "label": "State action",
+          "description": "State actions will also be published as 'action' when true.",
+          "value_on": true,
+          "value_off": false
+        },
+        {
+          "type": "numeric",
+          "name": "transition",
+          "property": "transition",
+          "label": "Transition",
+          "description": "Time in seconds a transition should take.",
+          "value_min": 0,
+          "value_max": 65535,
+          "value_step": 0.1
+        },
+        {
+          "type": "enum",
+          "name": "effect_color_mode",
+          "property": "effect_color_mode",
+          "label": "Effect color mode",
+          "description": "How the LED bar reports colour while an effect runs.",
+          "values": [
+            "stop",
+            "keep",
+            "restore"
+          ]
+        },
+        {
+          "type": "text",
+          "name": "friendly_note",
+          "property": "friendly_note",
+          "label": "Note",
+          "description": "Free-form note stored by Zigbee2MQTT."
+        },
+        {
+          "type": "binary",
+          "name": "color_sync",
+          "property": "color_sync",
+          "label": "Colour sync",
+          "value_on": true,
+          "value_off": false
+        },
+        {
+          "type": "binary",
+          "name": "hue_native_control",
+          "property": "hue_native_control",
+          "label": "Hue native control",
+          "value_on": true,
+          "value_off": false
+        }
+      ],
+      "scenes": [],
+      "update_entity": "update.hallway_dimmer",
+      "endpoints": []
     }
   ],
   "groups": [
@@ -272,6 +345,105 @@
       },
       "last_changed": "2026-08-25T22:00:35+00:00",
       "last_updated": "2026-08-25T22:00:35+00:00"
+    },
+    "sensor.z_coordinator_core_chip_temp": {
+      "entity_id": "sensor.z_coordinator_core_chip_temp",
+      "state": "111.31",
+      "attributes": {
+        "friendly_name": "Z Coordinator Core chip temp",
+        "unit_of_measurement": "\u00b0F",
+        "device_class": "temperature"
+      }
+    },
+    "sensor.z_coordinator_zigbee_chip_temp": {
+      "entity_id": "sensor.z_coordinator_zigbee_chip_temp",
+      "state": "38.5",
+      "attributes": {
+        "friendly_name": "Z Coordinator Zigbee chip temp",
+        "unit_of_measurement": "\u00b0C",
+        "device_class": "temperature"
+      }
+    },
+    "sensor.z_coordinator_core_uptime": {
+      "entity_id": "sensor.z_coordinator_core_uptime",
+      "state": "2026-08-22T00:00:00+00:00",
+      "attributes": {
+        "friendly_name": "Z Coordinator Core uptime",
+        "device_class": "timestamp"
+      }
+    },
+    "sensor.z_coordinator_zigbee_uptime": {
+      "entity_id": "sensor.z_coordinator_zigbee_uptime",
+      "state": "2026-08-24T00:00:00+00:00",
+      "attributes": {
+        "friendly_name": "Z Coordinator Zigbee uptime",
+        "device_class": "timestamp"
+      }
+    },
+    "sensor.z_coordinator_ram_usage": {
+      "entity_id": "sensor.z_coordinator_ram_usage",
+      "state": "1843",
+      "attributes": {
+        "friendly_name": "Z Coordinator RAM usage",
+        "unit_of_measurement": "kB"
+      }
+    },
+    "sensor.z_coordinator_connection_mode": {
+      "entity_id": "sensor.z_coordinator_connection_mode",
+      "state": "eth",
+      "attributes": {
+        "friendly_name": "Z Coordinator Connection mode"
+      }
+    },
+    "binary_sensor.z_coordinator_ethernet": {
+      "entity_id": "binary_sensor.z_coordinator_ethernet",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Z Coordinator Ethernet",
+        "device_class": "connectivity"
+      }
+    },
+    "binary_sensor.z_coordinator_internet": {
+      "entity_id": "binary_sensor.z_coordinator_internet",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Z Coordinator Internet",
+        "device_class": "connectivity"
+      }
+    },
+    "update.z_coordinator_core_firmware": {
+      "entity_id": "update.z_coordinator_core_firmware",
+      "state": "off",
+      "attributes": {
+        "friendly_name": "Z Coordinator Core firmware",
+        "installed_version": "v2.9.9",
+        "latest_version": "v2.9.9",
+        "in_progress": false
+      }
+    },
+    "update.z_coordinator_zigbee_firmware": {
+      "entity_id": "update.z_coordinator_zigbee_firmware",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Z Coordinator Zigbee firmware",
+        "installed_version": "20240710",
+        "latest_version": "20250321",
+        "in_progress": false
+      }
+    },
+    "switch.z_coordinator_disable_leds": {
+      "entity_id": "switch.z_coordinator_disable_leds",
+      "state": "off",
+      "attributes": {
+        "friendly_name": "Z Coordinator Disable LEDs"
+      }
+    },
+    "switch.z_coordinator_led_night_mode": {
+      "entity_id": "switch.z_coordinator_led_night_mode",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Z Coordinator LED night mode"
+      }
     }
   },
   "registry": {
@@ -401,6 +573,18 @@
         "labels": [
           "zigbee2mqtt"
         ],
+        "display_precision": 1
+      },
+      "sensor.z_coordinator_core_chip_temp": {
+        "entity_id": "sensor.z_coordinator_core_chip_temp",
+        "device_id": "devC",
+        "labels": [],
+        "display_precision": 1
+      },
+      "sensor.z_coordinator_zigbee_chip_temp": {
+        "entity_id": "sensor.z_coordinator_zigbee_chip_temp",
+        "device_id": "devC",
+        "labels": [],
         "display_precision": 1
       }
     },
@@ -532,6 +716,106 @@
       }
     }
   },
+  "health": {
+    "received_at": 0,
+    "health": {
+      "response_time": 12,
+      "os": {
+        "load_average": [
+          0.42,
+          0.31,
+          0.25
+        ],
+        "memory_used_mb": 512.3,
+        "memory_percent": 6.4
+      },
+      "process": {
+        "uptime_sec": 262800,
+        "memory_used_mb": 158.2,
+        "memory_percent": 1.9
+      },
+      "mqtt": {
+        "connected": true,
+        "queued": 0,
+        "published": 12345,
+        "received": 54321
+      },
+      "devices": {
+        "0x0000000000000001": {
+          "messages": 4200,
+          "messages_per_sec": 0.35,
+          "leave_count": 0,
+          "network_address_changes": 0
+        },
+        "0x0000000000000002": {
+          "messages": 88,
+          "messages_per_sec": 0.01,
+          "leave_count": 1,
+          "network_address_changes": 0
+        },
+        "0x0000000000000004": {
+          "messages": 12,
+          "messages_per_sec": 0.002,
+          "leave_count": 0,
+          "network_address_changes": 2
+        }
+      }
+    }
+  },
+  "energy_scans": [
+    {
+      "id": "scan-2",
+      "started_at": "2026-08-25T12:00:00+00:00",
+      "finished_at": "2026-08-25T12:02:00+00:00",
+      "channel": 15,
+      "duration_exp": 4,
+      "count": 5,
+      "energy": {
+        "11": 62.4,
+        "12": 48.2,
+        "13": 35.1,
+        "14": 22.0,
+        "15": 8.4,
+        "16": 15.9,
+        "17": 30.2,
+        "18": 44.7,
+        "19": 51.3,
+        "20": 66.8,
+        "21": 72.1,
+        "22": 58.4,
+        "23": 41.9,
+        "24": 28.6,
+        "25": 19.2,
+        "26": 76.3
+      }
+    },
+    {
+      "id": "scan-1",
+      "started_at": "2026-08-22T09:00:00+00:00",
+      "finished_at": "2026-08-22T09:02:00+00:00",
+      "channel": 15,
+      "duration_exp": 4,
+      "count": 3,
+      "energy": {
+        "11": 55.0,
+        "12": 47.5,
+        "13": 39.0,
+        "14": 5.2,
+        "15": 12.8,
+        "16": 20.4,
+        "17": 33.9,
+        "18": 46.1,
+        "19": 52.7,
+        "20": 64.3,
+        "21": 81.0,
+        "22": 57.2,
+        "23": 44.8,
+        "24": 31.5,
+        "25": 24.9,
+        "26": 70.6
+      }
+    }
+  ],
   "backup": {
     "zip": "UEsDBCBwcmV0ZW5kIGNvb3JkaW5hdG9yIGJhY2t1cA=="
   },

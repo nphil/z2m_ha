@@ -36,6 +36,18 @@ const fx = JSON.parse(readFileSync(join(here, 'fixture.json'), 'utf8'));
 fx.networkmap.generated = Date.now() / 1000 - 4 * 60;
 fx.info.map_generated = fx.networkmap.generated;
 fx.logs.entries = fx.logs.entries.map((e, i) => ({ ...e, time: Date.now() / 1000 - (10 - i) }));
+// The coordinator uptime sensors are timestamps: their STATE is the boot moment, so
+// they are re-anchored the same way, offsets preserved.
+fx.states['sensor.z_coordinator_core_uptime'].state =
+  new Date(Date.now() - (3 * 86400 + 2 * 3600) * 1000).toISOString();
+fx.states['sensor.z_coordinator_zigbee_uptime'].state =
+  new Date(Date.now() - (1 * 86400 + 2 * 3600) * 1000).toISOString();
+// The retained health report arrived two minutes ago; saved scans keep their spread.
+fx.health.received_at = Date.now() / 1000 - 120;
+fx.energy_scans[0].started_at = new Date(Date.now() - 40 * 60 * 1000).toISOString();
+fx.energy_scans[0].finished_at = new Date(Date.now() - 38 * 60 * 1000).toISOString();
+fx.energy_scans[1].started_at = new Date(Date.now() - 3 * 86400 * 1000).toISOString();
+fx.energy_scans[1].finished_at = new Date(Date.now() - (3 * 86400 - 120) * 1000).toISOString();
 
 /* ------------------------------------------------------------------ tiny DOM */
 //
@@ -392,6 +404,10 @@ let failFeed = null;
 // Group and pairing writes answer the way Zigbee2MQTT does, so the panel is tested
 // against real response shapes rather than bare acks.
 let groupAddId = 7;
+// Channel energy scans: the run is gated so a test can settle it deliberately, and
+// the status answer is whatever the scenario says Zigbee2MQTT is doing right now.
+let scanRunGate = null;
+let scanStatus = { running: false, stage: 'idle', detail: null, started_at: null };
 
 // Service calls made by the device page's live controls.
 const called = [];
@@ -437,6 +453,18 @@ const hass = {
           return Promise.resolve(fx.coordinator_check);
         case 'z2m/health_check':
           return Promise.resolve(fx.health_check);
+        case 'z2m/health':
+          return Promise.resolve(fx.health);
+        case 'z2m/energy_scan/list':
+          return Promise.resolve({ scans: fx.energy_scans });
+        case 'z2m/energy_scan/status':
+          return Promise.resolve({ ...scanStatus });
+        case 'z2m/energy_scan/run':
+          return new Promise((resolve, reject) => {
+            scanRunGate = { resolve, reject };
+          });
+        case 'z2m/energy_scan/delete':
+          return Promise.resolve({ deleted: true });
         case 'z2m/backup':
           return Promise.resolve(fx.backup);
         case 'z2m/pairing':
@@ -819,6 +847,25 @@ check('flags offline devices', offline.length === 0 || html().includes('chip off
 check('subpage titled Devices', html().includes('header="Devices"'));
 check('sub-view gets a back arrow', typeof p.shadowRoot.getElementById('page').backCallback === 'function');
 
+console.log('=== devices list: a real table at tablet width ===');
+check('the view widens its container', html().includes('class="container wide"'));
+check('a header row names the columns',
+  ['Name', 'Model', 'Area', 'Availability', 'Type'].every((c) => html().includes(`<span>${c}</span>`)));
+check('one table row per device',
+  (html().match(/class="dtab-row" role="button"/g) || []).length === fx.devices.length);
+check('table rows carry the device address',
+  /class="dtab-row"[^>]*data-ieee="0x0000000000000001"/.test(html()));
+check('the area comes from the HA registry', html().includes('>Hallway</span>'));
+check('the mesh role is shown, and battery devices say so',
+  /"dtab-dim">Router</.test(html()) && /"dtab-dim">Battery device</.test(html()));
+check('devices without a value degrade to a dash', html().includes('\u2014'));
+check('availability is a chip in the table too',
+  /dtab-row[\s\S]{0,400}?chip off">offline/.test(html()));
+check('the compact rows remain for phones',
+  html().includes('<ha-md-list-item type="button" data-ieee'));
+check('the table flips on at the tablet breakpoint',
+  html().includes('@media (min-width:1000px)'));
+
 console.log('=== search filter ===');
 p._filter = fx.devices[0].friendly_name.slice(0, 4);
 p._render();
@@ -1102,12 +1149,189 @@ check('lists routers missing from the coordinator',
   html().includes(fx.coordinator_check.missing_routers[0].name));
 check('missing router rows open the device', !!find('data-ieee',
   fx.coordinator_check.missing_routers[0].ieee));
+check('the health report is read on open', sent.some((m) => m.type === 'z2m/health'));
+check('saved scans are read on open', sent.some((m) => m.type === 'z2m/energy_scan/list'));
+check('diagnostics shares the masonry layout', html().includes('class="devgrid"'));
+
+console.log('=== diagnostics: mesh health ===');
+check('the card summarises the bridge in chips', html().includes('Mesh health')
+  && html().includes('Up 3d 1h') && html().includes('MQTT connected')
+  && html().includes('Load 0.42'));
+check('a device that left and rejoined is flagged by name',
+  html().includes('Needs attention') && html().includes('Left and rejoined the network once'));
+check('a device whose address changed is flagged with its counter',
+  html().includes('Changed network address twice'));
+check('a silent ROUTER is flagged; a sleeping battery device is not', (() => {
+  const flags = html().match(/silent since the last health reset/gi) || [];
+  const section = html().slice(html().indexOf('Needs attention'), html().indexOf('class="htab"'));
+  return flags.length === 1 && section.includes('Attic Repeater')
+    && !section.includes('Unknown Gadget');
+})());
+check('attention rows open the device', (() => {
+  const rows2 = p.shadowRoot.querySelectorAll('[data-ieee]');
+  return rows2.some((e) => e.dataset.ieee === '0x0000000000000005');
+})());
+check('the counters table is folded away and sorted by traffic', (() => {
+  const tab = html().slice(html().indexOf('class="htab"'));
+  const a = tab.indexOf('Hallway Dimmer');
+  const b = tab.indexOf('Porch Sensor');
+  return html().includes('All devices (3)') && a > -1 && b > a
+    && tab.includes('0.35') && tab.includes('4200');
+})());
+check('the card names its 10-minute window and the report age',
+  html().includes('last 10 minutes') && html().includes('2 min ago'));
+check('a quiet mesh is one success line', (() => {
+  const stash = p._diag.mesh;
+  p._diag.mesh = {
+    received_at: Date.now() / 1000 - 60,
+    health: {
+      ...fx.health.health,
+      devices: Object.fromEntries(fx.devices.map((d) => [d.ieee_address,
+        { messages: 10, messages_per_sec: 0.1, leave_count: 0, network_address_changes: 0 }])),
+    },
+  };
+  p._render();
+  const ok = html().includes('No device has dropped, rejoined, or gone silent')
+    && !html().includes('Needs attention');
+  p._diag.mesh = stash;
+  p._render();
+  return ok;
+})());
+
+console.log('=== diagnostics: verify now ===');
 sent.length = 0;
 await act('health');
 await tick(40);
-check('Run -> z2m/health_check', sent.some((m) => m.type === 'z2m/health_check'));
-check('renders the health payload', html().includes('healthy'));
-check('flattens nested health counters', html().includes('mqtt') && html().includes('12345'));
+check('Verify now -> z2m/health_check', sent.some((m) => m.type === 'z2m/health_check'));
+check('the verdict is a chip, not a key-value dump',
+  html().includes('>healthy<') && !html().includes('12345'));
+
+console.log('=== diagnostics: coordinator card ===');
+check('the card names the board', html().includes('The SLZB coordinator at 192.168.1.104'));
+check('status chips for ethernet, internet and mode',
+  html().includes('>Ethernet<') && html().includes('>Internet<') && html().includes('>eth<'));
+check('a Fahrenheit chip temp is shown in Celsius (111.31F -> 44.1C)',
+  html().includes('Core chip temp') && html().includes('>44.1 <span>\u00b0C</span>'));
+check('a temp already in Celsius passes through with its own precision',
+  html().includes('Zigbee chip temp') && html().includes('>38.5 <span>\u00b0C</span>'));
+check('uptime timestamps render as durations, not dates',
+  html().includes('Core uptime') && html().includes('>3d 2h<') && html().includes('>1d 2h<'));
+check('the RAM tile keeps its unit',
+  html().includes('RAM usage') && html().includes('>1843 <span>kB</span>'));
+check('a missing entity is skipped, not rendered broken',
+  !html().includes('Zigbee chip temp 2') && !html().includes('Z-Wave firmware'));
+check('firmware rows tell up-to-date from update-available',
+  html().includes('Core firmware') && html().includes('>Up to date<')
+    && html().includes('Zigbee firmware') && html().includes('>Update available<'));
+
+console.log('=== diagnostics: coordinator LEDs are live switches ===');
+const ledEl = () => p.shadowRoot.querySelectorAll('[data-ctltoggle]')
+  .find((e) => e.dataset.ctltoggle === 'switch.z_coordinator_disable_leds');
+check('the LED switch reflects the state', (() => {
+  const el = ledEl();
+  return !!el && el.checked === false;
+})());
+called.length = 0;
+(() => { const el = ledEl(); el.checked = true; el.emit('change'); })();
+check('flipping it calls switch.turn_on on the entity',
+  called.length === 1 && called[0].domain === 'switch' && called[0].service === 'turn_on'
+    && called[0].data.entity_id === 'switch.z_coordinator_disable_leds');
+check('a state push patches the switch without a re-render', (() => {
+  const before = html();
+  p.hass = { ...hass, states: { ...hass.states,
+    'switch.z_coordinator_disable_leds': { state: 'on', attributes: {} } } };
+  return ledEl().checked === true && html() === before;
+})());
+check('a temperature push patches the tile in place, still in Celsius', (() => {
+  // The contract is "no full re-render": count _render calls across the push and
+  // require the patched box to carry the converted reading.
+  let renders = 0;
+  const orig = p._render.bind(p);
+  p._render = (...a) => { renders += 1; return orig(...a); };
+  p.hass = { ...hass, states: { ...hass.states,
+    'sensor.z_coordinator_core_chip_temp': {
+      ...hass.states['sensor.z_coordinator_core_chip_temp'], state: '131.72' } } };
+  const box = p.shadowRoot.getElementById('coordbox');
+  const ok = renders === 0 && String(box.innerHTML).includes('55.4 <span>\u00b0C');
+  p._render = orig;
+  return ok;
+})());
+// Hand back the ORIGINAL hass object: later sections assert identity on it.
+p.hass = hass;
+await tick();
+
+console.log('=== diagnostics: channel energy scan ===');
+check('the card says what a scan costs', html().includes('about two minutes'));
+check('16 bars, one per channel', (html().match(/<rect /g) || []).length === 16);
+check('bars are labelled with rounded values',
+  html().includes('>62</text>') && html().includes('>8</text>'));
+check('channel numbers run 11 to 26',
+  html().includes('>11</text>') && html().includes('>26</text>'));
+check('the channel in use is marked', html().includes('>in use</text>'));
+check('the auto-summary names quietest and busiest',
+  html().includes('Quietest channel 15 at 8%, busiest 26 at 76%'));
+check('saved scans are listed newest first', (() => {
+  const a = html().indexOf('data-scan="scan-2"');
+  const b = html().indexOf('data-scan="scan-1"');
+  return a > -1 && b > a;
+})());
+
+console.log('=== diagnostics: scan history selection and delete ===');
+p.shadowRoot.querySelectorAll('[data-scan]').find((e) => e.dataset.scan === 'scan-1').onclick();
+await tick();
+check('an older scan can be viewed', html().includes('Viewing scan from'));
+check('and its chart replaces the newest',
+  html().includes('Quietest channel 14 at 5%, busiest 21 at 81%'));
+p.shadowRoot.querySelectorAll('[data-scan]').find((e) => e.dataset.scan === 'scan-2').onclick();
+await tick();
+check('the newest scan needs no viewing chip', !html().includes('Viewing scan from'));
+sent.length = 0;
+await act('scandel');
+await tick(40);
+check('delete names the scan and re-reads the list',
+  sent.some((m) => m.type === 'z2m/energy_scan/delete' && m.scan === 'scan-2')
+    && sent.some((m) => m.type === 'z2m/energy_scan/list'));
+
+console.log('=== diagnostics: a scan run is confirmed, staged and charted ===');
+sent.length = 0;
+await act('escan');
+check('Scan now asks for confirmation first', html().includes('alert-type="warning"')
+  && html().includes('will not respond')
+  && !sent.some((m) => m.type === 'z2m/energy_scan/run'));
+check('and can be declined', !!find('data-act', 'escancancel'));
+scanStatus = { running: true, stage: 'scanning', detail: null,
+  started_at: new Date().toISOString() };
+// Deliberately not awaited: the run promise is gated until the test settles it.
+find('data-act', 'escango').onclick();
+await tick(30);
+check('confirming starts the run', sent.some((m) => m.type === 'z2m/energy_scan/run'));
+check('the staged progress row appears', html().includes('Stopping Zigbee2MQTT')
+  && html().includes('Scanning 16 channels') && html().includes('Restarting Zigbee2MQTT'));
+check('a spinner marks the active stage', html().includes('<ha-spinner'));
+check('status polling is armed', !!p._energyTimer);
+await tick(2500);
+check('polling advances the stage', p._diag.scan.stage === 'scanning'
+  && html().includes('scan-step done'));
+scanRunGate.resolve({ id: 'scan-3', started_at: new Date().toISOString(),
+  finished_at: new Date().toISOString(), channel: 15, duration_exp: 4, count: 5,
+  energy: fx.energy_scans[0].energy });
+await tick(60);
+check('the finished scan is charted at once', p._diag.scanSel === 'scan-3'
+  && p._diag.scans[0].id === 'scan-3' && p._diag.scan.running === false);
+check('polling stops with the run', p._energyTimer === null);
+check('the run leaves no confirmation behind', !html().includes('Stop and scan'));
+
+console.log('=== diagnostics: a failed run is an error, not a hang ===');
+await act('escan');
+find('data-act', 'escango').onclick();
+await tick(30);
+scanRunGate.reject(new Error('The adapter refused the scan'));
+await tick(60);
+check('the failure is shown in words', html().includes('The adapter refused the scan'));
+check('and the card is usable again',
+  !!find('data-act', 'escan') && p._diag.scan.running === false);
+p._diag.scan.error = null;
+p._render();
 check('re-check re-runs the coordinator check', await (async () => {
   sent.length = 0;
   await act('coordcheck');
@@ -1951,6 +2175,58 @@ check('reporting binds are collapsed and read-only here',
   html().includes('Manage them from each device'));
 check('overview rows can remove a bind with the full triple',
   /data-act="unbind"[\s\S]{0,300}?data-from="0x[0-9a-f]+"[\s\S]{0,300}?data-clusters="[^"]+"/.test(html()));
+
+console.log('=== bindings: creating from the overview ===');
+p._go({ name: 'bindsall' });
+check('the overview still loads', await soon(() => !!p._bindsAll.data));
+check('the overview header offers Add binding', !!find('data-act', 'bindnew'));
+await act('bindnew');
+check('a source picker opens in its own card as a form field',
+  html().includes('data-form="bindsrc"') && !!p._forms.bindsrc
+    && p._forms.bindsrc.label() === 'Source device');
+const coordFixture = { ieee_address: '0xcccccccccccccccc', friendly_name: 'Aaa Coordinator',
+  type: 'Coordinator', power_source: 'Mains (single phase)', availability: 'online',
+  supported: true, endpoints: [1], exposes: [], options: [], scenes: [] };
+p._devices = fx.devices.concat([coordFixture]);
+p._render();
+const srcOptions = p._forms.bindsrc.schema[0].selector.select.options;
+check('the coordinator is never offered as a source',
+  !srcOptions.some((o) => o.label === 'Aaa Coordinator'));
+check('sources are sorted by name', (() => {
+  const names = srcOptions.map((o) => o.label);
+  return names.length === fx.devices.length
+    && names.join('|') === names.slice().sort((a, b) => a.localeCompare(b)).join('|');
+})());
+p._devices = fx.devices;
+sent.length = 0;
+// The form's value-changed path: data lands on the spec, then `changed` fires.
+p._forms.bindsrc.data = { source: '0x0000000000000001' };
+p._forms.bindsrc.changed(p._forms.bindsrc.data);
+await until('the source clusters to be read',
+  () => sent.some((m) => m.type === 'z2m/device/clusters' && m.device === '0x0000000000000001'));
+await tick(40);
+check('the same endpoint/cluster/target form renders', (() => {
+  const spec = p._forms['bind:0x0000000000000001'];
+  return !!spec && spec.schema.map((x) => x.name).join(',') === 'endpoint,clusters,target';
+})());
+check('targets still honour what devices accept', (() => {
+  const opts = p._forms['bind:0x0000000000000001'].schema[2].selector.select.options;
+  return opts.some((o) => o.label.includes('(group)'))
+    && !opts.some((o) => o.label.includes('Porch Sensor'));
+})());
+p._forms['bind:0x0000000000000001'].data =
+  { endpoint: '1', target: 'g:5', clusters: ['genOnOff', 'genScenes'] };
+sent.length = 0;
+await act('bind');
+await until('the overview bind to be sent', () => sent.some((m) => m.type === 'z2m/device/bind'));
+const oBind = sent.find((m) => m.type === 'z2m/device/bind');
+check('the bind names the picked source, not the last visited device',
+  oBind.from === '0x0000000000000001' && oBind.from_endpoint === 1 && oBind.to === 5);
+check('the overview is re-read afterwards',
+  await soon(() => sent.some((m) => m.type === 'z2m/binds/overview')));
+check('success and refusal are reported here exactly like the device page',
+  html().includes('Bound On/off (genOnOff)') && html().includes('were refused')
+    && html().includes('Scenes (genScenes)'));
 p._go({ name: 'device', ieee: '0x0000000000000001' });
 
 /* ============================================== device page: live and organized */
@@ -1958,6 +2234,10 @@ console.log('=== device page: controls and sensors come first ===');
 p._go({ name: 'device', ieee: '0x0000000000000001' });
 await tick();
 check('the page is a responsive grid', html().includes('class="devgrid"'));
+check('the grid is masonry: columns that keep cards whole',
+  html().includes('columns:2') && html().includes('columns:3')
+    && html().includes('break-inside:avoid')
+    && !html().includes('grid-template-columns:minmax(0, 7fr)'));
 check('controls card renders for a controllable device', html().includes('>Controls<'));
 check('the light is a native tile control', html().includes('data-ctltoggle="light.hallway_dimmer"'));
 check('a dimmable light gets a brightness slider',
