@@ -203,6 +203,19 @@ class NamingWatcher:
     def _async_rescan(self, _now: Any) -> None:
         self._cancel_timer = None
         try:
+            # Machine ids are rebuilt here rather than from the rename handler on
+            # purpose. Every way a device gets named -- this integration's add
+            # dialog, its device page, Zigbee2MQTT's own frontend, a hand-published
+            # MQTT request -- ends in a device registry update, and this listener
+            # already sees those. Hooking one caller would have covered one path,
+            # and would have had to guess how long to wait for the new name to
+            # arrive; the debounce is that wait, and it is measured rather than
+            # guessed because it starts when the registry actually changed.
+            self.applying = True
+            try:
+                async_normalize_machine_ids(self.hass)
+            finally:
+                self.applying = False
             async_refresh_issue(self.hass)
         except Exception:  # noqa: BLE001 - a hygiene check must never break setup
             _LOGGER.exception("Naming scan failed")
