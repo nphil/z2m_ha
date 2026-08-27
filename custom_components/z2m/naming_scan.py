@@ -120,6 +120,35 @@ def async_apply(
 
 
 @callback
+def async_normalize_machine_ids(hass: HomeAssistant) -> int:
+    """Rename entity ids that are still keyed to a raw Zigbee address.
+
+    Split out from the operator-gated fix flow on purpose. Punctuation renames need
+    consent because the old ids may be referenced from dashboards and automations
+    built over months. An id that is still the IEEE address has just been minted
+    for a device that was named seconds ago, so there is nothing to reference yet
+    and nothing to weigh: it is only ever an improvement, and asking would mean
+    every newly paired device sits wrong until somebody clicks a prompt.
+    """
+    entity_reg = er.async_get(hass)
+    renamed = 0
+    for item in async_scan(hass)["entities"]:
+        if item.get("reason") != "machine_id":
+            continue
+        if entity_reg.async_get(item["entity_id"]) is None:
+            continue
+        if entity_reg.async_get(item["new_entity_id"]) is not None:
+            continue
+        entity_reg.async_update_entity(
+            item["entity_id"], new_entity_id=item["new_entity_id"]
+        )
+        renamed += 1
+    if renamed:
+        _LOGGER.info("Renamed %s entity id(s) off their Zigbee address", renamed)
+    return renamed
+
+
+@callback
 def async_refresh_issue(hass: HomeAssistant) -> dict[str, list[dict[str, Any]]]:
     """Raise, update or clear the issue to match what the registries say now."""
     findings = async_scan(hass)

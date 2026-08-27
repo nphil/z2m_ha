@@ -16,7 +16,9 @@ from homeassistant.components import mqtt, websocket_api
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.event import async_call_later
 
+from . import naming_scan
 from .const import (
     BACKUP_TIMEOUT,
     DOMAIN,
@@ -36,6 +38,11 @@ from .coordinator import Z2MError, ieee_from_identifiers
 
 # Zigbee2MQTT refused the request, or never answered it.
 ERR_Z2M = "z2m_error"
+
+# How long to let a rename reach the device registry before rebuilding entity ids
+# from the new name. Z2M has to republish discovery and Home Assistant has to
+# process it; a few seconds covers that without making the add dialog feel slow.
+RENAME_SETTLE_SECONDS = 6
 
 _LOGGER = logging.getLogger(__package__)
 
@@ -582,6 +589,15 @@ async def ws_rename(hass, connection, msg, data) -> None:
             "homeassistant_rename": msg["homeassistant_rename"],
         },
         REQUEST_TIMEOUT,
+    )
+    # A device paired through the add dialog is named seconds after Zigbee2MQTT
+    # published discovery under its IEEE address, and Home Assistant does not
+    # regenerate entity ids on a discovery update -- so without this every newly
+    # paired device keeps `sensor.0x54ef4410014ae35e_humidity` forever. The delay
+    # is for the rename to reach the device registry first: the target id is built
+    # from the HA device name, which is still the address until Z2M republishes.
+    async_call_later(
+        hass, RENAME_SETTLE_SECONDS, lambda _now: naming_scan.async_normalize_machine_ids(hass)
     )
     connection.send_result(msg["id"], result)
 

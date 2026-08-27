@@ -161,6 +161,75 @@ empty = naming.scan(devices=[], areas=[], entities=[], slugify=slugify)
 check("a clean install finds nothing", naming.total(empty) == 0)
 check("and says so", naming.describe(empty) == "Nothing to change.")
 
+print("=== entity ids still keyed to a Zigbee address ===")
+# Zigbee2MQTT publishes discovery under the IEEE the moment a device joins, so the
+# ids exist before the operator has typed a name. This is what every device paired
+# through the add dialog looked like.
+paired = naming.scan(
+    devices=[{"id": "d", "name": "0xd0cf5efffec81d74",
+              "name_by_user": "Isabel's Bathroom Door Sensor", "area_id": "bath"}],
+    entities=[
+        {"entity_id": "binary_sensor.0xd0cf5efffec81d74_contact", "device_id": "d"},
+        {"entity_id": "sensor.0xd0cf5efffec81d74_battery", "device_id": "d"},
+    ],
+    areas=[{"area_id": "bath", "name": "Isabel's Bathroom", "floor_id": "main"}],
+    slugify=slugify,
+)
+check("both machine ids are found", len(paired["entities"]) == 2)
+check("they rebuild from the operator's name", {i["new_entity_id"] for i in paired["entities"]} == {
+    "binary_sensor.isabel_s_bathroom_door_sensor_contact",
+    "sensor.isabel_s_bathroom_door_sensor_battery"})
+check("and are tagged apart from punctuation work",
+      all(i["reason"] == "machine_id" for i in paired["entities"]))
+check("a straight name is not reported as a device rename", paired["devices"] == [])
+
+# An id with no suffix at all -- a cover or a light is published bare.
+bare = naming.scan(
+    devices=[{"id": "d", "name": None, "name_by_user": "Master Bedroom Main Blinds", "area_id": None}],
+    entities=[{"entity_id": "cover.0x70ac08fffe128526", "device_id": "d"}],
+    areas=[], slugify=slugify,
+)
+check("a bare address is rebuilt too",
+      bare["entities"][0]["new_entity_id"] == "cover.master_bedroom_main_blinds")
+
+# The device has not been named yet: there is nothing better to rename it to, and
+# renaming an address to itself must not be reported as work.
+unnamed = naming.scan(
+    devices=[{"id": "d", "name": "0x70ac08fffe128526", "name_by_user": None, "area_id": None}],
+    entities=[{"entity_id": "cover.0x70ac08fffe128526", "device_id": "d"}],
+    areas=[], slugify=slugify,
+)
+check("an unnamed device is left alone", unnamed["entities"] == [])
+
+# Shorter or longer than 16 hex digits is somebody's real name, not an address.
+lookalike = naming.scan(
+    devices=[{"id": "d", "name": None, "name_by_user": "Thing", "area_id": None}],
+    entities=[
+        {"entity_id": "sensor.0xdeadbeef_value", "device_id": "d"},
+        {"entity_id": "sensor.0xd0cf5efffec81d7411_value", "device_id": "d"},
+    ],
+    areas=[], slugify=slugify,
+)
+check("a lookalike object id is not touched", lookalike["entities"] == [])
+
+# Both problems on one device: curled name AND addresses for ids.
+both = naming.scan(
+    devices=[{"id": "d", "name": None, "name_by_user": "Isabel\u2019s Lamp", "area_id": None}],
+    entities=[
+        {"entity_id": "light.0x0017880104e05524", "device_id": "d"},
+        {"entity_id": "sensor.isabels_lamp_battery", "device_id": "d"},
+    ],
+    areas=[], slugify=slugify,
+)
+check("the curled slug is straightened", any(
+    i["new_entity_id"] == "sensor.isabel_s_lamp_battery" and i["reason"] == "punctuation"
+    for i in both["entities"]))
+check("and the address uses the straightened name, not the curled one", any(
+    i["new_entity_id"] == "light.isabel_s_lamp" and i["reason"] == "machine_id"
+    for i in both["entities"]))
+check("existing punctuation findings still carry a reason",
+      all("reason" in i for i in found["entities"]))
+
 print()
 if FAILED:
     print(f"{FAILED} CHECK(S) FAILED")

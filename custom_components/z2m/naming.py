@@ -17,11 +17,23 @@ separate things at once:
 The third is the expensive one and the reason this module exists: it is silent,
 and every device in the duplicate area drops out of floor-based views and voice
 targeting until somebody notices.
+
+A second, unrelated way a name fails to reach an entity id is handled here too:
+Zigbee2MQTT publishes discovery under the raw IEEE address the moment a device
+joins, so Home Assistant mints `sensor.0x54ef4410014ae35e_humidity` before the
+operator has typed a name at all. Naming the device afterwards does not
+regenerate entity ids, so every device that was paired and then named keeps
+machine-readable ids for the rest of its life.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
+
+# An object id that is still a raw Zigbee address rather than a name. Anchored and
+# length-exact so a device genuinely named something like "0x" cannot match.
+MACHINE_OBJECT_ID = re.compile(r"^(0x[0-9a-f]{16})(?=_|$)")
 
 # Curled quotes, the three dashes a keyboard never types, the ellipsis glyph, and
 # the space characters that are invisible in a name field yet survive into an MQTT
@@ -188,6 +200,34 @@ def scan(
                     "entity_id": entity["entity_id"],
                     "new_entity_id": candidate,
                     "device_id": device["id"],
+                    "reason": "punctuation",
+                }
+            )
+            taken.add(candidate)
+
+    # --- entity ids that never got a name at all --------------------------------
+    # Independent of spelling: these are ids minted from the IEEE address before a
+    # name existed. Every device is checked, curled or not, and the straightened
+    # display name is the target so this agrees with the device rename above when
+    # both apply to the same device.
+    for device in devices:
+        slug = slugify(straighten(_display_name(device)))
+        if not slug or MACHINE_OBJECT_ID.match(slug):
+            continue
+        for entity in entities_by_device.get(device["id"], []):
+            domain, _, object_id = entity["entity_id"].partition(".")
+            match = MACHINE_OBJECT_ID.match(object_id)
+            if not match:
+                continue
+            candidate = f"{domain}.{slug}{object_id[len(match.group(1)):]}"
+            if candidate == entity["entity_id"] or candidate in taken:
+                continue
+            entity_renames.append(
+                {
+                    "entity_id": entity["entity_id"],
+                    "new_entity_id": candidate,
+                    "device_id": device["id"],
+                    "reason": "machine_id",
                 }
             )
             taken.add(candidate)
