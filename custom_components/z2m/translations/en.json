@@ -12,5 +12,29 @@
     "abort": {
       "single_instance_allowed": "Zigbee is already configured."
     }
+  },
+  "issues": {
+    "naming_punctuation": {
+      "title": "Names contain punctuation a keyboard does not type",
+      "fix_flow": {
+        "step": {
+          "init": {
+            "title": "Straighten names typed on a phone",
+            "description": "A phone substitutes typographic punctuation as you type, so `Isabel\u2019s Lamp` and `Isabel's Lamp` are different strings. Home Assistant matches areas by name and turns names into entity IDs, so one curled apostrophe can create a **duplicate area with no floor** and a second spelling of the same entity ID.\n\nFound:\n\n{changes}\n\nChoose **Names and areas** for the safe half: display names and duplicate-area merges, which nothing can reference. Choose **Names, areas and entity IDs** to also rewrite the entity IDs the old spelling created.",
+            "menu_options": {
+              "names": "Names and areas (safe)",
+              "everything": "Names, areas and entity IDs"
+            }
+          },
+          "everything": {
+            "title": "Also rewrite {entities} entity ID(s)?",
+            "description": "Renaming an entity ID does **not** update references to it. Automations, scripts, scenes and dashboards that name the old ID keep naming it and will stop working until you update them.\n\nThe safe half of this fix runs either way. Submit to rewrite the entity IDs as well:\n\n{changes}"
+          }
+        },
+        "abort": {
+          "nothing_to_fix": "The names were already straightened."
+        }
+      }
+    }
   }
 }

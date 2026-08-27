@@ -34,6 +34,7 @@ from .const import (
     ZWAVE_SIDEBAR_TITLE,
 )
 from .coordinator import Z2MData, Z2MLabels
+from .naming_scan import NamingWatcher
 from .websocket_api import async_setup_websocket
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -108,6 +109,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     _register_zwave_shortcut(hass)
 
+    # Naming hygiene: a phone keyboard curls punctuation as you type, which forks
+    # MQTT topics, entity ids and -- silently -- areas. The watcher raises one
+    # Repairs issue when it finds any, and clears it when there is nothing left.
+    watcher = NamingWatcher(hass)
+    watcher.async_start()
+    hass.data.setdefault(DOMAIN, {})["naming_watcher"] = watcher
+    entry.async_on_unload(watcher.async_stop)
+
     entry.async_on_unload(entry.add_update_listener(_reload_on_change))
     _LOGGER.info("Zigbee panel ready (base topic %s)", base_topic)
     return True
@@ -117,6 +126,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     data: Z2MData | None = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     if data is not None:
         data.async_stop()
+    # The listeners are dropped by the async_on_unload hook; this only clears the
+    # handle the fix flow uses to mute the watcher while it writes.
+    hass.data.get(DOMAIN, {}).pop("naming_watcher", None)
     frontend.async_remove_panel(hass, PANEL_URL_PATH)
     # We added the Z-Wave shortcut, so we take it away again. Removing a panel that
     # is not registered raises, and an unload must never do that.
