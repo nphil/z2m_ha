@@ -92,6 +92,10 @@ const LOG_LEVELS = ['error', 'warning', 'info', 'debug'];
 
 const PAIR_OPEN_SECONDS = 254;
 const PAIR_LOG_MAX = 24;
+// Longest text a reading tile shows before it is trimmed and the rest moves to the
+// tooltip. Numbers never reach this; converters that pack a structure into one
+// state do, and HA truncates those at 255 characters anyway.
+const SENS_TEXT_MAX = 28;
 
 const esc = (s) =>
   String(s ?? '').replace(
@@ -1393,10 +1397,17 @@ class Z2MPanel extends HTMLElement {
       .sens { padding:var(--ha-space-2, 8px) var(--ha-space-3, 12px);
               border-radius:var(--ha-border-radius-md, 8px);
               background:var(--secondary-background-color); }
+      /* A reading is normally a number and a unit. Some converters expose a text
+         blob instead -- Aqara's FP300 packs 17 zone booleans into one state that
+         HA truncates at its 255 character limit -- and an unclamped one of those
+         takes over the card. _sensReading trims the text; this keeps a single long
+         token from widening the column even so. */
       .sens-v { font-size:var(--ha-font-size-xl, 20px); line-height:1.3;
-                color:var(--primary-text-color); }
+                color:var(--primary-text-color); overflow-wrap:anywhere; }
       .sens-v span { font-size:var(--ha-font-size-s, 12px);
                      color:var(--secondary-text-color); }
+      /* The unit is the small grey part; a clamped text reading is still the reading. */
+      .sens-v span.txt { font-size:inherit; color:inherit; }
       .sens-v.on { color:var(--primary-color); }
       .sens-l { color:var(--secondary-text-color); font-size:var(--ha-font-size-s, 12px);
                 white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -2514,7 +2525,7 @@ class Z2MPanel extends HTMLElement {
           <div class="card-content pad">
             ${this._textField(`rename:${d.ieee_address}`, {
               label: 'Friendly name',
-              helper: 'Changes the MQTT topic, so Home Assistant entity IDs regenerate',
+              helper: 'Moves the MQTT topic. Existing entity IDs keep their old name',
               value: d.friendly_name || '',
             })}
           </div>
@@ -2766,7 +2777,14 @@ class Z2MPanel extends HTMLElement {
     }
     const unit = item.domain === 'sensor' && a.unit_of_measurement
       ? ` <span>${esc(a.unit_of_measurement)}</span>` : '';
-    return `${esc(String(this._fmtState(st, item)))}${unit}`;
+    const text = String(this._fmtState(st, item));
+    // A value this long is prose, not a reading, so the tile shows the opening of
+    // it and hands the rest to the tooltip. Clamping here rather than in the tile
+    // covers the device page and the coordinator card at once.
+    if (text.length > SENS_TEXT_MAX) {
+      return `<span class="txt" title="${esc(text)}">${esc(text.slice(0, SENS_TEXT_MAX))}\u2026</span>${unit}`;
+    }
+    return `${esc(text)}${unit}`;
   }
 
   /** Seconds as a person says them: "3d 4h", "2h 10m", "5 min". */

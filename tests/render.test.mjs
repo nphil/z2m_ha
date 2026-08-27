@@ -2382,6 +2382,54 @@ check('a battery device is never read automatically',
 p._go({ name: 'dashboard' });
 await tick();
 
+/* ============================================== long text readings are clamped */
+console.log('=== device page: a text blob never takes over a reading tile ===');
+// Aqara's FP300 packs 17 zone booleans into one state, which HA truncates at its
+// 255 character limit. Unclamped, that one tile dwarfs every real reading.
+const blobIeee = '0x0000000000000002';
+const blob = "{'detection_range_0': True, 'detection_range_1': True, 'detection_range_10': True, 'de";
+const blobStates = { ...hass.states,
+  'sensor.porch_temperature': { state: blob, attributes: {} } };
+p.hass = { ...hass, states: blobStates };
+p._go({ name: 'device', ieee: blobIeee });
+await tick();
+check('the tile exists', !!find('data-sens', 'sensor.porch_temperature'));
+const blobShown = html();
+// The visible run is the opening of the value and nothing more; the whole thing
+// lives in the tooltip, which is why the blob still appears in the markup.
+check('only the opening of the value is on screen',
+  blobShown.includes(`>${esc(blob.slice(0, 28))}\u2026<`));
+check('and it says it was trimmed', blobShown.includes('\u2026'));
+check('the full value is kept in the tooltip', blobShown.includes(esc(blob)));
+check('the trimmed text is not styled as the unit', blobShown.includes('class="txt"'));
+// A real reading must be untouched by the clamp.
+p.hass = { ...hass, states: { ...hass.states,
+  'sensor.porch_temperature': { state: '21.5', attributes: { unit_of_measurement: '\u00b0C' } } } };
+p._go({ name: 'dashboard' });
+await tick();
+p._go({ name: 'device', ieee: blobIeee });
+await tick();
+const numShown = html();
+check('a number keeps its exact value', numShown.includes('21.5'));
+check('and keeps its unit', numShown.includes('\u00b0C'));
+check('with no clamp applied to it', !numShown.includes('class="txt"'));
+p.hass = hass;
+
+/* ================================================= rename tells the truth */
+console.log('=== device page: the rename field describes what renaming does ===');
+p._go({ name: 'device', ieee: blobIeee });
+await tick();
+// The integration sends homeassistant_rename false, so HA keeps the entity IDs it
+// already minted. Promising they regenerate sent operators looking for a change
+// that never lands.
+const renameHelper = p._forms[`rename:${blobIeee}`].helper();
+check('it does not promise entity IDs regenerate',
+  !renameHelper.includes('entity IDs regenerate'));
+check('it says the MQTT topic moves', renameHelper.includes('Moves the MQTT topic'));
+check('and that entity IDs stay behind', renameHelper.includes('keep their old name'));
+p._go({ name: 'dashboard' });
+await tick();
+
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
