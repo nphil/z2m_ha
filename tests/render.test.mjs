@@ -415,6 +415,14 @@ let groupAddId = 7;
 // the status answer is whatever the scenario says Zigbee2MQTT is doing right now.
 let scanRunGate = null;
 let scanStatus = { running: false, stage: 'idle', detail: null, started_at: null };
+// z2m/device/set's response shape is the whole write-lifecycle contract (§3.4):
+// confirmed with an echo, confirmed-but-adjusted, queued/unconfirmed after the
+// backend's own timeout, or sent for a write-only property. Scenarios reassign
+// this to exercise a phase other than the default immediate-echo confirm.
+let deviceSetHandler = (msg) => {
+  const [prop, value] = Object.entries(msg.payload)[0];
+  return Promise.resolve({ sent: true, confirmed: true, state: { [prop]: value } });
+};
 
 // Service calls made by the device page's live controls.
 const called = [];
@@ -519,6 +527,8 @@ const hass = {
             sleeping: (fx.devices.find((d) => d.ieee_address === msg.device) || {})
               .power_source === 'Battery',
           });
+        case 'z2m/device/set':
+          return deviceSetHandler(msg);
         case 'config/device_registry/update':
           return Promise.resolve({ id: msg.device_id });
         default:
@@ -877,21 +887,54 @@ console.log('=== search filter ===');
 p._filter = fx.devices[0].friendly_name.slice(0, 4);
 p._render();
 check('filter narrows list', html().includes(esc(fx.devices[0].friendly_name)));
-// Typing re-renders the list. Losing the caret mid-word is the classic failure here,
-// and a summary push lands mid-word constantly on a busy mesh.
+// Typing must never re-render: that used to rebuild every HA component in the
+// list and take the caret with it, and a summary push lands mid-word constantly
+// on a busy mesh. The proof is the same one the rest of the suite already uses
+// for "this must not rebuild the DOM": mark a stable element and watch it
+// survive, since the stub's html() cannot see into a targeted innerHTML patch.
 const searchBox = p.shadowRoot.getElementById('q');
+const pageMarker = p.shadowRoot.getElementById('page');
+if (pageMarker) pageMarker.marker = 'search-survivor';
+searchBox.marker = 'q-survivor';
+const devrowsBefore = p.shadowRoot.getElementById('devrows');
 searchBox.value = 'hall';
 searchBox.selectionStart = 4;
 p.shadowRoot.activeElement = searchBox;
 searchBox.oninput();
-const refocused = p.shadowRoot.getElementById('q');
-check('typing keeps focus in the search box', refocused.focused === true);
-check('typing keeps the caret position',
-  Array.isArray(refocused.selection) && refocused.selection[0] === 4);
+check('typing does not re-render the page',
+  p.shadowRoot.getElementById('page') && p.shadowRoot.getElementById('page').marker === 'search-survivor');
+check('the search input is the SAME element instance, never recreated',
+  p.shadowRoot.getElementById('q') === searchBox && p.shadowRoot.getElementById('q').marker === 'q-survivor');
+check('only the results container was rewritten',
+  p.shadowRoot.getElementById('devrows') === devrowsBefore
+    && String(devrowsBefore.innerHTML).includes(esc(fx.devices[0].friendly_name)));
+check('the live count reflects the new filter',
+  String(p.shadowRoot.getElementById('qcount').textContent)
+    === `${p._deviceSearchMatches().length} of ${fx.devices.length}`);
+check('the clear button appears once the field is non-empty',
+  p.shadowRoot.getElementById('qclear').hidden === false);
 check('typing filters the list', p._filter === 'hall'
   && html().includes(esc(fx.devices[0].friendly_name)));
+
+console.log('=== search filter: clear and Escape ===');
+searchBox.onkeydown({ key: 'Escape', preventDefault() {} });
+check('Escape clears a non-empty field', p._filter === ''
+  && p.shadowRoot.getElementById('qclear').hidden === true);
+check('clearing restores the full list',
+  String(p.shadowRoot.getElementById('devrows').innerHTML).includes(esc(fx.devices[1].friendly_name)));
+check('focus returns to the field', searchBox.focused === true);
+searchBox.value = 'zzz-no-match-zzz';
+searchBox.selectionStart = 16;
+searchBox.oninput();
+check('a filter with no matches shows the empty state and a Clear search action',
+  String(p.shadowRoot.getElementById('devrows').innerHTML).includes('No devices match')
+    && String(p.shadowRoot.getElementById('devrows').innerHTML).includes('Clear search'));
+await act('devsearchclear');
+check('Clear search restores the list and the box', p._filter === ''
+  && String(p.shadowRoot.getElementById('devrows').innerHTML).includes(esc(fx.devices[0].friendly_name)));
 p.shadowRoot.activeElement = null;
 p._filter = '';
+p._render();
 
 console.log('=== device detail (with options) ===');
 const withOpts = fx.devices.find((d) => (d.options || []).length > 3);
@@ -900,35 +943,22 @@ check(`opened ${withOpts.friendly_name}`, html().includes(esc(withOpts.friendly_
 check('titled after the device', html().includes(`header="${esc(withOpts.friendly_name)}"`));
 check('shows IEEE', html().includes(withOpts.ieee_address));
 check('shows vendor/model', html().includes(esc(withOpts.model)));
-check('generated settings form', html().includes('Device settings'));
-// The form is HA's own `ha-form`, driven by a selector schema rather than by markup:
-// what matters is that every option Z2M declares becomes a field with the right
-// selector, and that the operator's current value is what the field starts on.
-const optSpec = p._forms[`opts:${withOpts.ieee_address}`];
+
+console.log('=== settings: an options-only device is the card body, headerless ===');
+// This fixture device has no `exposes` at all, only options: the §3.1 special
+// case where Converter options IS the Settings card, not a group inside it.
+const optsCls = p._settingsClassify(withOpts);
 const rendered = (withOpts.options || []).filter((o) => o && o.property);
-check('the form is rendered by ha-form', html().includes('<ha-form data-form='));
-check(`every declared option is a field (${rendered.length})`,
-  rendered.every((o) => optSpec.schema.some((s) => s.name === o.property)));
-const selectorFor = (prop) =>
-  Object.keys((optSpec.schema.find((s) => s.name === prop) || {}).selector || {})[0];
-check('binary options use a boolean selector', rendered
-  .filter((o) => o.type === 'binary')
-  .every((o) => selectorFor(o.property) === 'boolean'));
-check('enum options use a select selector', rendered
-  .filter((o) => o.type === 'enum')
-  .every((o) => selectorFor(o.property) === 'select'));
-check('numeric options use a number selector, with the declared bounds', rendered
-  .filter((o) => o.type === 'numeric')
-  .every((o) => {
-    const n = (optSpec.schema.find((s) => s.name === o.property) || {}).selector.number;
-    return n && (o.value_min === undefined || n.min === o.value_min)
-      && (o.value_max === undefined || n.max === o.value_max);
-  }));
-check('labels and helpers come from Z2M\u2019s own schema', rendered.every((o) => {
-  const s = optSpec.schema.find((x) => x.name === o.property);
-  return optSpec.label(s) === (o.label || o.name || o.property)
-    && optSpec.helper(s) === o.description;
-}));
+check(`every declared option is classified (${rendered.length})`,
+  optsCls.options.length === rendered.length);
+check('friendly_name never becomes a row', !optsCls.options.some((o) => o.prop === 'friendly_name'));
+check('Settings is the card header', html().includes('>Settings<'));
+check('no Converter options group header when it IS the whole card',
+  !html().includes('Converter options'));
+check('a binary option row exists', !!find('data-prop', 'state_action'));
+check('a numeric option row exists', !!find('data-prop', 'transition'));
+check('an enum option row exists', !!find('data-prop', 'effect_color_mode'));
+check('a text option row exists', !!find('data-prop', 'friendly_note'));
 check('has rename', !!find('data-act', 'rename'));
 check('has reconfigure', !!find('data-act', 'configure'));
 check('has re-interview', !!find('data-act', 'interview'));
@@ -940,6 +970,24 @@ check('back from a device returns to the list', (() => {
   p._go({ name: 'device', ieee: withOpts.ieee_address });
   return ok;
 })());
+
+console.log('=== settings: a converter option commits per row, immediately ===');
+// option_values is absent on this fixture device, so every option starts
+// unknown; a binary option with an unknown value renders the B segment, not a
+// switch (§3.3's A/B boundary), regardless of source.
+sent.length = 0;
+const stateActionBox = p.shadowRoot.getElementById('setctl-option_state_action');
+check('an unknown binary option is the two-button segment', !!stateActionBox
+  && stateActionBox.querySelectorAll('[data-setseg]').length === 2);
+const stateActionOn = stateActionBox.querySelectorAll('[data-setseg]')
+  .find((e) => e.dataset.setseg.endsWith('|on'));
+stateActionOn.onclick();
+await tick(30);
+check('commit -> z2m/device/options with only the touched property', sent.some((m) =>
+  m.type === 'z2m/device/options' && m.device === withOpts.ieee_address
+  && m.options.state_action === true && Object.keys(m.options).length === 1));
+check('a confirmed option write shows the Saved chip',
+  String(p.shadowRoot.getElementById('setmeta-option_state_action').innerHTML).includes('Saved'));
 
 console.log('=== device commands ===');
 sent.length = 0;
@@ -966,21 +1014,6 @@ sent.length = 0;
 await act('remove');
 check('Remove -> z2m/device/remove with force', sent.some((m) => m.type === 'z2m/device/remove'
   && m.device === withOpts.ieee_address && m.force === true));
-sent.length = 0;
-// Only what the operator actually changed is written: Save on an untouched form must
-// not push every option back at Zigbee2MQTT.
-await act('options');
-check('an untouched form writes nothing', !sent.some((m) => m.type === 'z2m/device/options'));
-const binaryOpt = rendered.find((o) => o.type === 'binary');
-optSpec.data = { ...optSpec.data, [binaryOpt.property]: true };
-await act('options');
-check('Save settings -> z2m/device/options', sent.some((m) => m.type === 'z2m/device/options'
-  && m.device === withOpts.ieee_address
-  && m.options[binaryOpt.property] === true));
-check('and writes only the changed field', (() => {
-  const msg = sent.find((m) => m.type === 'z2m/device/options');
-  return Object.keys(msg.options).length === 1;
-})());
 
 console.log('=== every device detail renders ===');
 let bad = [];
@@ -2429,6 +2462,229 @@ check('it says the MQTT topic moves', renameHelper.includes('Moves the MQTT topi
 check('and that entity IDs stay behind', renameHelper.includes('keep their old name'));
 p._go({ name: 'dashboard' });
 await tick();
+
+/* ============================================================== settings card */
+// Fixtures below are transcribed from the live fleet's own exposes (the design
+// spec's own grounding data), not invented shapes: real property names, real
+// access bitmasks, real presets.
+const hueDevice = {
+  ieee_address: '0x00178801000000a1',
+  friendly_name: 'Back Deck Motion Sensor',
+  network_address: 5001,
+  vendor: 'Philips',
+  model: '9290019758',
+  description: 'Hue motion outdoor sensor',
+  type: 'EndDevice',
+  power_source: 'Battery',
+  availability: 'online',
+  supported: true,
+  scenes: [],
+  endpoints: [1],
+  exposes: [
+    { access: 1, description: 'Measured temperature value', label: 'Temperature', name: 'temperature', property: 'temperature', type: 'numeric', unit: '\u00b0C' },
+    { access: 1, description: 'Indicates whether the device detected occupancy', label: 'Occupancy', name: 'occupancy', property: 'occupancy', type: 'binary', value_off: false, value_on: true },
+    { access: 1, category: 'diagnostic', description: 'Remaining battery in %', label: 'Battery', name: 'battery', property: 'battery', type: 'numeric', unit: '%', value_max: 100, value_min: 0 },
+    { access: 7, label: 'Motion sensitivity', name: 'motion_sensitivity', property: 'motion_sensitivity', type: 'enum', values: ['low', 'medium', 'high'] },
+    { access: 7, description: 'Blink green LED on motion detection', label: 'Led indication', name: 'led_indication', property: 'led_indication', type: 'binary', value_off: false, value_on: true },
+    { access: 7, label: 'Occupancy timeout', name: 'occupancy_timeout', property: 'occupancy_timeout', type: 'numeric', unit: 's', value_max: 65535, value_min: 0 },
+    { access: 5, description: 'Measured illuminance', label: 'Illuminance', name: 'illuminance', property: 'illuminance', type: 'numeric', unit: 'lx' },
+    { access: 1, category: 'diagnostic', label: 'Linkquality', name: 'linkquality', property: 'linkquality', type: 'numeric', unit: 'lqi', value_max: 255, value_min: 0 },
+  ],
+  options: [
+    { access: 2, description: 'Calibrates the temperature value.', label: 'Temperature calibration', name: 'temperature_calibration', property: 'temperature_calibration', type: 'numeric', value_step: 0.1 },
+    { access: 2, description: 'Digits after the decimal point for temperature.', label: 'Temperature precision', name: 'temperature_precision', property: 'temperature_precision', type: 'numeric', value_max: 3, value_min: 0 },
+    { access: 2, description: 'Calibrates the illuminance value.', label: 'Illuminance calibration', name: 'illuminance_calibration', property: 'illuminance_calibration', type: 'numeric', value_step: 0.1 },
+    { access: 2, description: 'Sends no_occupancy_since after these many seconds.', item_type: { access: 3, label: 'Time', name: 'time', type: 'numeric' }, label: 'No occupancy since', name: 'no_occupancy_since', property: 'no_occupancy_since', type: 'list' },
+    { access: 2, description: 'Expose the raw illuminance value.', label: 'Illuminance raw', name: 'illuminance_raw', property: 'illuminance_raw', type: 'binary', value_off: false, value_on: true },
+  ],
+  option_values: { friendly_name: 'Back Deck Motion Sensor' },
+};
+const inovelliDevice = {
+  ieee_address: '0x00178801000000b2',
+  friendly_name: 'Stairway Dimmer',
+  network_address: 5002,
+  vendor: 'Inovelli',
+  model: 'VZM31-SN',
+  description: '2-in-1 switch + dimmer',
+  type: 'Router',
+  power_source: 'Mains (single phase)',
+  availability: 'online',
+  supported: true,
+  scenes: [],
+  endpoints: [1],
+  exposes: [
+    { type: 'light', features: [
+      { access: 7, name: 'state', property: 'state', type: 'binary', value_off: 'OFF', value_on: 'ON' },
+      { access: 7, name: 'brightness', property: 'brightness', type: 'numeric', value_max: 254, value_min: 0 },
+    ] },
+    { access: 3, category: 'config', label: 'led_effect', name: 'led_effect', property: 'led_effect', type: 'composite',
+      features: [
+        { access: 3, name: 'effect', property: 'effect', type: 'enum', values: ['off', 'solid', 'fast_blink'] },
+        { access: 3, name: 'level', property: 'level', type: 'numeric', value_max: 100, value_min: 0 },
+        { access: 3, name: 'duration', property: 'duration', type: 'numeric', unit: 's' },
+      ] },
+    { access: 7, category: 'config', label: 'DimmingSpeedUpRemote', name: 'dimmingSpeedUpRemote', property: 'dimmingSpeedUpRemote', type: 'numeric', value_max: 127, value_min: 0 },
+    { access: 7, category: 'config', label: 'DimmingSpeedUpLocal', name: 'dimmingSpeedUpLocal', property: 'dimmingSpeedUpLocal', type: 'numeric', value_max: 127, value_min: 0 },
+    { access: 7, category: 'config', label: 'RampRateOffToOnRemote', name: 'rampRateOffToOnRemote', property: 'rampRateOffToOnRemote', type: 'numeric', value_max: 127, value_min: 0 },
+    { access: 7, category: 'config', label: 'RampRateOffToOnLocal', name: 'rampRateOffToOnLocal', property: 'rampRateOffToOnLocal', type: 'numeric', value_max: 127, value_min: 0 },
+    { access: 7, category: 'config', label: 'DimmingSpeedDownRemote', name: 'dimmingSpeedDownRemote', property: 'dimmingSpeedDownRemote', type: 'numeric', value_max: 127, value_min: 0 },
+    { access: 7, category: 'config', label: 'DimmingSpeedDownLocal', name: 'dimmingSpeedDownLocal', property: 'dimmingSpeedDownLocal', type: 'numeric', value_max: 127, value_min: 0 },
+    { access: 7, category: 'config', label: 'InvertSwitch', name: 'invertSwitch', property: 'invertSwitch', type: 'enum', values: ['Yes', 'No'] },
+    { access: 7, category: 'config', label: 'AutoTimerOff', name: 'autoTimerOff', property: 'autoTimerOff', type: 'numeric', unit: 'seconds', value_max: 32767, value_min: 0,
+      presets: [{ description: '', name: 'Disabled', value: 0 }] },
+    { access: 7, category: 'config', label: 'DefaultLevelLocal', name: 'defaultLevelLocal', property: 'defaultLevelLocal', type: 'numeric', value_max: 254, value_min: 1 },
+    { access: 7, category: 'config', label: 'DefaultLevelRemote', name: 'defaultLevelRemote', property: 'defaultLevelRemote', type: 'numeric', value_max: 254, value_min: 1 },
+    { access: 7, category: 'config', label: 'LedColorWhenOn', name: 'ledColorWhenOn', property: 'ledColorWhenOn', type: 'numeric', value_max: 255, value_min: 0,
+      presets: [{ description: '', name: 'Red', value: 0 }, { description: '', name: 'Blue', value: 170 }] },
+    { access: 7, category: 'config', label: 'LedColorWhenOff', name: 'ledColorWhenOff', property: 'ledColorWhenOff', type: 'numeric', value_max: 255, value_min: 0 },
+    { access: 7, category: 'config', label: 'LedIntensityWhenOn', name: 'ledIntensityWhenOn', property: 'ledIntensityWhenOn', type: 'numeric', value_max: 100, value_min: 0 },
+    { access: 7, category: 'config', label: 'LedIntensityWhenOff', name: 'ledIntensityWhenOff', property: 'ledIntensityWhenOff', type: 'numeric', value_max: 100, value_min: 0 },
+    { access: 5, name: 'internalTemperature', property: 'internalTemperature', type: 'numeric', unit: '\u00b0C' },
+    { access: 5, name: 'powerType', property: 'powerType', type: 'enum', values: ['Non Neutral', 'Neutral'] },
+    { access: 2, category: 'config', description: 'Initiate device identification', label: 'Identify', name: 'identify', property: 'identify', type: 'enum', values: ['identify'] },
+    { access: 2, category: 'config', description: 'Reset energy meter', label: 'Energy reset', name: 'energy_reset', property: 'energy_reset', type: 'enum', values: ['reset'] },
+    { access: 1, category: 'diagnostic', name: 'action', property: 'action', type: 'enum', values: ['button_1_single', 'button_1_double'] },
+    { access: 7, category: 'diagnostic', label: 'DebugMode', name: 'debugMode', property: 'debugMode', type: 'binary', value_off: false, value_on: true },
+    { access: 1, category: 'diagnostic', name: 'linkquality', property: 'linkquality', type: 'numeric', unit: 'lqi' },
+  ],
+  options: [
+    { access: 2, name: 'transition', property: 'transition', type: 'numeric' },
+    { access: 2, name: 'identify_timeout', property: 'identify_timeout', type: 'numeric' },
+  ],
+  option_values: { friendly_name: 'Stairway Dimmer' },
+};
+p._devices = fx.devices.concat([hueDevice, inovelliDevice]);
+p._render();
+
+console.log('=== settings: Hue-PIR-shaped device (3 plain rows, no filter) ===');
+p._go({ name: 'device', ieee: hueDevice.ieee_address });
+const hueCls = p._settingsClassify(hueDevice);
+check('exactly 3 settable rows in the main list', hueCls.main.length === 3);
+check('the 3 are motion_sensitivity, led_indication, occupancy_timeout',
+  hueCls.main.map((e) => e.prop).sort().join(',')
+    === ['led_indication', 'motion_sensitivity', 'occupancy_timeout'].sort().join(','));
+check('no filter row for 3 rows', !html().includes('id="setfilter"'));
+check('no actions row (no single-value settable enums)', !html().includes('class="set-actions"'));
+check('motion sensitivity is a plain row', !!find('data-prop', 'motion_sensitivity'));
+check('occupancy timeout is a plain row', !!find('data-prop', 'occupancy_timeout'));
+check('a non-settable expose (illuminance) is not a settings row', !find('data-prop', 'illuminance'));
+check('a diagnostic non-settable expose (battery) is not a settings row', !find('data-prop', 'battery'));
+check('converter options group of 5 renders, collapsed by default',
+  html().includes('Converter options \u00b7 5') || html().includes('Converter options') && html().includes('\u00b7 5'));
+check('one option is the list editor (no_occupancy_since)',
+  hueCls.options.some((o) => o.prop === 'no_occupancy_since'));
+check('an unread numeric row shows Not read yet',
+  String(p.shadowRoot.getElementById('setmeta-expose_occupancy_timeout').innerHTML).includes('Not read yet'));
+
+console.log('=== settings: the state mirror drives value and chip without a render ===');
+const pageBeforeState = p.shadowRoot.getElementById('page');
+if (pageBeforeState) pageBeforeState.marker = 'state-survivor';
+push('z2m/device/state/subscribe', { state: { motion_sensitivity: 'medium', led_indication: true, occupancy_timeout: 120 } });
+check('the state push does not force a full render',
+  p.shadowRoot.getElementById('page') && p.shadowRoot.getElementById('page').marker === 'state-survivor');
+check('the numeric row now shows its known value and unit',
+  String(p.shadowRoot.getElementById('setctl-expose_occupancy_timeout').innerHTML).includes('data-value="120"')
+    && String(p.shadowRoot.getElementById('setctl-expose_occupancy_timeout').innerHTML).includes('>s<'));
+check('its meta chip cleared now that the value is known',
+  String(p.shadowRoot.getElementById('setmeta-expose_occupancy_timeout').innerHTML) === '0-65535');
+check('the binary row is now a switch, not a segment',
+  String(p.shadowRoot.getElementById('setctl-expose_led_indication').innerHTML).includes('data-setswitch')
+    && !String(p.shadowRoot.getElementById('setctl-expose_led_indication').innerHTML).includes('data-setseg'));
+
+console.log('=== settings: a commit sends z2m/device/set with the right payload ===');
+sent.length = 0;
+const sensCtl = p.shadowRoot.getElementById('setctl-expose_motion_sensitivity');
+const sensSelect = sensCtl.querySelectorAll('[data-setenum]')[0];
+sensSelect.value = 'high';
+sensSelect.emit('selected');
+await tick(30);
+check('z2m/device/set carries the device and the exact written property',
+  sent.some((m) => m.type === 'z2m/device/set' && m.device === hueDevice.ieee_address
+    && m.payload.motion_sensitivity === 'high' && Object.keys(m.payload).length === 1));
+await tick(30);
+check('a matching echo shows Saved', String(p.shadowRoot.getElementById('setmeta-expose_motion_sensitivity').innerHTML).includes('Saved'));
+
+console.log('=== settings: a mismatched echo is adjusted, an offline/timeout is queued ===');
+deviceSetHandler = () => Promise.resolve({ sent: true, confirmed: true, state: { motion_sensitivity: 'low' } });
+sensSelect.value = 'medium';
+sensSelect.emit('selected');
+await tick(30);
+check('the device clamping the value shows Device set <v>',
+  String(p.shadowRoot.getElementById('setmeta-expose_motion_sensitivity').innerHTML).includes('Device set low'));
+deviceSetHandler = () => Promise.resolve({ sent: true, confirmed: false, sleeping: true });
+sensSelect.value = 'high';
+sensSelect.emit('selected');
+await tick(30);
+check('a battery device timeout shows At next wake-up',
+  String(p.shadowRoot.getElementById('setmeta-expose_motion_sensitivity').innerHTML).includes('At next wake-up'));
+deviceSetHandler = () => Promise.reject(new Error("Publish 'set' 'motion_sensitivity' to 'x' failed: 'timeout'"));
+sensSelect.value = 'low';
+sensSelect.emit('selected');
+await tick(30);
+check('a rejected write shows Failed with Zigbee2MQTT\u2019s own reason',
+  String(p.shadowRoot.getElementById('setmeta-expose_motion_sensitivity').innerHTML).includes('Failed')
+    && String(p.shadowRoot.getElementById('seterr-expose_motion_sensitivity').textContent).includes("failed: 'timeout'"));
+deviceSetHandler = (msg) => {
+  const [prop, value] = Object.entries(msg.payload)[0];
+  return Promise.resolve({ sent: true, confirmed: true, state: { [prop]: value } });
+};
+
+console.log('=== settings: Inovelli-shaped device (grouped, filter row present) ===');
+p._go({ name: 'device', ieee: inovelliDevice.ieee_address });
+const invCls = p._settingsClassify(inovelliDevice);
+check(`more than 12 main rows (${invCls.main.length})`, invCls.main.length > 12);
+check('the filter row is present', html().includes('id="setfilter"'));
+check('actions row has Identify and Energy reset', html().includes('>Identify<') && html().includes('>Energy reset<'));
+check('no state/brightness rows from the light composite',
+  !find('data-prop', 'state') && !find('data-prop', 'brightness'));
+check('a composite row (led_effect) is present', !!find('data-prop', 'led_effect'));
+check('the composite has an Apply action', html().includes('data-setapply'));
+check('main rows keep exposes[] order, not alphabetical',
+  invCls.main[1].prop === 'dimmingSpeedUpRemote' && invCls.main[2].prop === 'dimmingSpeedUpLocal');
+check('Diagnostic group holds only the one settable diagnostic property (not action/linkquality)',
+  invCls.diagnostic.length === 1 && invCls.diagnostic[0].prop === 'debugMode'
+    && !!find('data-prop', 'debugMode') && html().includes('Diagnostic'));
+check('a preset numeric shows a preset select plus a hidden custom field', (() => {
+  const box = p.shadowRoot.getElementById('setctl-expose_autoTimerOff');
+  return !!box && String(box.innerHTML).includes('data-setpreset') && String(box.innerHTML).includes('setpreset-custom');
+})());
+
+console.log('=== settings: the composite Apply writes the whole nested object ===');
+sent.length = 0;
+push('z2m/device/state/subscribe', { state: { led_effect: { effect: 'solid', level: 40, duration: 10 } } });
+await tick(30);
+check('the collapsed row summarises the known values',
+  String(p.shadowRoot.getElementById('setctl-expose_led_effect').innerHTML).includes('solid'));
+const featEl = p.shadowRoot.getElementById('setfeat-expose_led_effect-level');
+const levelInput = featEl.querySelectorAll('[data-setfeat]')[0];
+levelInput.value = '55';
+levelInput.onchange();
+const applyBtn = p.shadowRoot.querySelectorAll('[data-setapply]')[0];
+applyBtn.onclick();
+await tick(30);
+const compositeMsg = sent.find((m) => m.type === 'z2m/device/set' && m.device === inovelliDevice.ieee_address
+  && m.payload.led_effect);
+check('the composite write nests every definite feature under its own property',
+  !!compositeMsg && compositeMsg.payload.led_effect.level === 55
+    && compositeMsg.payload.led_effect.effect === 'solid'
+    && compositeMsg.payload.led_effect.duration === 10);
+
+p._go({ name: 'dashboard' });
+await tick();
+p._devices = fx.devices;
+p._render();
+
+/* ======================================================== pairing log cap */
+console.log('=== pairing log: 200-line cap ===');
+sent.length = 0;
+await act('pair');
+await tick(60);
+for (let i = 0; i < 250; i += 1) {
+  push('z2m/logs/subscribe', { time: Date.now() / 1000, level: 'info', message: `interview step ${i}` });
+}
+check('the pairing log is capped at PAIR_LOG_MAX (200), not the old 24', p._pairing.logs.length === 200);
+check('the cap keeps the newest lines', p._pairing.logs[p._pairing.logs.length - 1].message === 'interview step 249');
+await act('pairclose');
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) =>

@@ -54,6 +54,7 @@ const MDI = {
   health: 'M7.5,4A5.5,5.5 0 0,0 2,9.5C2,10 2.09,10.5 2.22,11H6.3L7.57,7.63C7.87,6.83 9.05,6.75 9.43,7.63L11.5,13L12.09,11.58C12.22,11.25 12.57,11 13,11H21.78C21.91,10.5 22,10 22,9.5A5.5,5.5 0 0,0 16.5,4C14.64,4 13,4.93 12,6.34C11,4.93 9.36,4 7.5,4V4M3,12.5A1,1 0 0,0 2,13.5A1,1 0 0,0 3,14.5H5.44L11,20C12,20.9 12,20.9 13,20L18.56,14.5H21A1,1 0 0,0 22,13.5A1,1 0 0,0 21,12.5H13.4L12.47,14.8C12.07,15.81 10.92,15.67 10.55,14.83L8.5,9.5L7.54,11.83C7.39,12.21 7.05,12.5 6.6,12.5H3Z',
   unlinked: 'M4,1C2.89,1 2,1.89 2,3V7C2,8.11 2.89,9 4,9H1V11H13V9H10C11.11,9 12,8.11 12,7V3C12,1.89 11.11,1 10,1H4M4,3H10V7H4V3M14,13C12.89,13 12,13.89 12,15V19C12,20.11 12.89,21 14,21H11V23H23V21H20C21.11,21 22,20.11 22,19V15C22,13.89 21.11,13 20,13H14M3.88,13.46L2.46,14.88L4.59,17L2.46,19.12L3.88,20.54L6,18.41L8.12,20.54L9.54,19.12L7.41,17L9.54,14.88L8.12,13.46L6,15.59L3.88,13.46M14,15H20V19H14V15Z',
   updating: 'M13,2.03C17.73,2.5 21.5,6.25 21.95,11C22.5,16.5 18.5,21.38 13,21.93V19.93C16.64,19.5 19.5,16.61 19.96,12.97C20.5,8.58 17.39,4.59 13,4.05V2.05L13,2.03M11,2.06V4.06C9.57,4.26 8.22,4.84 7.1,5.74L5.67,4.26C7.19,3 9.05,2.25 11,2.06M4.26,5.67L5.69,7.1C4.8,8.23 4.24,9.58 4.05,11H2.05C2.25,9.04 3,7.19 4.26,5.67M2.06,13H4.06C4.24,14.42 4.81,15.77 5.69,16.9L4.27,18.33C3.03,16.81 2.26,14.96 2.06,13M7.1,18.37C8.23,19.25 9.58,19.82 11,20V22C9.04,21.79 7.18,21 5.67,19.74L7.1,18.37M12,16.5L7.5,12H11V8H13V12H16.5L12,16.5Z',
+  close: 'M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.5,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z',
 };
 
 /* Home Assistant components this page is built from. Every one of them is OPTIONAL:
@@ -68,6 +69,11 @@ const HA_ELEMENTS = [
   'ha-alert',
   'ha-button',
   'ha-dialog',
+  // Settings-card editors: a switch is common enough to be worth waiting for, and
+  // the converter-options/diagnostic groups and every composite row collapse behind
+  // ha-expansion-panel, so it earns the same late-upgrade treatment as the rest.
+  'ha-switch',
+  'ha-expansion-panel',
   // Form furniture. Every control the operator types into is one of HA's own, because
   // a hand-rolled input hosted in HA's row component is exactly what broke on a phone:
   // the trailing slot took the whole row and the label collapsed to nothing.
@@ -91,7 +97,7 @@ const LOG_MAX = 300;
 const LOG_LEVELS = ['error', 'warning', 'info', 'debug'];
 
 const PAIR_OPEN_SECONDS = 254;
-const PAIR_LOG_MAX = 24;
+const PAIR_LOG_MAX = 200;
 // Longest text a reading tile shows before it is trimmed and the rest moves to the
 // tooltip. Numbers never reach this; converters that pack a structure into one
 // state do, and HA truncates those at 255 characters anyway.
@@ -228,6 +234,58 @@ const rowButton = (label, act, appearance = 'plain') =>
     label
   )}</ha-button>`;
 
+/* Exposes of these types are already represented by an HA entity on the Controls
+ * card, so their whole feature subtree is invisible to the Settings classifier
+ * (§3.2.1): a plain Set stays a constant-time lookup instead of an array scan on
+ * every device page render. */
+const SETTINGS_CONTROL_TYPES = new Set(['light', 'switch', 'lock', 'cover', 'climate', 'fan']);
+
+/**
+ * Zigbee2MQTT hands a converter-authored setting a label by titlecasing the raw
+ * property (`DimmingSpeedUpRemote`), while a hand-written one already reads as a
+ * sentence ("Energy reset"). This only touches the first kind: a label with no
+ * spaces but an interior capital is split before each capital, every word but the
+ * first is lowercased, and a run that is ALL CAPS (an acronym) is left alone.
+ */
+const deCamel = (s) => {
+  const str = String(s || '');
+  if (!str || /\s/.test(str) || !/[A-Z]/.test(str.slice(1))) return str;
+  const words = str
+    .replace(/([a-z0-9])([A-Z])/g, '$1\u0000$2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1\u0000$2')
+    .split('\u0000');
+  return words
+    .map((w, i) => {
+      if (/^[A-Z]+$/.test(w)) return w;
+      return i === 0 ? w.charAt(0).toUpperCase() + w.slice(1) : w.toLowerCase();
+    })
+    .join(' ');
+};
+
+/**
+ * One button, gated the same way as every other settings editor: HA's own
+ * component when it is registered, a plain button when it is not.
+ */
+const ctlButton = (label, attrs, appearance) =>
+  customElements.get('ha-button')
+    ? `<ha-button appearance="${appearance || 'plain'}" size="s"${attrs || ''}>${esc(
+        label
+      )}</ha-button>`
+    : `<button type="button" class="fallback-btn"${attrs || ''}>${esc(label)}</button>`;
+
+/** Chip text and colour class for every write/value state that is not silence. */
+const SETTINGS_CHIP = {
+  notread: ['Not read yet', ''],
+  notreported: ['Not reported yet', ''],
+  writeonly: ['Write only', ''],
+  pending: ['Sending\u2026', ''],
+  confirmed: ['Saved', 'ok'],
+  sent: ['Sent', 'ok'],
+  queued: ['At next wake-up', 'warn'],
+  unconfirmed: ['No reply', 'warn'],
+  failed: ['Failed', 'off'],
+};
+
 /* The coordinator board's own entities, owned by the smlight integration. Hardcoded
  * ids on purpose: this panel manages one household's mesh, and the card simply skips
  * whatever Home Assistant does not currently provide. */
@@ -271,6 +329,12 @@ class Z2MPanel extends HTMLElement {
     this._feedVersions = { info: 0, devices: 0, groups: 0 };
     this._feedRequests = { info: 0, devices: 0, groups: 0 };
     this._filter = '';
+    // Recorded on every keystroke in the devices search box (§5.2): the source of
+    // truth for the caret when a real push forces a full re-render mid-word, since
+    // a freshly focused web-component host's own selectionStart cannot be trusted.
+    this._filterCaret = null;
+    // Same idea, for the Settings card's own filter box (§3.6).
+    this._setFilterCaret = null;
     // Group writes report locally: a refused rename must not blank the dashboard.
     this._groupError = null;
     this._groupNotice = null;
@@ -283,6 +347,23 @@ class Z2MPanel extends HTMLElement {
     this._resetMap();
     this._resetPairing();
     this._resetBinds();
+
+    // Settings card (§3): state values arrive over z2m/device/state/subscribe and
+    // are never baked into _markup (§1) -- everything below is keyed by ieee and
+    // patched onto the page by _syncSettings, never rendered into the page string.
+    this._settingsState = {}; // ieee -> merged property map from the state mirror
+    this._settingsWrite = {}; // ieee -> { rowKey -> {phase, message, echoed, token} }
+    this._settingsDraft = {}; // ieee -> { compositeKey -> {featureProp -> value} }
+    this._settingsOpen = {}; // ieee -> { groupKey -> expanded }, kept for the session
+    this._settingsFilterOpen = {}; // ieee -> Set of group keys the filter itself opened
+    this._settingsConfirming = {}; // `${ieee}|${prop}` -> confirm-window timeout id
+    this._settingsReading = {}; // ieee -> true while Read from device is in flight
+    this._settingsCache = {}; // ieee -> {ctl, meta} last-painted HTML, for _syncSettings' diff
+    this._settingsListDraft = {}; // `${ieee}|${rowKey}` -> in-progress array, editor I
+    // The Settings card's own filter text (§3.6). Kept apart from the devices
+    // list's _filter: the two boxes are never open at once, but sharing one field
+    // would make that coincidence load-bearing instead of incidental.
+    this._setFilter = '';
 
     this._diag = {
       // The coordinator's routing table.
@@ -987,27 +1068,6 @@ class Z2MPanel extends HTMLElement {
     return spec ? typedName(spec.data.value) : '';
   }
 
-  /** Home Assistant selectors for one Zigbee2MQTT option, from Z2M's own schema. */
-  _optionSelector(o) {
-    if (o.type === 'binary') return { boolean: {} };
-    if (o.type === 'enum') {
-      return {
-        select: {
-          mode: 'dropdown',
-          options: (o.values || []).map((v) => ({ value: String(v), label: String(v) })),
-        },
-      };
-    }
-    if (o.type === 'numeric') {
-      const number = { mode: 'box', step: o.value_step === undefined ? 'any' : o.value_step };
-      if (o.value_min !== undefined) number.min = o.value_min;
-      if (o.value_max !== undefined) number.max = o.value_max;
-      if (o.unit) number.unit_of_measurement = o.unit;
-      return { number };
-    }
-    return { text: {} };
-  }
-
   /**
    * The map's own state. `el` outlives every re-render -- it owns the physics, the
    * pinned layout and the selection -- and `scan` is the single object the element
@@ -1044,6 +1104,10 @@ class Z2MPanel extends HTMLElement {
       logs: [],
       // Auto-scroll: on until the operator wants to read something.
       follow: true,
+      // Lines that arrived while paused: shown on the Jump to latest control so
+      // coming back tells the operator how much they missed, not just that
+      // something did.
+      unread: 0,
       // The log level itself is the backend's business: it is the only side that is
       // reliably told when this view goes away, including on a closed tab.
       error: null,
@@ -1195,6 +1259,12 @@ class Z2MPanel extends HTMLElement {
     if (key === 'info') this._summary = value || null;
     else if (key === 'devices') this._devices = Array.isArray(value) ? value : [];
     else if (key === 'groups') this._groups = Array.isArray(value) ? value : [];
+    // The pairing dialog paints itself outside the normal render loop (see
+    // _paintPairDialog), so a summary push -- the only way the debug chip's
+    // log_level ever changes while the dialog is open -- needs its own nudge.
+    // _paintPairDialog no-ops when it is not open and dedupes on markup, so this
+    // is free the rest of the time.
+    if (key === 'info' && this._pairing.open) this._paintPairDialog();
     this._feedVersions[key] += 1;
     this._feedErrors[key] = null;
     this._renderFeedUpdate();
@@ -1457,7 +1527,13 @@ class Z2MPanel extends HTMLElement {
                 background:transparent; color:var(--primary-text-color); font:inherit;
                 font-size:var(--ha-font-size-l, 16px); }
       .search .grow { flex:1; font-size:var(--ha-font-size-m, 14px); }
+      .search .count { flex:none; color:var(--secondary-text-color);
+                        font-size:var(--ha-font-size-s, 13px);
+                        font-variant-numeric:tabular-nums; white-space:nowrap; }
       .search ha-svg-icon { color:var(--secondary-text-color); }
+      /* A no-match state reads as a centered notice, so its Clear action centers too
+         rather than inheriting the right-aligned rhythm .actions uses everywhere else. */
+      .empty .actions { justify-content:center; padding-top:var(--ha-space-2, 8px); }
       .chip { display:inline-block; padding:0 var(--ha-space-2, 8px); border:var(--ha-border-width, 1px) solid;
               border-radius:var(--ha-border-radius-pill, 999px); color:var(--secondary-text-color);
               font-size:var(--ha-font-size-xs, 12px); line-height:var(--ha-line-height-normal, 1.5);
@@ -1568,9 +1644,105 @@ class Z2MPanel extends HTMLElement {
                        border:var(--ha-border-width, 1px) solid var(--divider-color);
                        border-radius:var(--ha-border-radius-md, 8px); }
       .pair-identity strong, .pair-identity code { display:block; overflow-wrap:anywhere; }
-      .pair-log { max-height:var(--ha-log-max-height, 168px); overflow:auto;
+
+      /* ---------------------------------------------------------- settings */
+      /* One vertical rhythm, the .kv convention: a top divider between siblings,
+       * no padding on the row itself so a composite/group's ha-expansion-panel
+       * (which pads its own summary/content) never doubles up. */
+      .setrow { min-height:48px; box-sizing:border-box; }
+      .setrow + .setrow { border-top:var(--ha-border-width, 1px) solid var(--divider-color); }
+      details.setrow > summary { list-style:none; cursor:pointer; }
+      details.setrow > summary::-webkit-details-marker { display:none; }
+      .setrow-top { display:flex; flex-wrap:wrap; align-items:center;
+                    gap:var(--ha-space-4, 16px); padding:var(--ha-space-3, 12px) var(--ha-space-4, 16px); }
+      .setrow-label { flex:1; min-width:0; }
+      .setrow-name, .setgroup-title { font-size:var(--ha-font-size-m, 14px); color:var(--primary-text-color); }
+      .setgroup-title { flex:1; text-transform:uppercase; letter-spacing:.04em;
+                         font-size:var(--ha-font-size-s, 13px); color:var(--secondary-text-color); }
+      .setgroup-note { padding:0 var(--ha-space-4, 16px) var(--ha-space-2, 8px);
+                        color:var(--secondary-text-color); font-size:var(--ha-font-size-s, 13px); }
+      .setrow-desc { padding:0 var(--ha-space-4, 16px); margin-top:var(--ha-space-1, 4px);
+                     color:var(--secondary-text-color); font-size:var(--ha-font-size-s, 13px);
+                     line-height:1.4; display:-webkit-box; -webkit-line-clamp:2;
+                     -webkit-box-orient:vertical; overflow:hidden; max-height:calc(1.4em * 2); }
+      .setrow-desc.expanded { -webkit-line-clamp:unset; overflow:visible; max-height:none; }
+      /* A trailing block, never inline inside the clamped text: an inline button
+       * sharing the clamped box's line count is exactly what made -webkit-line-
+       * clamp's reported height unreliable and let the second line bleed into
+       * the meta row below it. */
+      .setrow-more { padding:0 var(--ha-space-4, 16px); margin-top:var(--ha-space-1, 4px); }
+      .setrow-meta:empty { display:none; }
+      .setrow-meta { padding:0 var(--ha-space-4, 16px) var(--ha-space-3, 12px);
+                     margin-top:var(--ha-space-1, 4px);
+                     color:var(--secondary-text-color); font-size:var(--ha-font-size-s, 12px);
+                     font-variant-numeric:tabular-nums; }
+      .seterr { padding:0 var(--ha-space-4, 16px) var(--ha-space-3, 12px);
+                margin-top:var(--ha-space-2, 8px);
+                color:var(--error-color); font-size:var(--ha-font-size-s, 13px); }
+      .seterr[hidden] { display:none; }
+      .setrow-summary { color:var(--secondary-text-color); font-size:var(--ha-font-size-s, 13px); }
+      .linklike { all:unset; cursor:pointer; color:var(--primary-color); font-size:var(--ha-font-size-s, 13px); }
+      .setrow-ctl { flex:none; max-width:60%; }
+      @media (min-width:900px) { .setrow-ctl { max-width:320px; } }
+      .setrow[data-etype="text"] .setrow-ctl, .setrow[data-etype="list"] .setrow-ctl { width:100%; max-width:none; }
+      @media (max-width:600px) {
+        .setrow[data-etype="text"] .setrow-top, .setrow[data-etype="list"] .setrow-top {
+          flex-direction:column; align-items:stretch; }
+      }
+      .setnumwrap { display:inline-flex; align-items:center; gap:var(--ha-space-2, 8px); }
+      .setnumwrap input.fallback { width:136px; }
+      .setunit { color:var(--secondary-text-color); font-size:var(--ha-font-size-s, 13px); }
+      input.fallback.invalid { border-color:var(--error-color); }
+      select.fallback { box-sizing:border-box; min-height:var(--ha-touch-target-min-size, 40px);
+                         padding:var(--ha-space-2, 8px);
+                         border:var(--ha-border-width, 1px) solid var(--divider-color);
+                         border-radius:var(--ha-border-radius-md, 8px);
+                         background:var(--card-background-color); color:var(--primary-text-color);
+                         font:inherit; font-size:var(--ha-font-size-m, 14px); }
+      select.fallback.compact, input.fallback.compact { min-height:var(--ha-space-8, 32px);
+                         padding:var(--ha-space-1, 4px) var(--ha-space-2, 8px); width:96px; }
+      .setseg { display:inline-flex; gap:var(--ha-space-2, 8px); }
+      .fallback-btn { box-sizing:border-box; min-height:var(--ha-touch-target-min-size, 40px);
+                      padding:0 var(--ha-space-4, 16px);
+                      border:var(--ha-border-width, 1px) solid var(--divider-color);
+                      border-radius:var(--ha-border-radius-md, 8px);
+                      background:var(--card-background-color); color:var(--primary-color);
+                      font:inherit; font-size:var(--ha-font-size-m, 14px); cursor:pointer; }
+      .setpreset { display:inline-flex; flex-wrap:wrap; align-items:center; gap:var(--ha-space-2, 8px); }
+      .setpreset-custom[hidden] { display:none; }
+      .setlist { display:flex; flex-direction:column; gap:var(--ha-space-2, 8px); align-items:flex-end; }
+      .setlist-chips { display:flex; flex-wrap:wrap; gap:var(--ha-space-1, 4px); justify-content:flex-end; }
+      .setlist-empty { color:var(--secondary-text-color); font-size:var(--ha-font-size-s, 13px); }
+      .chipx { all:unset; cursor:pointer; margin-inline-start:var(--ha-space-1, 4px); }
+      .setlist-add { display:flex; align-items:center; gap:var(--ha-space-2, 8px); }
+      .setlist-add input.fallback, .setlist-add ha-textfield { width:88px; }
+      .set-actions { display:flex; flex-wrap:wrap; gap:var(--ha-space-3, 12px);
+                     padding:var(--ha-space-3, 12px) var(--ha-space-4, 16px);
+                     border-bottom:var(--ha-border-width, 1px) solid var(--divider-color); }
+      .setaction { display:flex; flex-direction:column; gap:var(--ha-space-1, 4px); }
+      .setcomposite-body { padding-bottom:var(--ha-space-3, 12px); }
+      .setfeature { display:flex; align-items:center; justify-content:space-between;
+                    gap:var(--ha-space-3, 12px);
+                    padding:var(--ha-space-1, 4px) var(--ha-space-4, 16px) var(--ha-space-1, 4px)
+                      calc(var(--ha-space-4, 16px) * 2); }
+      .setfeature-label { flex:1; min-width:0; font-size:var(--ha-font-size-s, 13px); color:var(--primary-text-color); }
+      .setfeature-ctl { flex:none; }
+      .setcomposite-apply { display:flex; justify-content:flex-end; padding:var(--ha-space-2, 8px) var(--ha-space-4, 16px) 0; }
+
+      /* Viewport-proportional, not a fixed box: an interview emits dozens of lines
+       * and the old 168px strip showed nine of them. height (not max-height)
+       * claims the space immediately so the box does not jump around as lines
+       * arrive; dvh tracks a phone's URL bar, with the plain vh line right
+       * above it as the fallback for engines that do not know dvh yet. */
+      .pair-log { height:clamp(160px, 32vh, 480px);
+                  height:clamp(160px, 32dvh, 480px);
+                  overflow:auto; overscroll-behavior:contain;
                   border-top:var(--ha-border-width, 1px) solid var(--divider-color); }
       .pair-log .log { padding-inline:var(--ha-space-3, 12px); }
+      .pair-log:empty::after { content:"Waiting for Zigbee2MQTT\u2026"; display:block;
+                  padding:var(--ha-space-3, 12px); color:var(--secondary-text-color);
+                  font-size:var(--ha-font-size-s, 13px);
+                  line-height:var(--ha-line-height-normal, 1.5); }
 
       /* ------------------------------------------------------------ dialog */
       /* A window everywhere, sized for the surface. 2026.8's ha-dialog is built on
@@ -1582,6 +1754,11 @@ class Z2MPanel extends HTMLElement {
        * auto on both margins is what centres the surface. It only reaches the surface
        * because the element is not type="standard"; see _ensurePairDialog. */
       ha-dialog { --ha-dialog-width-md:min(92vw, 33rem); }
+      @media (min-width: 900px) {
+        /* Widen the dialog once there is room, so log lines stop wrapping
+           constantly during an interview. */
+        ha-dialog { --ha-dialog-width-md:min(92vw, 40rem); }
+      }
       @media (max-width: 450px), (max-height: 500px) {
         ha-dialog { --ha-dialog-width-md:calc(100vw - var(--ha-space-8, 32px));
                     --ha-dialog-width-full:calc(100vw - var(--ha-space-8, 32px));
@@ -1589,7 +1766,8 @@ class Z2MPanel extends HTMLElement {
                     --ha-dialog-min-height:auto;
                     --dialog-surface-margin-top:auto;
                     --ha-dialog-border-radius:var(--ha-border-radius-2xl, 28px); }
-        .pair-log { max-height:var(--ha-log-max-height-narrow, 132px); }
+        .pair-log { height:clamp(128px, 28vh, 320px);
+                    height:clamp(128px, 28dvh, 320px); }
       }
       .dlg { display:grid; gap:var(--ha-space-4, 16px);
              padding:var(--ha-space-2, 8px) 0 var(--ha-space-4, 16px); }
@@ -1769,28 +1947,39 @@ class Z2MPanel extends HTMLElement {
     if (markup === this._markup) return;
     this._markup = markup;
 
-    // The operator may be mid-word in the device search when a push lands.
+    // The operator may be mid-word in the devices or settings search when a push
+    // lands. ha-textfield is a web component: its caret lives on an inner input
+    // the host itself does not reliably expose through selectionStart, so these
+    // two ids trust the value their own input handler already recorded instead
+    // of a fresh read here, which is what _restoreCaret is for.
     const focused = this.shadowRoot.activeElement;
     const focusId = focused && focused.id;
-    let caret = null;
-    try {
-      caret = focused ? focused.selectionStart : null;
-    } catch (_) {
-      caret = null; // inputs that do not support selection throw on read
+    const tracked = focusId === 'q' ? this._filterCaret
+      : focusId === 'setfilter' ? this._setFilterCaret
+      : null;
+    let caret = tracked;
+    if (caret === null) {
+      try {
+        caret = focused ? focused.selectionStart : null;
+      } catch (_) {
+        caret = null; // inputs that do not support selection throw on read
+      }
     }
 
     this._ensureApp().innerHTML = markup;
     this._hydrate();
+    // _syncFw/_syncCoord also call _hydrate() after a scoped box patch, while
+    // the device page's own settings boxes already hold real content -- forcing
+    // a fresh sync there would blow the per-row memo away and repaint every row
+    // on every firmware tick. A genuine full render is the one place the
+    // skeleton is truly empty (render discipline, §1) and a forced sync is safe.
+    if (this._view.name === 'device') this._syncSettings(true);
 
     if (focusId) {
       const again = this.shadowRoot.getElementById(focusId);
       if (again && again.focus) {
         again.focus();
-        try {
-          if (caret !== null && again.setSelectionRange) again.setSelectionRange(caret, caret);
-        } catch (_) {
-          /* selection is a nicety; focus is the part that matters */
-        }
+        this._restoreCaret(again, caret);
       }
     }
 
@@ -1798,6 +1987,36 @@ class Z2MPanel extends HTMLElement {
     // markup that just replaced it.
     this._hostPairDialog();
     this._enter();
+  }
+
+  /**
+   * Best-effort caret restore after the element that had it was just recreated.
+   *
+   * A plain `<input>` exposes `setSelectionRange` directly. A web-component text
+   * field (`ha-textfield`) may not: its caret lives on a native input behind its
+   * own shadow root, reachable only once the component has finished updating --
+   * hence the `updateComplete` branch, which real LitElement-based components
+   * (HA's own) provide and a plain object simply will not have.
+   */
+  _restoreCaret(el, caret) {
+    if (caret === null) return;
+    try {
+      if (el.setSelectionRange) {
+        el.setSelectionRange(caret, caret);
+        return;
+      }
+    } catch (_) {
+      /* fall through to the web-component path below */
+    }
+    const ready = el.updateComplete;
+    if (ready && typeof ready.then === 'function') {
+      ready
+        .then(() => {
+          const inner = el.shadowRoot && el.shadowRoot.querySelector('input');
+          if (inner && inner.setSelectionRange) inner.setSelectionRange(caret, caret);
+        })
+        .catch(() => {});
+    }
   }
 
   /** HA's own page chrome: header, back arrow and refresh action. */
@@ -2031,6 +2250,197 @@ class Z2MPanel extends HTMLElement {
       el.onchange = () => this._change(el.dataset.change, el);
     });
 
+    // Settings editors (§3.3). Every commit ultimately calls _settingsCommit,
+    // which routes an expose to z2m/device/set and a converter option to
+    // z2m/device/options and drives the row's write-lifecycle chip either way.
+    r.querySelectorAll('[data-setswitch]').forEach((el) => {
+      el.onchange = () => {
+        const [ieee, key] = el.dataset.setswitch.split('|');
+        const d = this._dev(ieee);
+        const entry = d && this._settingsFindEntry(d, key);
+        if (!entry) return;
+        const e = entry.expose;
+        this._settingsCommit(ieee, entry, el.checked
+          ? (e.value_on === undefined ? true : e.value_on)
+          : (e.value_off === undefined ? false : e.value_off));
+      };
+    });
+    r.querySelectorAll('[data-setseg]').forEach((el) => {
+      el.onclick = () => {
+        const [ieee, key, which] = el.dataset.setseg.split('|');
+        const d = this._dev(ieee);
+        const entry = d && this._settingsFindEntry(d, key);
+        if (!entry) return;
+        const e = entry.expose;
+        this._settingsCommit(ieee, entry, which === 'on'
+          ? (e.value_on === undefined ? true : e.value_on)
+          : (e.value_off === undefined ? false : e.value_off));
+      };
+    });
+    r.querySelectorAll('[data-setenum]').forEach((el) => {
+      const commit = () => {
+        if (el.value === '') return;
+        const [ieee, key] = el.dataset.setenum.split('|');
+        const d = this._dev(ieee);
+        const entry = d && this._settingsFindEntry(d, key);
+        if (entry) this._settingsCommit(ieee, entry, el.value);
+      };
+      // ha-select's own change never fires; the native fallback has no `selected`
+      // event -- assigning both this way needs no per-kind branch and, unlike
+      // `addEventListener` here, is safe to redo on every _wire() pass.
+      el.onchange = commit;
+      if (!el._z2mSetEnum) {
+        el._z2mSetEnum = true;
+        el.addEventListener('selected', commit);
+      }
+    });
+    r.querySelectorAll('[data-setpreset]').forEach((el) => {
+      const commit = () => {
+        const [ieee, key, domId] = el.dataset.setpreset.split('|');
+        const custom = r.getElementById(`setpresetcustom-${domId}`);
+        if (el.value === '__custom__') {
+          if (custom) custom.hidden = false;
+          return;
+        }
+        if (custom) custom.hidden = true;
+        const d = this._dev(ieee);
+        const entry = d && this._settingsFindEntry(d, key);
+        const presets = entry && entry.expose.presets;
+        if (presets && presets[Number(el.value)]) this._settingsCommit(ieee, entry, presets[Number(el.value)].value);
+      };
+      el.onchange = commit;
+      if (!el._z2mSetPreset) {
+        el._z2mSetPreset = true;
+        el.addEventListener('selected', commit);
+      }
+    });
+    r.querySelectorAll('[data-setnum]').forEach((el) => {
+      const [ieee, key] = el.dataset.setnum.split('|');
+      const commit = () => this._settingsCommitNumber(ieee, key, el);
+      el.onkeydown = (ev) => {
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          commit();
+        } else if (ev.key === 'Escape') {
+          ev.preventDefault();
+          el.value = el.dataset.value;
+          if (el.classList) el.classList.remove('invalid');
+        }
+      };
+      el.onblur = () => {
+        commit();
+        // The row may have settled (adjusted/confirmed) while this field still
+        // had focus, in which case _settingsPaintCtl skipped it; blur is
+        // exactly the resync point §3.4 calls for.
+        const d = this._dev(ieee);
+        const entry = d && this._settingsFindEntry(d, key);
+        if (entry) this._settingsPaintCtl(ieee, entry);
+      };
+    });
+    r.querySelectorAll('[data-settext]').forEach((el) => {
+      const [ieee, key] = el.dataset.settext.split('|');
+      const commit = () => this._settingsCommitText(ieee, key, el);
+      el.onkeydown = (ev) => {
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          commit();
+        } else if (ev.key === 'Escape') {
+          ev.preventDefault();
+          el.value = el.dataset.value;
+        }
+      };
+      el.onblur = () => {
+        commit();
+        const d = this._dev(ieee);
+        const entry = d && this._settingsFindEntry(d, key);
+        if (entry) this._settingsPaintCtl(ieee, entry);
+      };
+    });
+    r.querySelectorAll('[data-setlistdel]').forEach((el) => {
+      el.onclick = () => {
+        const [ieee, key, idx] = el.dataset.setlistdel.split('|');
+        const arr = this._settingsListDraft[`${ieee}|${key}`];
+        if (!arr) return;
+        arr.splice(Number(idx), 1);
+        this._settingsRepaintControl(ieee, key);
+      };
+    });
+    r.querySelectorAll('[data-setlistadd]').forEach((el) => {
+      el.onclick = () => {
+        const [ieee, key] = el.dataset.setlistadd.split('|');
+        const d = this._dev(ieee);
+        const entry = d && this._settingsFindEntry(d, key);
+        if (!entry) return;
+        const input = r.getElementById(`setlistval-${this._settingsDomId(entry)}`);
+        const n = input && Number(input.value);
+        if (!input || input.value === '' || !Number.isFinite(n)) return;
+        const draftKey = `${ieee}|${key}`;
+        const arr = (this._settingsListDraft[draftKey] = this._settingsListDraft[draftKey] || []);
+        arr.push(n);
+        input.value = '';
+        this._settingsRepaintControl(ieee, key);
+      };
+    });
+    r.querySelectorAll('[data-setlistapply]').forEach((el) => {
+      el.onclick = () => {
+        const [ieee, key] = el.dataset.setlistapply.split('|');
+        const d = this._dev(ieee);
+        const entry = d && this._settingsFindEntry(d, key);
+        if (!entry) return;
+        this._settingsCommit(ieee, entry, (this._settingsListDraft[`${ieee}|${key}`] || []).slice());
+      };
+    });
+    // Composite (J) nested features: touching one records it in the draft and
+    // makes it definite; only Apply actually writes anything.
+    r.querySelectorAll('[data-setfeat]').forEach((el) => {
+      el.onchange = () => {
+        const [ieee, key, prop] = el.dataset.setfeat.split('|');
+        const store = (this._settingsDraft[ieee] = this._settingsDraft[ieee] || {});
+        const draft = (store[key] = store[key] || {});
+        const kind = el.dataset.setfeatkind;
+        draft[prop] = kind === 'binary' ? !!el.checked : kind === 'numeric' ? Number(el.value) : el.value;
+        if (el.indeterminate !== undefined) el.indeterminate = false;
+      };
+    });
+    r.querySelectorAll('[data-indeterminate]').forEach((el) => {
+      el.indeterminate = true;
+    });
+    r.querySelectorAll('[data-setapply]').forEach((el) => {
+      el.onclick = () => {
+        const [ieee, key] = el.dataset.setapply.split('|');
+        this._settingsApplyComposite(ieee, key);
+      };
+    });
+    r.querySelectorAll('[data-setaction]').forEach((el) => {
+      el.onclick = () => {
+        const [ieee, prop] = el.dataset.setaction.split('|');
+        this._settingsActionClick(ieee, prop);
+      };
+    });
+    // Converter options / Diagnostic groups and every composite row remember
+    // their own open state (§3.6) so a session revisit, or the filter clearing,
+    // can put them back the way the operator left them.
+    r.querySelectorAll('[data-setgrouptoggle]').forEach((el) => {
+      if (el._z2mGroupToggle) return;
+      el._z2mGroupToggle = true;
+      const [ieee, key] = el.dataset.setgrouptoggle.split('|');
+      const remember = (open) => {
+        const store = (this._settingsOpen[ieee] = this._settingsOpen[ieee] || {});
+        store[key] = open;
+      };
+      el.addEventListener('expanded-changed', (ev) => remember(!!(ev.detail || {}).expanded));
+      el.addEventListener('toggle', () => remember(!!el.open));
+    });
+    r.querySelectorAll('[data-descmore]').forEach((el) => {
+      el.onclick = () => {
+        const id = el.dataset.descmore;
+        const box = r.getElementById(`setdesc-${id}`);
+        if (!box || !box.classList) return;
+        const expanded = box.classList.toggle('expanded');
+        el.textContent = expanded ? 'Less' : 'More';
+      };
+    });
+
     const pairLog = r.querySelector('#pairlog');
     if (pairLog) {
       // Scrolling up is itself a request to stop following; scrolling back to the
@@ -2041,6 +2451,7 @@ class Z2MPanel extends HTMLElement {
         const atBottom = pairLog.scrollHeight - pairLog.scrollTop - pairLog.clientHeight < 24;
         if (this._pairing.follow !== atBottom) {
           this._pairing.follow = atBottom;
+          if (atBottom) this._pairing.unread = 0;
           this._syncPairFollow();
         }
       };
@@ -2063,12 +2474,49 @@ class Z2MPanel extends HTMLElement {
     }
 
     const q = r.getElementById('q');
-    // _render restores focus and caret for whatever was focused, so typing here just
-    // needs to update the filter.
-    if (q) q.oninput = () => {
-      this._filter = q.value;
-      this._render();
-    };
+    const qclear = r.getElementById('qclear');
+    if (qclear) qclear.hidden = !this._filter;
+    // Typing must never run _render(): that rebuilds every HA component in the
+    // results list and takes the caret with it. _patchDeviceSearch rewrites only
+    // the results region and the live count; this row's value is read back by
+    // _render's own focus/caret restore whenever a real push causes a full one.
+    if (q) {
+      q.oninput = () => {
+        this._filter = q.value;
+        try {
+          this._filterCaret = q.selectionStart;
+        } catch (_) {
+          this._filterCaret = null; // some hosts do not expose a selection range
+        }
+        this._patchDeviceSearch();
+      };
+      q.onkeydown = (ev) => {
+        if (ev.key !== 'Escape' || !this._filter) return;
+        ev.preventDefault();
+        this._clearDeviceSearch();
+      };
+    }
+
+    const setfilter = r.getElementById('setfilter');
+    const setfilterclear = r.getElementById('setfilterclear');
+    if (setfilterclear) setfilterclear.hidden = !this._setFilter;
+    if (setfilter) {
+      setfilter.oninput = () => {
+        this._setFilter = setfilter.value;
+        try {
+          this._setFilterCaret = setfilter.selectionStart;
+        } catch (_) {
+          this._setFilterCaret = null;
+        }
+        this._settingsApplyFilter();
+        if (setfilterclear) setfilterclear.hidden = !this._setFilter;
+      };
+      setfilter.onkeydown = (ev) => {
+        if (ev.key !== 'Escape' || !this._setFilter) return;
+        ev.preventDefault();
+        this._clearSettingsFilter();
+      };
+    }
 
     const scroll = r.getElementById('logscroll');
     if (scroll) {
@@ -2088,7 +2536,10 @@ class Z2MPanel extends HTMLElement {
       stage.addEventListener('z2m-rescan', () => this._startScan());
     }
 
-    if (this._view.name === 'device') this._lastFw = this._fwInner(this._dev(this._view.ieee) || {});
+    if (this._view.name === 'device') {
+      this._lastFw = this._fwInner(this._dev(this._view.ieee) || {});
+      this._paintSettingsReadButton(this._view.ieee);
+    }
     if (this._view.name === 'diagnostics') this._lastCoord = this._coordInner();
     this._startTicker();
   }
@@ -2104,6 +2555,9 @@ class Z2MPanel extends HTMLElement {
     this._leave();
     this._view = view;
     this._filter = '';
+    this._filterCaret = null;
+    this._setFilter = '';
+    this._setFilterCaret = null;
     this._render();
     this.shadowRoot.scrollTop = 0;
   }
@@ -2111,6 +2565,7 @@ class Z2MPanel extends HTMLElement {
   /** Tear down whatever the view being left had running. */
   _leave() {
     if (this._view.name === 'logs') this._unsub('logs');
+    if (this._view.name === 'device') this._unsub('devstate');
     // The dialog floats above whatever view is beneath it, and navigating out from
     // under it would leave the network open with nothing on screen saying so.
     if (this._pairing.open) this._closePairDialog();
@@ -2155,14 +2610,19 @@ class Z2MPanel extends HTMLElement {
     // would only queue until wake-up; the Refresh button covers them honestly.
     if (this._view.name === 'device') {
       const d = this._dev(this._view.ieee);
+      // The state mirror (§1) is server-side and refcounted per device; watching
+      // it is what lets Settings show values without ever baking one into the
+      // page markup (see the settings section preamble).
+      if (d && !this._subs.devstate) {
+        this._sub('devstate', { type: 'z2m/device/state/subscribe', device: d.ieee_address }, (ev) =>
+          this._onDeviceState(d.ieee_address, ev)
+        );
+      }
       this._readValues = this._readValues || {};
       if (d && d.availability !== 'offline' && d.power_source === 'Mains (single phase)'
           && !this._readValues[d.ieee_address]) {
         this._readValues[d.ieee_address] = true;
-        this._call('z2m/device/read_values', { device: d.ieee_address }).catch(() => {
-          // A failed freshen changes nothing on screen; the page still shows HA's
-          // last known state, which is exactly what it showed before this existed.
-        });
+        this._readDeviceValues(d.ieee_address);
       }
     }
   }
@@ -2377,16 +2837,30 @@ class Z2MPanel extends HTMLElement {
 
   /* ---------------------------------------------------------------- devices */
 
-  _devicesView() {
+  /** The devices search predicate, shared by the initial render and the typed patch. */
+  _deviceSearchMatches() {
     const f = this._filter.toLowerCase();
-    const matches = this._devices.filter(
+    return this._devices.filter(
       (d) =>
         !f ||
         (d.friendly_name || '').toLowerCase().includes(f) ||
         (d.model || '').toLowerCase().includes(f) ||
         (d.vendor || '').toLowerCase().includes(f)
     );
+  }
 
+  /**
+   * The results region alone: the table, the compact list, or the no-match state.
+   * Split out so typing can rewrite just this element (`#devrows`) instead of
+   * running `_render()`, which is what used to steal the caret on every keystroke.
+   */
+  _devRowsHtml(matches) {
+    if (!matches.length) {
+      return `<div class="empty">No devices match &ldquo;${esc(this._filter)}&rdquo;.
+          <div class="actions"><ha-button appearance="plain" size="s"
+            data-act="devsearchclear">Clear search</ha-button></div>
+        </div>`;
+    }
     const rows = matches
       .map((d) => {
         const off = d.availability === 'offline';
@@ -2403,7 +2877,38 @@ class Z2MPanel extends HTMLElement {
         });
       })
       .join('');
+    return `${this._devicesTable(matches)}<div class="dlist">${list(rows)}</div>`;
+  }
 
+  /** Rewrites the results region and the live count in place, never the search row. */
+  _patchDeviceSearch() {
+    const r = this.shadowRoot;
+    if (!r) return;
+    const box = r.getElementById('devrows');
+    if (!box) return;
+    const matches = this._deviceSearchMatches();
+    box.innerHTML = this._devRowsHtml(matches);
+    this._wire(box);
+    const count = r.getElementById('qcount');
+    if (count) count.textContent = `${matches.length} of ${this._devices.length}`;
+    const clearBtn = r.getElementById('qclear');
+    if (clearBtn) clearBtn.hidden = !this._filter;
+  }
+
+  /** Same patch path as typing, so clearing returns focus without a render. */
+  _clearDeviceSearch() {
+    this._filter = '';
+    this._filterCaret = null;
+    const q = this.shadowRoot.getElementById('q');
+    if (q) {
+      q.value = '';
+      q.focus();
+    }
+    this._patchDeviceSearch();
+  }
+
+  _devicesView() {
+    const matches = this._deviceSearchMatches();
     return `<ha-card class="nav-card">
         <div class="search">${icon(MDI.search, '')}
           ${
@@ -2417,12 +2922,13 @@ class Z2MPanel extends HTMLElement {
                 `<input id="q" class="fallback" type="search" value="${esc(this._filter)}"
                    placeholder="Search ${this._devices.length} devices">`
           }
+          <span class="count" id="qcount" aria-live="polite">${matches.length} of ${
+            this._devices.length
+          }</span>
+          <ha-icon-button id="qclear" data-act="devsearchclear" data-path="${MDI.close}"
+            data-label="Clear search" aria-label="Clear search"></ha-icon-button>
         </div>
-        <div class="card-content">${
-          rows
-            ? `${this._devicesTable(matches)}<div class="dlist">${list(rows)}</div>`
-            : `<div class="empty">No devices match &ldquo;${esc(this._filter)}&rdquo;.</div>`
-        }</div>
+        <div class="card-content"><div id="devrows">${this._devRowsHtml(matches)}</div></div>
       </ha-card>`;
   }
 
@@ -2504,7 +3010,9 @@ class Z2MPanel extends HTMLElement {
              window. Controls will queue or fail until it is heard again.
            </ha-alert>`
         : ''
-    }${feed}${this._controlsCard(live)}${this._sensorsCard(live)}<ha-card class="nav-card"><div id="fwbox">${this._fwInner(
+    }${feed}${this._controlsCard(live)}${this._sensorsCard(live)}${this._settingsCard(
+      d
+    )}<ha-card class="nav-card"><div id="fwbox">${this._fwInner(
       d
     )}</div></ha-card><ha-card class="nav-card">
           <div class="devchips">${this._deviceChips(d, live)}</div>
@@ -2532,7 +3040,7 @@ class Z2MPanel extends HTMLElement {
           <div class="actions">
             <ha-button appearance="filled" size="s" data-act="rename">Rename</ha-button>
           </div>
-        </ha-card>${this._optionsForm(d)}<ha-card class="nav-card">
+        </ha-card><ha-card class="nav-card">
           <div class="card-header">Maintenance</div>
           <div class="card-content">${list(
             row({
@@ -2853,48 +3361,991 @@ class Z2MPanel extends HTMLElement {
       .join('');
   }
 
+  /* --------------------------------------------------------------- settings */
+  //
+  // The Settings card (design spec §3) walks the SAME exposes[]/options[] Z2M
+  // already sends with every device; nothing here is per-model. Render
+  // discipline is load-bearing throughout this section: a row's skeleton
+  // (label, description, the empty setctl-/setmeta- boxes) is the only part
+  // that is ever part of `_markup`, because that string is what `_render()`
+  // diffs to decide whether to touch the DOM at all. Values, chips and write
+  // states are assigned afterwards by `_syncSettings`, which diffs and patches
+  // each row's own small boxes the same way `_syncFw` patches the firmware
+  // card -- so a state echo can never force the whole-page rebuild that would
+  // steal the caret from a field the operator is mid-edit on.
+
+  /** Every settable exposes[]/options[] entry, sorted into where §3.2 puts it. */
+  _settingsClassify(d) {
+    const actions = [];
+    const main = [];
+    const diagnostic = [];
+    const options = [];
+    (d.exposes || []).forEach((e) => {
+      if (!e || SETTINGS_CONTROL_TYPES.has(e.type)) return; // a Controls-card entity owns this
+      if (!(e.access & 2)) return; // not settable: Readings owns it, not Settings
+      const entry = {
+        source: 'expose',
+        expose: e,
+        prop: e.property,
+        key: `expose:${e.property}`,
+        label: deCamel(e.label || e.name || e.property || ''),
+        description: e.description || '',
+      };
+      if (e.type === 'enum' && Array.isArray(e.values) && e.values.length === 1) {
+        entry.isAction = true;
+        actions.push(entry);
+        return;
+      }
+      if (e.category === 'diagnostic') {
+        diagnostic.push(entry);
+        return;
+      }
+      if (e.type === 'composite') {
+        entry.features = (e.features || [])
+          .filter((f) => f && f.property && (f.access & 2))
+          .map((f) => ({ expose: f, prop: f.property, label: deCamel(f.label || f.name || f.property || '') }));
+      }
+      main.push(entry);
+    });
+    (d.options || []).forEach((o) => {
+      if (!o || !o.property || o.property === 'friendly_name') return; // Rename owns this one
+      options.push({
+        source: 'option',
+        expose: o,
+        prop: o.property,
+        key: `option:${o.property}`,
+        label: deCamel(o.label || o.name || o.property || ''),
+        description: o.description || '',
+      });
+    });
+    return { actions, main, diagnostic, options };
+  }
+
+  /** Every classified entry, flattened, for the write-commit handlers to look one up by key. */
+  _settingsFindEntry(d, key) {
+    const cls = this._settingsClassify(d);
+    return [...cls.main, ...cls.diagnostic, ...cls.options].find((e) => e.key === key) || null;
+  }
+
+  /** A DOM-id-safe token for a row: property names are the only variable part. */
+  _settingsDomId(entry) {
+    return entry.key.replace(/[^a-zA-Z0-9_-]/g, '_');
+  }
+
+  /** At least one expose is worth asking Zigbee2MQTT to report (§3.5's gate for the header button). */
+  _settingsHasReadable(d) {
+    const scan = (list) =>
+      (list || []).some((e) => (e ? !!(e.access & 4) || scan(e.features) : false));
+    return scan(d.exposes);
+  }
+
+  /** Where a row's current value lives: the state mirror, or option_values. */
+  _settingsValue(d, entry) {
+    const map = entry.source === 'option' ? d.option_values || {} : this._settingsState[d.ieee_address] || {};
+    return { known: Object.prototype.hasOwnProperty.call(map, entry.prop), value: map[entry.prop] };
+  }
+
+  /** A composite feature's value inherits from the parent's own state object (§3.3 J notes). */
+  _settingsFeatureValue(d, entry, f) {
+    const parent = this._settingsValue(d, entry);
+    if (!parent.known || !parent.value || typeof parent.value !== 'object') {
+      return { known: false, value: undefined };
+    }
+    const has = Object.prototype.hasOwnProperty.call(parent.value, f.prop);
+    return { known: has, value: parent.value[f.prop] };
+  }
+
+  /** §3.4's value states, from access bits and whether the value is known. */
+  _settingsValueState(entry, known) {
+    if (known) return 'known';
+    if (entry.source === 'option') return 'default';
+    if (entry.expose.access === 2) return 'writeonly';
+    if (entry.expose.access & 4) return 'notread';
+    return 'notreported'; // access has the state bit but not the get bit (the Tuya access-3 trio)
+  }
+
+  /** A binary's wire value as a boolean, honouring value_on/value_off when they are not just true/false. */
+  _settingsBoolOf(expose, v) {
+    if (typeof v === 'boolean') return v;
+    if (expose && v === expose.value_on) return true;
+    if (expose && v === expose.value_off) return false;
+    return !!v;
+  }
+
   /**
-   * Z2M ships an options schema per device, so the form is generated from it rather
-   * than hard-coded per model. It is rendered by `ha-form`, which is what Home
-   * Assistant's own config pages use: it lays out and validates every selector type,
-   * and it is responsive without a single line of CSS here.
-   *
-   * The previous version hosted bare `<input>`/`<select>` in the trailing slot of
-   * HA's list row. On a phone the control took the whole row, the label collapsed to
-   * zero width, and the row grew to several hundred pixels of empty space.
+   * Loose equality for "did the device echo back what was written" (§3.4): numbers
+   * compare as numbers, binaries via value_on/value_off, composites key by key
+   * (order-independent -- the echo's key order owes us nothing), everything else
+   * as strings.
    */
-  _optionsForm(d) {
-    const opts = (d.options || []).filter((o) => o && o.property);
-    if (!opts.length) return '';
-    const key = `opts:${d.ieee_address}`;
-    const spec = this._formSpec(key, () => ({
-      schema: opts.map((o) => ({ name: o.property, selector: this._optionSelector(o) })),
-      // Z2M reports the device's current option values separately from the schema.
-      data: { ...(d.option_values || {}) },
-      label: (s) => {
-        const o = opts.find((x) => x.property === s.name) || {};
-        return o.label || o.name || s.name;
-      },
-      helper: (s) => (opts.find((x) => x.property === s.name) || {}).description,
-    }));
-    // Values that arrived after the form was built, for fields the operator has not
-    // touched, still belong on screen.
-    Object.entries(d.option_values || {}).forEach(([k, v]) => {
-      if (!(k in spec.data)) spec.data[k] = v;
+  _settingsValuesEqual(expose, a, b) {
+    if (a === b) return true;
+    if (a === undefined || b === undefined) return false;
+    if (expose && expose.type === 'binary') return this._settingsBoolOf(expose, a) === this._settingsBoolOf(expose, b);
+    if (Array.isArray(a) && Array.isArray(b)) {
+      return a.length === b.length && a.every((v, i) => this._settingsValuesEqual(null, v, b[i]));
+    }
+    if (a && typeof a === 'object' && b && typeof b === 'object') {
+      const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+      return [...keys].every((k) => this._settingsValuesEqual(null, a[k], b[k]));
+    }
+    const na = Number(a);
+    const nb = Number(b);
+    if (Number.isFinite(na) && Number.isFinite(nb)) return na === nb;
+    return String(a) === String(b);
+  }
+
+  /** A value as the chip.adjusted copy shows it: the wire value, verbatim for non-binaries. */
+  _settingsDisplayValue(entry, v) {
+    const e = entry.expose;
+    if (e.type === 'binary') {
+      const on = this._settingsBoolOf(e, v);
+      return on ? (typeof e.value_on === 'string' ? e.value_on : 'on') : typeof e.value_off === 'string' ? e.value_off : 'off';
+    }
+    if (v && typeof v === 'object') return JSON.stringify(v);
+    return String(v);
+  }
+
+  /** The one chip a row shows right now: a write in flight outranks the plain value state. */
+  _settingsChipHtml(d, entry) {
+    const w = (this._settingsWrite[d.ieee_address] || {})[entry.key];
+    if (w && w.phase) {
+      if (w.phase === 'adjusted') {
+        return `<span class="chip warn">Device set ${esc(this._settingsDisplayValue(entry, w.echoed))}</span>`;
+      }
+      const spec = SETTINGS_CHIP[w.phase];
+      if (spec) return `<span class="chip ${spec[1]}">${spec[0]}</span>`;
+    }
+    const { known } = this._settingsValue(d, entry);
+    const spec = SETTINGS_CHIP[this._settingsValueState(entry, known)];
+    return spec ? `<span class="chip ${spec[1]}">${spec[0]}</span>` : '';
+  }
+
+  /** Range (numerics with declared bounds) plus the state chip, the row's whole meta line. */
+  _settingsMetaHtml(d, entry) {
+    const e = entry.expose;
+    const parts = [];
+    if (e.type === 'numeric' && e.value_min !== undefined && e.value_max !== undefined) {
+      parts.push(`${e.value_min}-${e.value_max}`);
+    }
+    const chip = this._settingsChipHtml(d, entry);
+    if (chip) parts.push(chip);
+    return parts.join(' \u00b7 ');
+  }
+
+  /* ------------------------------------------------------- the editor matrix */
+
+  /** Dispatches to A-J. Safe to bake the current value into THIS string: unlike
+   * the row skeleton, it is diffed by _syncSettings against its own per-row
+   * memo, never against the page-level _markup _render() compares. */
+  _settingsControlHtml(d, entry) {
+    if (entry.expose.type === 'composite') return this._settingsCompositeSummaryHtml(d, entry);
+    const { known, value } = this._settingsValue(d, entry);
+    const ctx = { entry, known, value, disabled: !!d.disabled, ieee: d.ieee_address, id: this._settingsDomId(entry) };
+    switch (entry.expose.type) {
+      case 'binary':
+        return this._settingsBinaryHtml(ctx);
+      case 'enum':
+        return this._settingsEnumHtml(ctx);
+      case 'numeric':
+        return entry.expose.presets ? this._settingsPresetHtml(ctx) : this._settingsNumericHtml(ctx);
+      case 'list':
+        return this._settingsListHtml(ctx);
+      default:
+        return this._settingsTextHtml(ctx); // text, and the safest honest fallback for anything else
+    }
+  }
+
+  /** A: known binary -> switch. B: unknown or write-only -> a two-button segment. */
+  _settingsBinaryHtml(ctx) {
+    const { entry, known, value, disabled, ieee, id } = ctx;
+    const e = entry.expose;
+    const dis = disabled ? ' disabled' : '';
+    if (known) {
+      const checked = this._settingsBoolOf(e, value) ? ' checked' : '';
+      return this._has('ha-switch')
+        ? `<ha-switch data-setrow="${id}" data-setswitch="${esc(ieee)}|${esc(entry.key)}"${checked}${dis}></ha-switch>`
+        : `<input type="checkbox" class="fallback-check" data-setrow="${id}" data-setswitch="${esc(ieee)}|${esc(entry.key)}"${checked}${dis}>`;
+    }
+    const onLabel = typeof e.value_on === 'string' ? e.value_on : 'Turn on';
+    const offLabel = typeof e.value_off === 'string' ? e.value_off : 'Turn off';
+    return `<span class="setseg" data-setrow="${id}">${ctlButton(
+      offLabel,
+      ` data-setseg="${esc(ieee)}|${esc(entry.key)}|off"${dis}`
+    )}${ctlButton(onLabel, ` data-setseg="${esc(ieee)}|${esc(entry.key)}|on"${dis}`)}</span>`;
+  }
+
+  /** C: known-value enum -> select. D: write-only -> the same select, unselected, with a placeholder. */
+  _settingsEnumHtml(ctx) {
+    const { entry, known, value, disabled, ieee, id } = ctx;
+    const e = entry.expose;
+    const values = e.values || [];
+    // Converter options never have a get bit: they are write-only by nature, so
+    // an unknown one gets the D placeholder even on a schema that omits `access`
+    // (Z2M's own samples always set it to 2; this covers the ones that do not).
+    const placeholder = (e.access === 2 || entry.source === 'option') && !known;
+    const selected = known ? String(value) : '';
+    const dis = disabled ? ' disabled' : '';
+    const items = values.map((v) => `<ha-list-item value="${esc(String(v))}">${esc(String(v))}</ha-list-item>`).join('');
+    const opts = values.map((v) => `<option value="${esc(String(v))}">${esc(String(v))}</option>`).join('');
+    return this._has('ha-select')
+      ? `<ha-select data-setrow="${id}" naturalMenuWidth fixedMenuPosition data-value="${esc(
+          selected
+        )}" data-setenum="${esc(ieee)}|${esc(entry.key)}"${dis}>${
+          placeholder ? '<ha-list-item disabled value="">Choose\u2026</ha-list-item>' : ''
+        }${items}</ha-select>`
+      : `<select class="fallback" data-setrow="${id}" data-value="${esc(selected)}" data-setenum="${esc(
+          ieee
+        )}|${esc(entry.key)}"${dis}>${placeholder ? '<option value="" disabled>Choose\u2026</option>' : ''}${opts}</select>`;
+  }
+
+  /** F: a bounded or unbounded number, suffixed with its unit. */
+  _settingsNumericHtml(ctx) {
+    const { entry, known, value, disabled, ieee, id } = ctx;
+    const e = entry.expose;
+    const min = e.value_min !== undefined ? ` min="${esc(e.value_min)}"` : '';
+    const max = e.value_max !== undefined ? ` max="${esc(e.value_max)}"` : '';
+    const step = e.value_step !== undefined ? esc(e.value_step) : 'any';
+    const val = known ? esc(String(value)) : '';
+    const placeholder = entry.source === 'option' && !known ? ' placeholder="Z2M default"' : '';
+    const tag = `data-setrow="${id}" data-setnum="${esc(ieee)}|${esc(entry.key)}" data-value="${val}"${min}${max} step="${step}"${
+      disabled ? ' disabled' : ''
+    }${placeholder}`;
+    return this._has('ha-textfield')
+      ? `<span class="setnumwrap"><ha-textfield type="number" ${tag}${e.unit ? ` suffix="${esc(e.unit)}"` : ''}></ha-textfield></span>`
+      : `<span class="setnumwrap"><input type="number" class="fallback" ${tag}>${
+          e.unit ? `<span class="setunit">${esc(e.unit)}</span>` : ''
+        }</span>`;
+  }
+
+  /** H: free text, same commit rule as F. */
+  _settingsTextHtml(ctx) {
+    const { entry, known, value, disabled, ieee, id } = ctx;
+    const val = known ? esc(String(value)) : '';
+    const placeholder = entry.source === 'option' && !known ? ' placeholder="Z2M default"' : '';
+    const tag = `data-setrow="${id}" data-settext="${esc(ieee)}|${esc(entry.key)}" data-value="${val}"${
+      disabled ? ' disabled' : ''
+    }${placeholder}`;
+    return this._has('ha-textfield') ? `<ha-textfield type="text" ${tag}></ha-textfield>` : `<input type="text" class="fallback" ${tag}>`;
+  }
+
+  /** E: a preset select plus final "Custom…", revealing an F-style field for anything else. */
+  _settingsPresetHtml(ctx) {
+    const { entry, known, value, disabled, ieee, id } = ctx;
+    const e = entry.expose;
+    const presets = e.presets || [];
+    const matchIdx = known ? presets.findIndex((p) => this._settingsValuesEqual(e, p.value, value)) : -1;
+    const custom = known && matchIdx === -1;
+    const selected = custom ? '__custom__' : matchIdx >= 0 ? String(matchIdx) : '';
+    const dis = disabled ? ' disabled' : '';
+    const items = presets.map((p, i) => `<ha-list-item value="${i}">${esc(p.name)}</ha-list-item>`).join('');
+    const opts = presets.map((p, i) => `<option value="${i}">${esc(p.name)}</option>`).join('');
+    const select = this._has('ha-select')
+      ? `<ha-select data-setrow="${id}" naturalMenuWidth fixedMenuPosition data-value="${esc(
+          selected
+        )}" data-setpreset="${esc(ieee)}|${esc(entry.key)}|${id}"${dis}>${items}<ha-list-item value="__custom__">Custom\u2026</ha-list-item></ha-select>`
+      : `<select class="fallback" data-setrow="${id}" data-value="${esc(selected)}" data-setpreset="${esc(
+          ieee
+        )}|${esc(entry.key)}|${id}"${dis}>${opts}<option value="__custom__">Custom\u2026</option></select>`;
+    const showCustom = custom || selected === '';
+    return `<span class="setpreset">${select}<span class="setpreset-custom" id="setpresetcustom-${id}"${
+      showCustom ? '' : ' hidden'
+    }>${this._settingsNumericHtml(ctx)}</span></span>`;
+  }
+
+  /** I: a list of numbers as removable chips, with an explicit Apply for the whole array. */
+  _settingsListHtml(ctx) {
+    const { entry, known, value, disabled, ieee, id } = ctx;
+    const draftKey = `${ieee}|${entry.key}`;
+    if (!(draftKey in this._settingsListDraft)) {
+      this._settingsListDraft[draftKey] = known && Array.isArray(value) ? value.slice() : [];
+    }
+    const items = this._settingsListDraft[draftKey];
+    const dis = disabled ? ' disabled' : '';
+    const chips = items
+      .map(
+        (v, i) =>
+          `<span class="chip">${esc(String(v))}<button type="button" class="chipx" data-setlistdel="${esc(
+            ieee
+          )}|${esc(entry.key)}|${i}" aria-label="Remove ${esc(String(v))}">\u00d7</button></span>`
+      )
+      .join('');
+    const numTag = `data-setrow="${id}" id="setlistval-${id}" min="0" step="1"`;
+    const addField = this._has('ha-textfield')
+      ? `<ha-textfield type="number" ${numTag}></ha-textfield>`
+      : `<input type="number" class="fallback" ${numTag}>`;
+    return `<div class="setlist" data-setrow="${id}">
+        <div class="setlist-chips">${chips || '<span class="setlist-empty">No values yet.</span>'}</div>
+        <div class="setlist-add">${addField}${ctlButton(
+          'Add',
+          ` data-setlistadd="${esc(ieee)}|${esc(entry.key)}"${dis}`
+        )}${ctlButton('Apply', ` data-setlistapply="${esc(ieee)}|${esc(entry.key)}"${dis}`, 'filled')}</div>
+      </div>`;
+  }
+
+  /** J's collapsed row: a one-line summary of known feature values, or the unknown chip. */
+  _settingsCompositeSummaryHtml(d, entry) {
+    const parent = this._settingsValue(d, entry);
+    const stateObj = parent.known && parent.value && typeof parent.value === 'object' ? parent.value : null;
+    const bits = stateObj
+      ? entry.features
+          .filter((f) => Object.prototype.hasOwnProperty.call(stateObj, f.prop))
+          .map((f) => `${stateObj[f.prop]}${f.expose.unit || ''}`)
+      : [];
+    return bits.length ? `<span class="setrow-summary">${esc(bits.join(' \u00b7 '))}</span>` : '<span class="chip">Not read yet</span>';
+  }
+
+  /** J's nested compact row for one feature: value inherited from the parent's state object. */
+  _settingsFeatureControlHtml(d, entry, f, id) {
+    const ieee = d.ieee_address;
+    const draft = (this._settingsDraft[ieee] || {})[entry.key] || {};
+    const touched = Object.prototype.hasOwnProperty.call(draft, f.prop);
+    const parentVal = this._settingsFeatureValue(d, entry, f);
+    const known = touched || parentVal.known;
+    const value = touched ? draft[f.prop] : parentVal.value;
+    const tag = `data-setrow="${id}" data-setfeat="${esc(ieee)}|${esc(entry.key)}|${esc(f.prop)}"`;
+    if (f.expose.type === 'binary') {
+      const checked = known && this._settingsBoolOf(f.expose, value);
+      return `<input type="checkbox" class="setfeature-check" ${tag} data-setfeatkind="binary"${
+        checked ? ' checked' : ''
+      }${known ? '' : ' data-indeterminate="1"'}>`;
+    }
+    if (f.expose.type === 'enum') {
+      const opts = (f.expose.values || []).map((v) => `<option value="${esc(String(v))}">${esc(String(v))}</option>`).join('');
+      return `<select class="fallback compact" ${tag} data-setfeatkind="enum" data-value="${
+        known ? esc(String(value)) : ''
+      }">${known ? '' : '<option value="" disabled>Choose\u2026</option>'}${opts}</select>`;
+    }
+    return `<input type="number" class="fallback compact" ${tag} data-setfeatkind="numeric" data-value="${
+      known ? esc(String(value)) : ''
+    }"${f.expose.value_min !== undefined ? ` min="${esc(f.expose.value_min)}"` : ''}${
+      f.expose.value_max !== undefined ? ` max="${esc(f.expose.value_max)}"` : ''
+    }>`;
+  }
+
+  /* ----------------------------------------------------------- row skeletons */
+
+  /**
+   * The helper line under a label (§3.7): clamped to 2 lines, with More/Less as
+   * its own trailing block -- never inline inside the clamped text, which is
+   * what let the clamp's reported height go wrong and overlap the meta line
+   * that follows it.
+   */
+  _settingsDescHtml(id, description) {
+    if (!description) return '';
+    const more = description.length > 140
+      ? `<div class="setrow-more"><button type="button" class="linklike" data-descmore="${id}">More</button></div>`
+      : '';
+    return `<div class="setrow-desc" id="setdesc-${id}">${esc(description)}</div>${more}`;
+  }
+
+  /** A-I's row: label and control side by side, description clamped, meta below. Values are
+   * assigned by _syncSettings, never here -- see the section preamble. */
+  _settingsRowHtml(d, entry) {
+    const id = this._settingsDomId(entry);
+    const e = entry.expose;
+    return `<div class="setrow" id="setrow-${id}" data-prop="${esc(entry.prop)}" data-etype="${esc(e.type)}">
+        <div class="setrow-top">
+          <div class="setrow-label"><div class="setrow-name">${esc(entry.label)}</div></div>
+          <div class="setrow-ctl" id="setctl-${id}"></div>
+        </div>
+        ${this._settingsDescHtml(id, entry.description)}
+        <div class="setrow-meta" id="setmeta-${id}"></div>
+        <div class="seterr" id="seterr-${id}" hidden></div>
+      </div>`;
+  }
+
+  /** J's row: the same header shape, expandable into its nested features plus Apply. */
+  _settingsCompositeRowHtml(d, entry) {
+    const id = this._settingsDomId(entry);
+    const ieee = d.ieee_address;
+    const descHtml = this._settingsDescHtml(id, entry.description);
+    const header = `<div class="setrow-top">
+          <div class="setrow-label"><div class="setrow-name">${esc(entry.label)}</div></div>
+          <div class="setrow-ctl" id="setctl-${id}"></div>
+        </div>
+        ${descHtml}
+        <div class="setrow-meta" id="setmeta-${id}"></div>`;
+    const body = `<div class="setcomposite-body">${entry.features
+      .map((f) => this._settingsFeatureRowHtml(entry, f))
+      .join('')}<div class="setcomposite-apply">${ctlButton(
+      'Apply',
+      ` data-setapply="${esc(ieee)}|${esc(entry.key)}"`,
+      'filled'
+    )}</div></div>`;
+    const open = !!(this._settingsOpen[ieee] || {})[entry.key];
+    const toggle = `data-setgrouptoggle="${esc(ieee)}|${esc(entry.key)}"`;
+    return this._has('ha-expansion-panel')
+      ? `<ha-expansion-panel class="setrow setcomposite" id="setrow-${id}" data-prop="${esc(
+          entry.prop
+        )}" data-etype="composite" ${toggle}${open ? ' expanded' : ''}><div slot="header">${header}</div>${body}</ha-expansion-panel>`
+      : `<details class="setrow setcomposite" id="setrow-${id}" data-prop="${esc(entry.prop)}" data-etype="composite" ${toggle}${
+          open ? ' open' : ''
+        }><summary>${header}</summary>${body}</details>`;
+  }
+
+  _settingsFeatureRowHtml(entry, f) {
+    const id = `${this._settingsDomId(entry)}-${f.prop.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    return `<div class="setfeature"><div class="setfeature-label">${esc(f.label)}</div><div class="setfeature-ctl" id="setfeat-${id}"></div></div>`;
+  }
+
+  /** The Converter options / Diagnostic groups: same anatomy, same collapse component as J. */
+  _settingsGroupHtml(d, key, title, entries, note) {
+    const ieee = d.ieee_address;
+    const rows = entries.map((entry) => this._settingsRowHtml(d, entry)).join('');
+    const noteHtml = note ? `<div class="setgroup-note">${esc(note)}</div>` : '';
+    const header = `<div class="setrow-top"><div class="setgroup-title">${esc(title)} \u00b7 ${entries.length}</div></div>`;
+    const body = `${noteHtml}<div class="setgroup-body">${rows}</div>`;
+    const open = !!(this._settingsOpen[ieee] || {})[`group:${key}`];
+    const toggle = `data-setgrouptoggle="${esc(ieee)}|group:${key}"`;
+    return this._has('ha-expansion-panel')
+      ? `<ha-expansion-panel class="setrow" id="setrow-group-${key}" ${toggle}${
+          open ? ' expanded' : ''
+        }><div slot="header">${header}</div>${body}</ha-expansion-panel>`
+      : `<details class="setrow" id="setrow-group-${key}" ${toggle}${open ? ' open' : ''}><summary>${header}</summary>${body}</details>`;
+  }
+
+  /** The actions row (§3.2.3): single-value settable enums, as a small toolbar. */
+  _settingsActionsHtml(d, actions) {
+    if (!actions.length) return '';
+    const ieee = d.ieee_address;
+    const buttons = actions
+      .map((entry) => {
+        const id = this._settingsDomId(entry);
+        return `<span class="setaction">${ctlButton(entry.label, ` id="setact-${id}" data-setaction="${esc(
+          ieee
+        )}|${esc(entry.prop)}"`)}<div class="seterr" id="seterr-${id}" hidden></div></span>`;
+      })
+      .join('');
+    return `<div class="set-actions">${buttons}</div>`;
+  }
+
+  /** The filter row (§3.6), shown only past 12 main-list rows. Reuses the devices search recipe. */
+  _settingsFilterRowHtml() {
+    return `<div class="search">${icon(MDI.search, '')}
+        ${
+          this._has('ha-textfield')
+            ? `<ha-textfield id="setfilter" type="search" data-value="${esc(this._setFilter)}" placeholder="Filter settings"></ha-textfield>`
+            : `<input id="setfilter" class="fallback" type="search" value="${esc(this._setFilter)}" placeholder="Filter settings">`
+        }
+        <span class="count" id="setfiltercount" aria-live="polite"></span>
+        <ha-icon-button id="setfilterclear" data-act="setfilterclear" data-path="${MDI.close}"
+          data-label="Clear filter" aria-label="Clear filter"></ha-icon-button>
+      </div>`;
+  }
+
+  /* ------------------------------------------------------------- the card */
+
+  /** The Settings card itself (§3.1): omitted for a device with nothing settable at all. */
+  _settingsCard(d) {
+    const cls = this._settingsClassify(d);
+    const nothing = !cls.actions.length && !cls.main.length && !cls.diagnostic.length && !cls.options.length;
+    if (nothing) return ''; // the Wyze lock case: no empty furniture
+
+    // Converter options only (no settable exposes at all): they ARE the card body,
+    // expanded, without a group header of their own (§3.1).
+    if (!cls.actions.length && !cls.main.length && !cls.diagnostic.length) {
+      return `<ha-card class="nav-card">
+          <div class="card-header">Settings</div>
+          <div class="card-content" id="setrows">${cls.options.map((entry) => this._settingsRowHtml(d, entry)).join('')}</div>
+        </ha-card>`;
+    }
+
+    const headerAction = this._settingsHasReadable(d)
+      ? `<span class="header-actions"><ha-button appearance="plain" size="s" id="setread" data-act="readvalues">Read from device</ha-button></span>`
+      : '';
+    const filterHtml = cls.main.length > 12 ? this._settingsFilterRowHtml() : '';
+    const rowsHtml = cls.main
+      .map((entry) => (entry.expose.type === 'composite' ? this._settingsCompositeRowHtml(d, entry) : this._settingsRowHtml(d, entry)))
+      .join('');
+    const optionsGroup = cls.options.length
+      ? this._settingsGroupHtml(d, 'options', 'Converter options', cls.options, 'Applied by Zigbee2MQTT, not stored on the device.')
+      : '';
+    const diagGroup = cls.diagnostic.length ? this._settingsGroupHtml(d, 'diagnostic', 'Diagnostic', cls.diagnostic, '') : '';
+    const emptyHtml = filterHtml
+      ? `<div class="empty" id="setfilterempty" hidden>No settings match &ldquo;<span id="setfilterq"></span>&rdquo;.
+          <div class="actions"><ha-button appearance="plain" size="s" data-act="setfilterclear">Clear filter</ha-button></div>
+        </div>`
+      : '';
+    const disabledNote = d.disabled ? '<div class="note">This device is disabled in Zigbee2MQTT.</div>' : '';
+    return `<ha-card class="nav-card">
+        <div class="card-header">Settings${headerAction}</div>
+        ${this._settingsActionsHtml(d, cls.actions)}
+        ${filterHtml}
+        ${disabledNote}
+        <div class="card-content" id="setrows">${rowsHtml}${optionsGroup}${diagGroup}${emptyHtml}</div>
+      </ha-card>`;
+  }
+
+  /* --------------------------------------------------------------- syncing */
+
+  /** Is the element the operator is focused in part of row `id`? Guards every patch below. */
+  _settingsRowFocused(r, id) {
+    const el = r.activeElement;
+    return !!(el && el.dataset && el.dataset.setrow === id);
+  }
+
+  /**
+   * The sibling of `_syncLive`/`_syncFw`: patches every row's control and meta box
+   * from the state mirror and the write-lifecycle table, in place.
+   *
+   * `fresh` is passed after a full render, whose skeleton always starts every box
+   * empty (render discipline, see the section preamble): the per-row memo has to
+   * be thrown away then, or an unchanged value would leave a freshly-rebuilt box
+   * permanently blank. A live state push, by contrast, patches only what changed.
+   */
+  _syncSettings(fresh) {
+    if (this._view.name !== 'device' || !this.shadowRoot) return;
+    const d = this._dev(this._view.ieee);
+    if (!d) return;
+    const ieee = d.ieee_address;
+    const r = this.shadowRoot;
+    if (fresh || !this._settingsCache[ieee]) this._settingsCache[ieee] = { ctl: {}, meta: {} };
+    const cache = this._settingsCache[ieee];
+    const cls = this._settingsClassify(d);
+
+    const paintCtl = (entry) => this._settingsPaintCtl(ieee, entry);
+    const paintMeta = (entry) => {
+      const id = this._settingsDomId(entry);
+      const box = r.getElementById(`setmeta-${id}`);
+      if (!box) return;
+      const html = this._settingsMetaHtml(d, entry);
+      if (cache.meta[entry.key] === html) return;
+      cache.meta[entry.key] = html;
+      box.innerHTML = html;
+    };
+
+    [...cls.main, ...cls.diagnostic, ...cls.options].forEach((entry) => {
+      paintCtl(entry);
+      paintMeta(entry);
+      if (entry.features) entry.features.forEach((f) => this._syncCompositeFeature(r, cache, d, entry, f));
+    });
+    cls.actions.forEach((entry) => this._paintSettingsRow(ieee, entry));
+  }
+
+  _syncCompositeFeature(r, cache, d, entry, f) {
+    const id = `${this._settingsDomId(entry)}-${f.prop.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    const box = r.getElementById(`setfeat-${id}`);
+    if (!box || this._settingsRowFocused(r, id)) return;
+    const html = this._settingsFeatureControlHtml(d, entry, f, id);
+    const cacheKey = `${entry.key}.${f.prop}`;
+    if (cache.ctl[cacheKey] === html) return;
+    cache.ctl[cacheKey] = html;
+    box.innerHTML = html;
+    this._wire(box);
+  }
+
+  /**
+   * Repaint one row's control from the state mirror, the same memoized-diff
+   * bargain _syncFw makes. Skipped while a write for this row is in flight
+   * (pending keeps showing what the operator set, §3.4) and while the row has
+   * focus (it resyncs on blur instead of being yanked out from under typing).
+   */
+  _settingsPaintCtl(ieee, entry) {
+    const r = this.shadowRoot;
+    const d = this._dev(ieee);
+    if (!r || !d) return;
+    const w = (this._settingsWrite[ieee] || {})[entry.key];
+    if (w && w.phase === 'pending') return;
+    const id = this._settingsDomId(entry);
+    const box = r.getElementById(`setctl-${id}`);
+    if (!box || this._settingsRowFocused(r, id)) return;
+    const html = this._settingsControlHtml(d, entry);
+    const cache = this._settingsCache[ieee] || (this._settingsCache[ieee] = { ctl: {}, meta: {} });
+    if (cache.ctl[entry.key] === html) return;
+    cache.ctl[entry.key] = html;
+    box.innerHTML = html;
+    this._wire(box);
+  }
+
+  /** A list editor's Add/remove buttons change the draft, not the server, so the
+   * control repaints unconditionally rather than waiting for _syncSettings' diff. */
+  _settingsRepaintControl(ieee, key) {
+    const r = this.shadowRoot;
+    const d = this._dev(ieee);
+    const entry = d && this._settingsFindEntry(d, key);
+    if (!r || !entry) return;
+    const id = this._settingsDomId(entry);
+    const box = r.getElementById(`setctl-${id}`);
+    if (!box) return;
+    const html = this._settingsControlHtml(d, entry);
+    box.innerHTML = html;
+    this._wire(box);
+    if (this._settingsCache[ieee]) this._settingsCache[ieee].ctl[entry.key] = html;
+  }
+
+  /* --------------------------------------------------------- write lifecycle */
+
+  _paintSettingsRow(ieee, entry) {
+    if (entry.isAction) return this._paintSettingsAction(ieee, entry);
+    return this._paintSettingsWrite(ieee, entry);
+  }
+
+  /** Patches only the meta chip and the inline error: the control keeps whatever
+   * the operator set, per §3.4's "control not disabled" rule for a pending write. */
+  _paintSettingsWrite(ieee, entry) {
+    const r = this.shadowRoot;
+    if (!r || this._view.name !== 'device' || this._view.ieee !== ieee) return;
+    const d = this._dev(ieee);
+    if (!d) return;
+    const id = this._settingsDomId(entry);
+    const w = (this._settingsWrite[ieee] || {})[entry.key];
+    // Confirmed or adjusted both mean the state mirror now holds the device's
+    // real value (merged in _settingsCommitExpose): the control adopts it here
+    // unless it is what the operator is still focused in, which resyncs on
+    // blur instead (§3.4's cross-cutting rule).
+    if (w && (w.phase === 'confirmed' || w.phase === 'adjusted')) this._settingsPaintCtl(ieee, entry);
+    const metaBox = r.getElementById(`setmeta-${id}`);
+    if (metaBox) {
+      const html = this._settingsMetaHtml(d, entry);
+      metaBox.innerHTML = html;
+      if (this._settingsCache[ieee]) this._settingsCache[ieee].meta[entry.key] = html;
+    }
+    const err = r.getElementById(`seterr-${id}`);
+    if (!err) return;
+    if (w && w.phase === 'failed' && w.message) {
+      err.hidden = false;
+      err.textContent = w.message;
+    } else if (w && w.phase === 'unconfirmed') {
+      err.hidden = false;
+      err.textContent = 'Sent, but the device did not confirm. Check the log if it did not apply.';
+    } else {
+      err.hidden = true;
+      err.textContent = '';
+    }
+  }
+
+  _settingsClearError(ieee, entry) {
+    const r = this.shadowRoot;
+    const id = this._settingsDomId(entry);
+    const err = r && r.getElementById(`seterr-${id}`);
+    if (err) {
+      err.hidden = true;
+      err.textContent = '';
+    }
+  }
+
+  _settingsShowError(ieee, entry, message) {
+    const r = this.shadowRoot;
+    const id = this._settingsDomId(entry);
+    const err = r && r.getElementById(`seterr-${id}`);
+    if (err) {
+      err.hidden = false;
+      err.textContent = message;
+    }
+  }
+
+  /** Every commit lands here: an expose write goes to z2m/device/set, a converter
+   * option to the existing z2m/device/options -- whose response IS the
+   * confirmation, so it only ever reaches confirmed or failed (§3.4). */
+  _settingsCommit(ieee, entry, value) {
+    this._settingsClearError(ieee, entry);
+    if (entry.source === 'option') return this._settingsCommitOption(ieee, entry, value);
+    return this._settingsCommitExpose(ieee, entry, value);
+  }
+
+  async _settingsCommitExpose(ieee, entry, value) {
+    const store = (this._settingsWrite[ieee] = this._settingsWrite[ieee] || {});
+    const token = ((store[entry.key] || {}).token || 0) + 1;
+    const w = (store[entry.key] = { phase: 'pending', message: null, token });
+    this._paintSettingsRow(ieee, entry);
+    try {
+      const res = await this._call('z2m/device/set', { device: ieee, payload: { [entry.prop]: value } });
+      if (store[entry.key] !== w) return; // superseded: latest write wins (§3.4)
+      if (res && res.confirmed) {
+        const echoed = (res.state || {})[entry.prop];
+        const adjusted = !this._settingsValuesEqual(entry.expose, echoed, value);
+        w.phase = adjusted ? 'adjusted' : 'confirmed';
+        w.echoed = echoed;
+        // The control adopts what the device actually holds (§3.4): merge the
+        // echo into the mirror now, rather than wait on the separate state
+        // subscription to report the identical fact a moment later.
+        if (echoed !== undefined) {
+          this._settingsState[ieee] = { ...(this._settingsState[ieee] || {}), [entry.prop]: echoed };
+        }
+        if (!adjusted) this._settingsFadeWrite(ieee, entry, token);
+      } else if (res && Object.prototype.hasOwnProperty.call(res, 'sleeping')) {
+        w.phase = res.sleeping ? 'queued' : 'unconfirmed';
+      } else {
+        w.phase = 'sent'; // write-only: no error surfaced within the backend's grace window
+        this._settingsFadeWrite(ieee, entry, token);
+      }
+    } catch (err) {
+      if (store[entry.key] !== w) return;
+      w.phase = 'failed';
+      w.message = this._feedMessage(err, 'The write failed');
+    }
+    this._paintSettingsRow(ieee, entry);
+  }
+
+  async _settingsCommitOption(ieee, entry, value) {
+    const store = (this._settingsWrite[ieee] = this._settingsWrite[ieee] || {});
+    const token = ((store[entry.key] || {}).token || 0) + 1;
+    const w = (store[entry.key] = { phase: 'pending', message: null, token });
+    this._paintSettingsRow(ieee, entry);
+    try {
+      await this._call('z2m/device/options', { device: ieee, options: { [entry.prop]: value } });
+      if (store[entry.key] !== w) return;
+      w.phase = 'confirmed';
+      this._settingsFadeWrite(ieee, entry, token);
+      // The written value only shows as Known once option_values catches up.
+      setTimeout(() => this._refreshFeed('devices', 'z2m/devices'), 1200);
+    } catch (err) {
+      if (store[entry.key] !== w) return;
+      w.phase = 'failed';
+      w.message = this._feedMessage(err, 'The write failed');
+    }
+    this._paintSettingsRow(ieee, entry);
+  }
+
+  _settingsFadeWrite(ieee, entry, token) {
+    setTimeout(() => {
+      const store = this._settingsWrite[ieee];
+      const w = store && store[entry.key];
+      if (!w || w.token !== token) return;
+      delete store[entry.key];
+      this._paintSettingsRow(ieee, entry);
+    }, 2000);
+  }
+
+  /* -------------------------------------------------------------- actions */
+
+  _settingsActionClick(ieee, prop) {
+    const d = this._dev(ieee);
+    if (!d) return;
+    const entry = this._settingsClassify(d).actions.find((a) => a.prop === prop);
+    if (!entry) return;
+    const confirmKey = `${ieee}|${prop}`;
+    // Restart/reset actions need a second press: the first swaps the label for
+    // five seconds rather than opening a dialog over what is already a one-tap page.
+    if (/restart|reset/i.test(prop) && !this._settingsConfirming[confirmKey]) {
+      this._settingsConfirming[confirmKey] = setTimeout(() => {
+        delete this._settingsConfirming[confirmKey];
+        this._paintSettingsAction(ieee, entry);
+      }, 5000);
+      this._paintSettingsAction(ieee, entry);
+      return;
+    }
+    if (this._settingsConfirming[confirmKey]) {
+      clearTimeout(this._settingsConfirming[confirmKey]);
+      delete this._settingsConfirming[confirmKey];
+    }
+    this._settingsCommit(ieee, entry, (entry.expose.values || [])[0]);
+  }
+
+  _paintSettingsAction(ieee, entry) {
+    const r = this.shadowRoot;
+    if (!r) return;
+    const id = this._settingsDomId(entry);
+    const w = (this._settingsWrite[ieee] || {})[entry.key];
+    const confirming = !!this._settingsConfirming[`${ieee}|${entry.prop}`];
+    const btn = r.getElementById(`setact-${id}`);
+    if (btn) {
+      btn.disabled = !confirming && !!w && w.phase === 'pending';
+      btn.textContent = confirming ? 'Press again to confirm' : w && w.phase === 'pending' ? 'Sending\u2026' : entry.label;
+    }
+    const err = r.getElementById(`seterr-${id}`);
+    if (!err) return;
+    if (w && w.phase === 'failed' && w.message) {
+      err.hidden = false;
+      err.textContent = w.message;
+    } else if (w && w.phase === 'unconfirmed') {
+      err.hidden = false;
+      err.textContent = 'Sent, but the device did not confirm. Check the log if it did not apply.';
+    } else {
+      err.hidden = true;
+      err.textContent = '';
+    }
+  }
+
+  /* ---------------------------------------------------------------- commits */
+
+  _settingsCommitNumber(ieee, key, el) {
+    const d = this._dev(ieee);
+    const entry = d && this._settingsFindEntry(d, key);
+    if (!entry) return;
+    this._settingsClearError(ieee, entry);
+    if (el.classList) el.classList.remove('invalid');
+    const raw = el.value;
+    if (raw === '' || raw === el.dataset.value) return; // cleared, or unchanged: nothing to write
+    const n = Number(raw);
+    const e = entry.expose;
+    const outOfRange =
+      !Number.isFinite(n) || (e.value_min !== undefined && n < e.value_min) || (e.value_max !== undefined && n > e.value_max);
+    if (outOfRange) {
+      if (el.classList) el.classList.add('invalid');
+      this._settingsShowError(ieee, entry, `Between ${e.value_min} and ${e.value_max}${e.unit ? ` ${e.unit}` : ''}`);
+      return;
+    }
+    // The baseline moves to what was just sent immediately, not only once a
+    // reply arrives: otherwise a blur with no further edit compares against
+    // the stale pre-write value forever (nothing else repaints this box while
+    // a write for it might still be in flight) and resends the same write.
+    el.dataset.value = raw;
+    this._settingsCommit(ieee, entry, n);
+  }
+
+  _settingsCommitText(ieee, key, el) {
+    const d = this._dev(ieee);
+    const entry = d && this._settingsFindEntry(d, key);
+    if (!entry) return;
+    this._settingsClearError(ieee, entry);
+    const raw = typedName(el.value);
+    if (raw === el.dataset.value) return;
+    el.dataset.value = raw;
+    this._settingsCommit(ieee, entry, raw);
+  }
+
+  _settingsApplyComposite(ieee, key) {
+    const d = this._dev(ieee);
+    const entry = d && this._settingsFindEntry(d, key);
+    if (!entry || !entry.features) return;
+    const draft = (this._settingsDraft[ieee] || {})[key] || {};
+    const payload = {};
+    entry.features.forEach((f) => {
+      if (Object.prototype.hasOwnProperty.call(draft, f.prop)) {
+        payload[f.prop] = draft[f.prop];
+        return;
+      }
+      const known = this._settingsFeatureValue(d, entry, f);
+      if (known.known) payload[f.prop] = known.value;
+    });
+    if (!Object.keys(payload).length) return;
+    this._settingsCommit(ieee, entry, payload);
+  }
+
+  /* ---------------------------------------------------------------- filter */
+
+  /** §3.6: hides non-matching rows, searches inside groups and composites, and
+   * auto-expands whatever the filter itself needed open -- restoring exactly
+   * that set (never a group the operator opened by hand) once it clears. */
+  _settingsApplyFilter() {
+    const r = this.shadowRoot;
+    const d = this._dev(this._view.ieee);
+    if (!r || !d) return;
+    const ieee = d.ieee_address;
+    const q = this._setFilter.trim().toLowerCase();
+    const filtering = q.length > 0;
+    const cls = this._settingsClassify(d);
+    const forced = (this._settingsFilterOpen[ieee] = this._settingsFilterOpen[ieee] || new Set());
+    let matchCount = 0;
+
+    const rowMatches = (entry) => {
+      if (!filtering) return true;
+      const hay = `${entry.label} ${entry.prop} ${entry.description || ''}`.toLowerCase();
+      if (hay.includes(q)) return true;
+      return !!(entry.features && entry.features.some((f) => `${f.label} ${f.prop}`.toLowerCase().includes(q)));
+    };
+    const setExpanded = (el, key, wantOpen) => {
+      if (!el) return;
+      if (wantOpen) forced.add(key);
+      else if (forced.has(key)) forced.delete(key);
+      else return; // the operator opened this one themselves; the filter leaves it alone
+      const isOpen = wantOpen || !!(this._settingsOpen[ieee] || {})[key];
+      if (this._has('ha-expansion-panel')) el.expanded = isOpen;
+      else el.open = isOpen;
+    };
+
+    let anyVisible = false;
+    cls.main.forEach((entry) => {
+      const el = r.getElementById(`setrow-${this._settingsDomId(entry)}`);
+      if (!el) return;
+      const hit = rowMatches(entry);
+      el.hidden = !hit;
+      if (hit) {
+        anyVisible = true;
+        matchCount += 1;
+      }
+      if (entry.expose.type === 'composite') setExpanded(el, entry.key, filtering && hit);
     });
 
-    return `<ha-card class="nav-card">
-        <div class="card-header">Device settings</div>
-        <div class="card-content pad">
-          <ha-form data-form="${esc(key)}"></ha-form>
-        </div>
-        <div class="note">Written straight to Zigbee2MQTT. An empty field simply uses
-        the Zigbee2MQTT default for this model. These are converter settings rather than
-        values stored on the device, so there is nothing to read back.</div>
-        <div class="actions">
-          <ha-button appearance="filled" size="s" data-act="options">Save settings</ha-button>
-        </div>
-      </ha-card>`;
+    const paintGroup = (key, entries) => {
+      const groupEl = r.getElementById(`setrow-group-${key}`);
+      if (!groupEl) return;
+      let groupHit = false;
+      entries.forEach((entry) => {
+        const rowEl = r.getElementById(`setrow-${this._settingsDomId(entry)}`);
+        const hit = rowMatches(entry);
+        if (rowEl) rowEl.hidden = !hit;
+        if (hit) {
+          groupHit = true;
+          matchCount += 1;
+        }
+      });
+      groupEl.hidden = filtering && !groupHit;
+      if (groupHit) anyVisible = true;
+      setExpanded(groupEl, `group:${key}`, filtering && groupHit);
+    };
+    paintGroup('options', cls.options);
+    paintGroup('diagnostic', cls.diagnostic);
+
+    const empty = r.getElementById('setfilterempty');
+    if (empty) {
+      empty.hidden = !filtering || anyVisible;
+      const qEl = r.getElementById('setfilterq');
+      if (qEl) qEl.textContent = this._setFilter;
+    }
+    const count = r.getElementById('setfiltercount');
+    if (count) count.textContent = `${matchCount} match${matchCount === 1 ? '' : 'es'}`;
+    const clearBtn = r.getElementById('setfilterclear');
+    if (clearBtn) clearBtn.hidden = !filtering;
+  }
+
+  _clearSettingsFilter() {
+    this._setFilter = '';
+    this._setFilterCaret = null;
+    const r = this.shadowRoot;
+    const el = r && r.getElementById('setfilter');
+    if (el) {
+      el.value = '';
+      el.focus();
+    }
+    this._settingsApplyFilter();
+  }
+
+  /* ------------------------------------------------------------- read now */
+
+  /** Shared by the header button and the automatic mains-device read on entry, so
+   * both ever say "Reading…" for the same in-flight call rather than racing. */
+  _readDeviceValues(ieee) {
+    if (this._settingsReading[ieee]) return Promise.resolve();
+    this._settingsReading[ieee] = true;
+    this._paintSettingsReadButton(ieee);
+    return this._call('z2m/device/read_values', { device: ieee })
+      .then((res) => {
+        this._feedMsg = res && res.sleeping
+          ? 'Asked. A battery device answers at its next wake-up.'
+          : 'Asked the device to report its current values.';
+        this._render();
+        setTimeout(() => {
+          this._feedMsg = null;
+          this._render();
+        }, 4000);
+      })
+      .catch((err) => {
+        this._error = (err && (err.message || err.code)) || 'Could not ask the device';
+        this._render();
+      })
+      .finally(() => {
+        this._settingsReading[ieee] = false;
+        this._paintSettingsReadButton(ieee);
+      });
+  }
+
+  _paintSettingsReadButton(ieee) {
+    const r = this.shadowRoot;
+    const btn = r && r.getElementById('setread');
+    if (!btn) return;
+    const reading = !!this._settingsReading[ieee];
+    btn.disabled = reading;
+    btn.textContent = reading ? 'Reading\u2026' : 'Read from device';
+  }
+
+  /** A `z2m/device/state/subscribe` push: the merged map replaces what we know. */
+  _onDeviceState(ieee, ev) {
+    if (this._view.name !== 'device' || this._view.ieee !== ieee) return;
+    this._settingsState[ieee] = (ev && ev.state) || {};
+    this._syncSettings();
   }
 
   /* --------------------------------------------------------------- firmware */
@@ -3544,7 +4995,11 @@ class Z2MPanel extends HTMLElement {
     const box = this.shadowRoot && this.shadowRoot.getElementById('pairlog');
     if (!box) return;
     box.insertAdjacentHTML('beforeend', this._pairLogRow(entry));
-    if (!p.follow) return;
+    if (!p.follow) {
+      p.unread += 1;
+      this._syncPairFollow();
+      return;
+    }
     if (overflow) box.innerHTML = this._pairLogRows();
     box.scrollTop = box.scrollHeight;
   }
@@ -3568,7 +5023,7 @@ class Z2MPanel extends HTMLElement {
     const btn = this.shadowRoot && this.shadowRoot.getElementById('pairfollow');
     if (!btn) return;
     btn.setAttribute('aria-pressed', String(this._pairing.follow));
-    btn.textContent = this._pairing.follow ? 'Following' : 'Jump to latest';
+    btn.textContent = this._pairFollowLabel();
   }
 
   _pairLogRows() {
@@ -4029,13 +5484,19 @@ class Z2MPanel extends HTMLElement {
                 : ''
             }
             <ha-button appearance="plain" size="s" data-act="pairfollow" id="pairfollow"
-              aria-pressed="${p.follow}">${
-                p.follow ? 'Following' : 'Jump to latest'
-              }</ha-button>
+              aria-pressed="${p.follow}">${esc(this._pairFollowLabel())}</ha-button>
           </span>
         </div>
-        <div class="pair-log" id="pairlog">${this._pairLogRows()}</div>
+        <div class="pair-log" id="pairlog" tabindex="0" role="log"
+          aria-label="Zigbee2MQTT log">${this._pairLogRows()}</div>
       </div>`;
+  }
+
+  /** Shared by the initial paint and the scroll-driven patch, so they never disagree. */
+  _pairFollowLabel() {
+    const p = this._pairing;
+    if (p.follow) return 'Following';
+    return p.unread > 0 ? `Jump to latest \u00b7 ${p.unread > 99 ? '99+' : p.unread}` : 'Jump to latest';
   }
 
   _pairDialogActions() {
@@ -5152,6 +6613,9 @@ class Z2MPanel extends HTMLElement {
       case 'refresh':
         return this._refresh();
 
+      case 'devsearchclear':
+        return this._clearDeviceSearch();
+
       // Only reachable from the fallback chrome; hass-subpage owns its own back arrow.
       case 'back':
         return this._back();
@@ -5196,6 +6660,7 @@ class Z2MPanel extends HTMLElement {
       // rather than watch the newest one arrive.
       case 'pairfollow': {
         this._pairing.follow = !this._pairing.follow;
+        if (this._pairing.follow) this._pairing.unread = 0;
         this._syncPairFollow();
         if (this._pairing.follow) this._scrollPairLog();
         return undefined;
@@ -5432,22 +6897,10 @@ class Z2MPanel extends HTMLElement {
       case 'configure':
         return this._act('z2m/device/configure', { device });
 
-      case 'readvalues': {
+      case 'readvalues':
         // The manual path exists for exactly two cases the automatic read skips:
         // battery devices, and "I just changed something at the wall, show me now".
-        return this._call('z2m/device/read_values', { device: this._view.ieee })
-          .then((res) => {
-            this._feedMsg = (res && res.sleeping)
-              ? 'Asked. A battery device answers at its next wake-up.'
-              : 'Asked the device to report its current values.';
-            this._render();
-            setTimeout(() => { this._feedMsg = null; this._render(); }, 4000);
-          })
-          .catch((err) => {
-            this._error = (err && (err.message || err.code)) || 'Could not ask the device';
-            this._render();
-          });
-      }
+        return this._readDeviceValues(this._view.ieee);
 
       case 'interview':
         return this._act('z2m/device/interview', { device });
@@ -5466,22 +6919,8 @@ class Z2MPanel extends HTMLElement {
         return this._act('z2m/device/rename', { from: d.friendly_name, to });
       }
 
-      case 'options': {
-        // The form holds the operator's edits; only what actually differs from the
-        // device's current values is written, so Save on an untouched form is a no-op
-        // rather than a pointless write to every option.
-        const spec = (this._forms || {})[`opts:${device}`];
-        if (!spec) return undefined;
-        const current = d.option_values || {};
-        const options = {};
-        Object.entries(spec.data || {}).forEach(([k, v]) => {
-          if (v === undefined || v === null || v === '') return;
-          if (String(current[k]) === String(v)) return;
-          options[k] = v;
-        });
-        if (!Object.keys(options).length) return undefined;
-        return this._act('z2m/device/options', { device, options });
-      }
+      case 'setfilterclear':
+        return this._clearSettingsFilter();
 
       default:
         return undefined;

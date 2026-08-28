@@ -61,6 +61,8 @@ from .const import (
     CONF_LABEL_ID,
     COORDINATOR_CHECK_TIMEOUT,
     DEFAULT_BIND_GROUP_ID,
+    DEVICE_SET_GRACE,
+    DEVICE_SET_TIMEOUT,
     DOMAIN,
     ENERGY_SCAN_ADDON,
     ENERGY_SCAN_COUNT,
@@ -81,6 +83,9 @@ from .const import (
     LABEL_ICON,
     LABEL_NAME,
     LOG_BUFFER,
+    LOG_RESTORE_RETRY_GRACE,
+    LOG_RESTORE_STORE_KEY,
+    LOG_RESTORE_STORE_VERSION,
     MAP_TIMEOUT,
     MAP_TTL,
     MQTT_IDENT_DOMAIN,
@@ -93,6 +98,7 @@ from .const import (
     SCENE_RECALL_GRACE,
     SCENE_TIMEOUT,
     SIGNAL_DEVICE_LIST,
+    SIGNAL_DEVICE_STATE,
     SIGNAL_DEVICES,
     SIGNAL_GROUPS,
     SIGNAL_LOG,
@@ -130,6 +136,11 @@ INTERVIEW_PHASES = {
 
 # Some Xiaomi devices report this instead of their own address in a neighbour table.
 ZERO_IEEE = "0x0000000000000000"
+# From the Z2M `access` bitmask (bit 1 state, bit 2 set, bit 4 get): exactly 2
+# means settable with neither of the other bits, so the property never appears
+# on the device's own state topic and async_device_write cannot wait for an
+# echo that will never come.
+ACCESS_WRITE_ONLY = 2
 
 
 class Z2MError(Exception):
@@ -340,6 +351,25 @@ class _Scan:
         return dropped or "nothing dropped"
 
 
+class _DeviceWatch:
+    """One device's live state mirror: the topic held, refcount, and merged map.
+
+    Kept as one small object per ieee, unlike the single OTA mirror, because
+    this watch is scoped to ONE device's own topic rather than a wildcard over
+    all of them -- there is no "give me everything" caller to amortize a
+    wildcard against, only a device page open on exactly one device (refcounted
+    for the rare case of two tabs on the same one).
+    """
+
+    __slots__ = ("friendly_name", "state", "unsub", "users")
+
+    def __init__(self, friendly_name: str) -> None:
+        self.friendly_name = friendly_name
+        self.unsub: Callable[[], None] | None = None
+        self.users = 0
+        self.state: dict[str, Any] = {}
+
+
 class Z2MData:
     """Live mirror of the Z2M bridge, plus the request side."""
 
@@ -365,6 +395,10 @@ class Z2MData:
         # only this side is guaranteed to be told when a client disappears.
         self._verbose_users = 0
         self._verbose_restore: str | None = None
+        # Durable half of _verbose_restore -- see async_pairing_verbose_acquire.
+        self._log_restore_store: Store[dict[str, Any]] = Store(
+            hass, LOG_RESTORE_STORE_VERSION, LOG_RESTORE_STORE_KEY
+        )
         # Last OTA state seen per IEEE address, and how many firmware views are
         # watching. The device state topics that carry firmware progress are NOT
         # retained -- Z2M publishes them with `retain` taken from the device's own
@@ -375,6 +409,12 @@ class Z2MData:
         self._ota: dict[str, dict[str, Any]] = {}
         self._ota_users = 0
         self._ota_unsub: Callable[[], None] | None = None
+        # One entry per ieee currently watched for its OWN state (the Settings
+        # card and its writes), refcounted per ieee rather than one OTA-style
+        # wildcard: a device page watches exactly one device, so a subscription
+        # scoped to that device's own topic is both cheaper and gives
+        # async_device_write a clean per-device signal to wait on.
+        self._device_watches: dict[str, _DeviceWatch] = {}
         # Set by Z2MLabels once the label is resolved, and surfaced in summary() so
         # the panel can deep-link into HA's own tables with ?label=<id>.
         self.label_id: str | None = None
@@ -484,6 +524,14 @@ class Z2MData:
         )
         _LOGGER.debug("Subscribed to %s bridge topics", self.base_topic)
 
+        # Best effort: a Home Assistant restart mid-pairing, or a Zigbee2MQTT
+        # outage that swallowed the fire-and-forget restore, both leave a
+        # durable record with nothing left to finish it. Backgrounded so a
+        # slow or absent broker never holds up the rest of setup.
+        self.hass.async_create_task(
+            self._async_heal_log_restore(), f"{DOMAIN} log restore heal"
+        )
+
     @callback
     def async_stop(self) -> None:
         for unsub in self._unsubs:
@@ -496,6 +544,13 @@ class Z2MData:
             self._ota_unsub()
             self._ota_unsub = None
         self._ota_users = 0
+        # Same reasoning, once per watched device: each is its own MQTT
+        # subscription outside _unsubs, taken out and dropped with the page
+        # that asked for it rather than the entry's own lifetime.
+        for watch in self._device_watches.values():
+            if watch.unsub is not None:
+                watch.unsub()
+        self._device_watches.clear()
         scan = self._scan
         if scan is not None and scan.task is not None and not scan.task.done():
             scan.task.cancel()
@@ -538,9 +593,11 @@ class Z2MData:
                 self.info.get("permit_join_end"),
             )
             self._check_bridge_seen()
+            self._reconcile_verbose_log_level()
         elif suffix == TOPIC_DEVICES and isinstance(payload, list):
             self.devices = payload
             self._reconcile_pairing_devices()
+            self._reconcile_device_watch_names()
             devices_changed = True
         elif suffix == TOPIC_GROUPS and isinstance(payload, list):
             self.groups = payload
@@ -668,6 +725,11 @@ class Z2MData:
 
         Reference counted, because two tabs (or a phone and a laptop) can watch the
         same join, and the first one to close must not silence the other.
+
+        The target level is persisted before the publish, not after: a Home
+        Assistant restart between those two lines would otherwise leave the
+        bridge at debug with _verbose_users reset to 0 and no record of what to
+        put back. See _async_heal_log_restore for the other half of that fix.
         """
         self._verbose_users += 1
         if self._verbose_users > 1:
@@ -678,6 +740,7 @@ class Z2MData:
             # nothing to restore afterwards, so record nothing.
             return
         self._verbose_restore = current
+        await self._log_restore_store.async_save({"level": current})
         await self.async_request(
             "options", {"options": {"advanced": {"log_level": "debug"}}}
         )
@@ -685,27 +748,118 @@ class Z2MData:
 
     @callback
     def async_pairing_verbose_release(self) -> None:
-        """Put the level back once the last pairing view has gone.
+        """Publish the restore once the last pairing view has gone.
 
         Called from a websocket unsubscribe, which Home Assistant also runs when the
         socket dies -- that is why this is reliable where a browser is not. It is a
         @callback, so the MQTT publish goes out as a task rather than being awaited
         during teardown.
+
+        _verbose_restore is deliberately NOT cleared here. A fire-and-forget
+        publish is not proof of anything; the only trustworthy confirmation is
+        bridge/info echoing the restored level back with nobody watching, which
+        _reconcile_verbose_log_level checks on every bridge/info push and is
+        what actually clears it (and the durable record with it).
         """
         self._verbose_users = max(0, self._verbose_users - 1)
         if self._verbose_users:
             return
         restore = self._verbose_restore
-        self._verbose_restore = None
         if restore is None:
             return
         self.hass.async_create_task(
-            self.async_request(
-                "options", {"options": {"advanced": {"log_level": restore}}}
-            ),
-            f"{DOMAIN} restore log level",
+            self._async_verbose_restore(restore), f"{DOMAIN} restore log level"
         )
-        _LOGGER.debug("Pairing view restored Zigbee2MQTT log level to %s", restore)
+
+    async def _async_verbose_restore(self, restore: str) -> None:
+        """Publish one log-level restore, and resend it once if it never lands.
+
+        Shared by async_pairing_verbose_release and _async_heal_log_restore --
+        the two moments a restore needs sending: the ordinary release, and a
+        previous run's release that this one never heard confirmed. The only
+        trustworthy confirmation is bridge/info echoing `restore` back with
+        nobody watching (_reconcile_verbose_log_level), so this waits out one
+        grace period and republishes exactly once if that has not happened yet.
+        A bridge that is still down after that needs the durable record picked
+        up on the next start, not this coroutine hammering it forever.
+        """
+        await self.async_request(
+            "options", {"options": {"advanced": {"log_level": restore}}}
+        )
+        _LOGGER.debug("Pairing view restoring Zigbee2MQTT log level to %s", restore)
+        await asyncio.sleep(LOG_RESTORE_RETRY_GRACE)
+        if (
+            self._verbose_restore == restore
+            and not self._verbose_users
+            and self.info.get("log_level") == "debug"
+        ):
+            await self.async_request(
+                "options", {"options": {"advanced": {"log_level": restore}}}
+            )
+            _LOGGER.debug(
+                "Zigbee2MQTT log level still debug %gs after release, resent"
+                " restore to %s",
+                LOG_RESTORE_RETRY_GRACE,
+                restore,
+            )
+
+    @callback
+    def _reconcile_verbose_log_level(self) -> None:
+        """React to bridge/info's log_level against the pairing-verbose contract.
+
+        Two independent things share this one retained field:
+
+        * A pairing view is open but the bridge is not at debug -- almost
+          always a Zigbee2MQTT restart mid-pairing, which comes back at
+          whatever level its own config holds and stays there until told
+          otherwise. Re-asserted every time this is seen; cheap, because
+          bridge/info republishes on any bridge change rather than in a tight
+          loop.
+        * A restore is pending and nobody is watching anymore. Confirmed by
+          VALUE (the level actually matches what was recorded), not merely
+          "not debug", so a restore target that legitimately is not "info" is
+          never mistaken for granted before Zigbee2MQTT has actually said so.
+        """
+        level = self.info.get("log_level")
+        if self._verbose_users:
+            if level != "debug":
+                self.hass.async_create_task(
+                    self.async_request(
+                        "options", {"options": {"advanced": {"log_level": "debug"}}}
+                    ),
+                    f"{DOMAIN} reassert log level",
+                )
+                _LOGGER.debug(
+                    "Zigbee2MQTT log level reported %s with a pairing view open,"
+                    " raised again",
+                    level,
+                )
+            return
+        if self._verbose_restore is not None and level == self._verbose_restore:
+            self._verbose_restore = None
+            self.hass.async_create_task(
+                self._log_restore_store.async_remove(), f"{DOMAIN} clear log restore"
+            )
+            _LOGGER.debug("Zigbee2MQTT confirmed the log level restore to %s", level)
+
+    async def _async_heal_log_restore(self) -> None:
+        """Finish a log-level restore an earlier run never got confirmed.
+
+        Runs once from async_start. The record async_pairing_verbose_acquire
+        wrote survives exactly the two things a fire-and-forget MQTT publish
+        cannot: Home Assistant restarting before any pairing view released its
+        hold, and a release's own publish getting lost to a Zigbee2MQTT outage
+        before the broker delivered it. Only acted on when nobody has raised
+        the level again in the meantime -- a fresh pairing view racing this at
+        startup wants debug, not whatever this would put back, and it will
+        overwrite this same record with its own when it acquires.
+        """
+        stored = await self._log_restore_store.async_load()
+        level = stored.get("level") if isinstance(stored, dict) else None
+        if not isinstance(level, str) or not level or self._verbose_users:
+            return
+        self._verbose_restore = level
+        await self._async_verbose_restore(level)
 
     @callback
     def async_clear_pairing_sessions(self) -> None:
@@ -1659,6 +1813,282 @@ class Z2MData:
         finally:
             for detach in detaches:
                 detach()
+
+    # ------------------------------------------------------------ device state
+    #
+    # The Settings card needs live values for a device's own settable properties,
+    # and Z2M never puts those anywhere but the device's own state topic --
+    # `<base>/<friendly_name>`, published with `retain` taken from the device's
+    # options, which default to false on this fleet. So, like the OTA mirror,
+    # there is no retained snapshot to read on connect and the subscription has
+    # to be live. UNLIKE the OTA mirror, this is scoped to ONE device rather than
+    # a wildcard over all of them: a device page watches exactly one device, so a
+    # subscription on that device's own topic is both cheaper and gives
+    # async_device_write a clean per-device signal to wait on, at the cost of
+    # having to follow the device if it gets renamed while watched (see
+    # _reconcile_device_watch_names).
+
+    async def async_device_state_acquire(self, ieee: str) -> None:
+        """Start mirroring one device's state topic, if nobody already is.
+
+        Refcounted per ieee: two tabs open on the same device share one MQTT
+        subscription, and the first to leave must not blind the other.
+        """
+        watch = self._device_watches.get(ieee)
+        if watch is None:
+            entry = self._device_entry(ieee)
+            if entry is None:
+                raise Z2MError(f"Zigbee2MQTT does not know a device called '{ieee}'")
+            watch = self._device_watches[ieee] = _DeviceWatch(
+                entry.get("friendly_name") or ieee
+            )
+        watch.users += 1
+        if watch.users > 1 or watch.unsub is not None:
+            return
+        watch.unsub = await mqtt.async_subscribe(
+            self.hass,
+            f"{self.base_topic}/{watch.friendly_name}",
+            partial(self._on_device_watch_message, ieee),
+            0,
+        )
+        _LOGGER.debug("Watching %s state for %s", watch.friendly_name, ieee)
+
+    @callback
+    def async_device_state_release(self, ieee: str) -> None:
+        """Drop one device's mirror once its last watcher has gone.
+
+        The merged map goes with it rather than lingering: the topic is not
+        retained, so state nobody was watching to receive is not something a
+        later watcher can trust anyway. The next acquire starts empty, honestly.
+        """
+        watch = self._device_watches.get(ieee)
+        if watch is None:
+            return
+        watch.users = max(0, watch.users - 1)
+        if watch.users:
+            return
+        if watch.unsub is not None:
+            watch.unsub()
+        del self._device_watches[ieee]
+        _LOGGER.debug("Stopped watching %s state for %s", watch.friendly_name, ieee)
+
+    @callback
+    def device_state(self, ieee: str) -> dict[str, Any]:
+        """The merged property map mirrored for one device, or {} if unwatched.
+
+        {} covers both "nobody has acquired a watch" and "a watch is open but
+        the device has not echoed anything yet" -- on this fleet those are
+        indistinguishable and both honestly mean "not read yet", which is
+        exactly the row state the panel renders for it.
+        """
+        watch = self._device_watches.get(ieee)
+        return dict(watch.state) if watch is not None else {}
+
+    @callback
+    def _on_device_watch_message(self, ieee: str, msg: mqtt.ReceiveMessage) -> None:
+        """Shallow-merge one state publish into the watched device's mirror.
+
+        Z2M publishes partial maps -- a single button press republishes only
+        the properties that changed, not the whole device -- so this merges
+        rather than replaces. The raw fragment goes out on the signal alongside
+        the merged map because async_device_write needs to know which
+        properties THIS message actually carried, not just what the mirror
+        currently holds: a property already known from an earlier read must not
+        look like confirmation of a write that has not echoed yet.
+        """
+        watch = self._device_watches.get(ieee)
+        if watch is None:
+            return
+        try:
+            payload = json.loads(msg.payload)
+        except ValueError:
+            return
+        if not isinstance(payload, dict):
+            return
+        watch.state.update(payload)
+        async_dispatcher_send(
+            self.hass,
+            SIGNAL_DEVICE_STATE,
+            {"ieee_address": ieee, "state": dict(watch.state), "fragment": payload},
+        )
+
+    @callback
+    def _reconcile_device_watch_names(self) -> None:
+        """Re-point any open device watch at its friendly name's new topic.
+
+        bridge/devices is the only place a rename is learned -- the state topic
+        itself gives no warning, it just goes quiet on the old name and starts
+        publishing on the new one -- so every watched ieee is checked against
+        the fresh inventory on every bridge/devices push. Cheap: at most a
+        handful of device pages are ever open at once.
+        """
+        for ieee, watch in self._device_watches.items():
+            entry = self._device_entry(ieee)
+            name = entry.get("friendly_name") if entry is not None else None
+            if isinstance(name, str) and name and name != watch.friendly_name:
+                self.hass.async_create_task(
+                    self._async_resubscribe_device_watch(ieee, name),
+                    f"{DOMAIN} device watch rename {ieee}",
+                )
+
+    async def _async_resubscribe_device_watch(self, ieee: str, name: str) -> None:
+        """Move one open device watch to its renamed topic.
+
+        Re-fetched from the dict rather than closed over: the watch can be
+        released, or released and re-acquired as a fresh object, while this is
+        suspended on the subscribe, and acting on a stale reference would
+        either leak a subscription nobody owns or clobber a watch this rename
+        has nothing to do with. `old_unsub` is read fresh right before it is
+        replaced, with no await in between, so a second rename racing this one
+        still tears down exactly the subscription it made obsolete.
+        """
+        watch = self._device_watches.get(ieee)
+        if watch is None or watch.friendly_name == name:
+            return
+        new_unsub = await mqtt.async_subscribe(
+            self.hass,
+            f"{self.base_topic}/{name}",
+            partial(self._on_device_watch_message, ieee),
+            0,
+        )
+        if self._device_watches.get(ieee) is not watch:
+            new_unsub()
+            return
+        old_unsub = watch.unsub
+        watch.friendly_name = name
+        watch.unsub = new_unsub
+        if old_unsub is not None:
+            old_unsub()
+        _LOGGER.debug("Device watch for %s followed a rename to %s", ieee, name)
+
+    @callback
+    def _expose_write_only(self, device: dict[str, Any], keys: list[str]) -> bool:
+        """Whether every one of `keys` is write-only: settable, never in state.
+
+        A composite's own `property` is the payload's top-level key; its
+        features are nested inside the value and do not carry access bits worth
+        checking here. A key this does not recognise is treated as NOT
+        write-only, so an unknown property still gets the full confirmation
+        wait rather than being guessed into the short grace window.
+        """
+        access_by_prop = {
+            e.get("property"): e.get("access")
+            for e in (device.get("definition") or {}).get("exposes") or []
+            if isinstance(e, dict) and e.get("property")
+        }
+        return bool(keys) and all(
+            access_by_prop.get(key) == ACCESS_WRITE_ONLY for key in keys
+        )
+
+    async def async_device_write(
+        self, ieee: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Publish one `set` and wait for whatever proves it landed.
+
+        Mirrors async_scene_write's shape -- listeners attached before the
+        publish, resolve on whichever signal proves something first, race a
+        deadline -- but the signal is the device's OWN state mirror rather than
+        a retained inventory republish, and a write-only property gets a short
+        grace instead of the full wait because Z2M can never echo a value it
+        never reports.
+
+        Raises Z2MError carrying Zigbee2MQTT's own words when the converter
+        failed. Otherwise: {sent, confirmed, state} once a state echo carries a
+        written property; {sent, confirmed: false, sleeping} once
+        DEVICE_SET_TIMEOUT passes with no echo; {sent, confirmed: false} for a
+        write-only payload once DEVICE_SET_GRACE passes with nothing on the log.
+        """
+        entry = self._device_entry(ieee)
+        if entry is None:
+            raise Z2MError(f"Zigbee2MQTT does not know a device called '{ieee}'")
+        name = entry.get("friendly_name") or ieee
+        keys = list(payload.keys())
+        write_only = self._expose_write_only(entry, keys)
+        sleeping = (entry.get("power_source") or "") == "Battery"
+        markers = [f"Publish 'set' '{key}' to '{name}' failed" for key in keys]
+
+        progress = asyncio.Event()
+        failure: list[str] = []
+        confirmed_state: dict[str, Any] | None = None
+
+        @callback
+        def _on_log(line: dict[str, Any]) -> None:
+            if line.get("level") != "error":
+                return
+            message = line.get("message") or ""
+            if any(marker in message for marker in markers):
+                failure.append(message)
+                progress.set()
+
+        @callback
+        def _on_state(event: dict[str, Any]) -> None:
+            nonlocal confirmed_state
+            if event.get("ieee_address") != ieee or confirmed_state is not None:
+                return
+            fragment = event.get("fragment")
+            if isinstance(fragment, dict) and any(key in fragment for key in keys):
+                confirmed_state = event.get("state")
+                progress.set()
+
+        await self.async_device_state_acquire(ieee)
+        try:
+            detaches = [
+                async_dispatcher_connect(self.hass, SIGNAL_LOG, _on_log),
+                async_dispatcher_connect(self.hass, SIGNAL_DEVICE_STATE, _on_state),
+            ]
+            try:
+                # Listeners and the mirror subscription are both live before the
+                # publish: Z2M can answer a local broker faster than this
+                # coroutine gets rescheduled, and an echo that landed before the
+                # connect would simply be missed.
+                topic = f"{self.base_topic}/{name}/set"
+                body = json.dumps(payload)
+                await mqtt.async_publish(self.hass, topic, body, qos=0, retain=False)
+                _LOGGER.debug("Published %s -> %s", topic, body)
+
+                if write_only:
+                    try:
+                        async with asyncio.timeout(DEVICE_SET_GRACE):
+                            while not failure:
+                                progress.clear()
+                                await progress.wait()
+                    except TimeoutError:
+                        return {"sent": True, "confirmed": False}
+                    raise Z2MError(failure[-1])
+
+                deadline = self.hass.loop.time() + DEVICE_SET_TIMEOUT
+                while True:
+                    if failure:
+                        raise Z2MError(failure[-1])
+                    if confirmed_state is not None:
+                        return {
+                            "sent": True,
+                            "confirmed": True,
+                            "state": confirmed_state,
+                        }
+                    remaining = deadline - self.hass.loop.time()
+                    if remaining <= 0:
+                        break
+                    progress.clear()
+                    # Re-checked after the clear: a signal that landed between
+                    # the checks above and the clear would otherwise be dropped
+                    # and this would wait out the full timeout on state it had
+                    # already been told about.
+                    if failure or confirmed_state is not None:
+                        continue
+                    try:
+                        async with asyncio.timeout(remaining):
+                            await progress.wait()
+                    except TimeoutError:
+                        break
+                if failure:
+                    raise Z2MError(failure[-1])
+                return {"sent": True, "confirmed": False, "sleeping": sleeping}
+            finally:
+                for detach in detaches:
+                    detach()
+        finally:
+            self.async_device_state_release(ieee)
 
     # ----------------------------------------------------------------- extension
 

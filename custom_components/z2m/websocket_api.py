@@ -23,6 +23,7 @@ from .const import (
     OTA_ACCEPT_WINDOW,
     REQUEST_TIMEOUT,
     SIGNAL_DEVICE_LIST,
+    SIGNAL_DEVICE_STATE,
     SIGNAL_GROUPS,
     SIGNAL_LOG,
     SIGNAL_MAP,
@@ -81,6 +82,9 @@ def async_setup_websocket(hass: HomeAssistant) -> None:
         ws_remove,
         ws_set_options,
         ws_read_values,
+        ws_device_state,
+        ws_device_state_subscribe,
+        ws_device_set,
         ws_configure,
         ws_interview,
         ws_health_check,
@@ -840,6 +844,105 @@ async def ws_read_values(hass, connection, msg, data) -> None:
     connection.send_result(
         msg["id"],
         {"requested": readable, "not_readable": skipped, "sleeping": battery},
+    )
+
+
+# ------------------------------------------------------------- device state
+#
+# The Settings card's live values come from the device's OWN state topic, not
+# from Home Assistant entities: on this fleet the config-category entities
+# Z2M's homeassistant extension would create are disabled by choice, and would
+# leave most Settings rows blank. Z2MData.async_device_state_acquire/_release
+# hold a refcounted mirror per ieee -- see the comment above that method in
+# coordinator.py for why this is a per-device subscription rather than the OTA
+# mirror's single wildcard.
+#
+# Not retained, same as OTA: the mirror only knows what has actually echoed
+# since something started watching, and a device that has said nothing yet is
+# legitimately {} rather than an error. All three commands are admin-gated
+# because the mirror echoes raw MQTT payloads verbatim, which this file's own
+# policy (see the network map admin comment above) reserves for admins.
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {vol.Required("type"): "z2m/device/state", vol.Required("device"): str}
+)
+@websocket_api.async_response
+@_guard
+async def ws_device_state(hass, connection, msg, data) -> None:
+    """The device's mirrored state, or {} if nobody has watched it yet.
+
+    A plain read of whatever is already mirrored -- it does not itself start a
+    watch. z2m/device/state/subscribe is what the panel actually opens a
+    device page with; this exists for a caller that only ever wants one
+    snapshot.
+    """
+    connection.send_result(msg["id"], {"state": data.device_state(msg["device"])})
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {vol.Required("type"): "z2m/device/state/subscribe", vol.Required("device"): str}
+)
+@websocket_api.async_response
+@_guard
+async def ws_device_state_subscribe(hass, connection, msg, data) -> None:
+    """Snapshot first, then one merged-map push per state publish.
+
+    Refcounted per ieee on Z2MData, so two tabs open on the same device share
+    one MQTT subscription and the last to leave is what tears it down -- Home
+    Assistant always runs the unsubscribe, including when the socket dies,
+    which a browser tab cannot promise.
+
+    Acquired BEFORE the dispatcher connect, the reverse of the pairing and OTA
+    subscriptions above: acquire can raise for an unknown device, and
+    connecting first would leak a dispatcher registration on that error path.
+    Nothing is missed by the reorder -- acquire is awaited and connect is
+    called from the same coroutine with no intervening await, so no push can
+    land in the gap, and the result below is a fresh snapshot regardless.
+    """
+    ieee = msg["device"]
+    await data.async_device_state_acquire(ieee)
+
+    @callback
+    def _forward(event: dict[str, Any]) -> None:
+        if event.get("ieee_address") != ieee:
+            return
+        connection.send_message(
+            websocket_api.event_message(msg["id"], {"state": event.get("state")})
+        )
+
+    detach = async_dispatcher_connect(hass, SIGNAL_DEVICE_STATE, _forward)
+
+    @callback
+    def _unsubscribe() -> None:
+        detach()
+        data.async_device_state_release(ieee)
+
+    connection.subscriptions[msg["id"]] = _unsubscribe
+    connection.send_result(msg["id"], {"state": data.device_state(ieee)})
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "z2m/device/set",
+        vol.Required("device"): str,
+        vol.Required("payload"): vol.All(dict, vol.Length(min=1)),
+    }
+)
+@websocket_api.async_response
+@_guard
+async def ws_device_set(hass, connection, msg, data) -> None:
+    """Write one property (or one composite's nested object) and confirm it.
+
+    See Z2MData.async_device_write for exactly what "confirm" means: the
+    device's own state echo, a bridge/logging converter failure, or -- for a
+    property that can never echo -- a short grace with nothing on the log.
+    """
+    connection.send_result(
+        msg["id"], await data.async_device_write(msg["device"], msg["payload"])
     )
 
 

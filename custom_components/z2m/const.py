@@ -46,6 +46,12 @@ SIGNAL_MAP = f"{DOMAIN}_map"  # network map scan phase, passed as the arg
 # topics, not a bridge topic: Z2M publishes firmware progress as an `update` key on
 # `<base>/<friendly_name>` and nowhere else.
 SIGNAL_OTA = f"{DOMAIN}_ota"
+# One device's own state topic changed while something is watching it, passed
+# as {ieee_address, state, fragment} -- `state` is the merged property map,
+# `fragment` is the raw payload THIS publish carried (Z2M sends partial maps).
+# Fed from the DEVICE state topic like SIGNAL_OTA, but scoped per ieee rather
+# than fleet-wide: see Z2MData.async_device_state_acquire.
+SIGNAL_DEVICE_STATE = f"{DOMAIN}_device_state"
 # Retained bridge topics we mirror into local state. Each is JSON except `state`,
 # which Z2M publishes as {"state": "online"|"offline"}.
 TOPIC_INFO = "bridge/info"
@@ -198,6 +204,30 @@ SCENE_TIMEOUT = 20
 # synchronously as the command fails. Long enough to catch that, short enough not to
 # make a working recall feel slow.
 SCENE_RECALL_GRACE = 3.0
+
+# z2m/device/set's write lifecycle, fixed by the contract the panel builds
+# against rather than measured: resolve confirmed once the device's own state
+# topic echoes a written property, and unconfirmed after this deadline for
+# every other settable property, mains or battery.
+DEVICE_SET_TIMEOUT = 10
+# Write-only properties (access exactly 2: settable, never in state) can never
+# echo, so there is nothing to wait the full timeout for -- only a possible
+# converter failure on bridge/logging, the same idea as SCENE_RECALL_GRACE.
+DEVICE_SET_GRACE = 3.0
+
+# The pairing log-level restore is fire-and-forget MQTT, so it is made durable
+# rather than trusted: the pending target level is written here the moment
+# Zigbee2MQTT is raised to debug, and not cleared until bridge/info actually
+# echoes it back with nobody watching. That is what survives a Home Assistant
+# restart mid-pairing, or a Zigbee2MQTT outage that swallows the restore
+# publish outright -- both leave a record here for the next start to finish.
+LOG_RESTORE_STORE_KEY = "z2m.log_restore"
+LOG_RESTORE_STORE_VERSION = 1
+# How long to give a restore publish to be echoed back before sending it once
+# more. Long enough that an ordinary round trip through the broker is never
+# mistaken for a lost publish; short enough that a genuinely lost one is
+# retried within the same pairing session rather than only at next startup.
+LOG_RESTORE_RETRY_GRACE = 15.0
 
 # The clusters Zigbee2MQTT is willing to bind, copied from ALL_CLUSTER_CANDIDATES in
 # 2.13.0's lib/extension/bind.ts. Mirrored rather than guessed because Z2M attempts
