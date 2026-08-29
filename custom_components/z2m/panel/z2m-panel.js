@@ -238,7 +238,11 @@ const rowButton = (label, act, appearance = 'plain') =>
  * card, so their whole feature subtree is invisible to the Settings classifier
  * (§3.2.1): a plain Set stays a constant-time lookup instead of an array scan on
  * every device page render. */
-const SETTINGS_CONTROL_TYPES = new Set(['light', 'switch', 'lock', 'cover', 'climate', 'fan']);
+/* light gets narrower treatment (§2.1 amendment): only these five feature
+ * names are excluded from Settings; the composite's other features (e.g.
+ * `color_temp_startup`) are ordinary Settings rows, one level up. */
+const SETTINGS_CONTROL_TYPES = new Set(['switch', 'lock', 'cover', 'climate', 'fan']);
+const LIGHT_CONTROL_FEATURES = new Set(['state', 'brightness', 'color_temp', 'color_xy', 'color_hs']);
 
 /**
  * Zigbee2MQTT hands a converter-authored setting a label by titlecasing the raw
@@ -286,6 +290,225 @@ const SETTINGS_CHIP = {
   failed: ['Failed', 'off'],
 };
 
+/* --------------------------------------------------------- light: colour math */
+//
+// Every function below is normative from the light/colour specification's §4.8:
+// the anchors, the matrices, and the gamma constants are copied verbatim, not
+// approximated. Kept as plain functions (not methods) because none of them
+// touch panel state -- they are exercised through the rendered swatches, hex
+// readouts and write payloads the same way the rest of this file is tested.
+
+const clamp255 = (n) => Math.max(0, Math.min(255, Math.round(n)));
+
+const hexToRgb = (hex) => {
+  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || '').trim());
+  if (!m) return { r: 0, g: 0, b: 0 };
+  const n = parseInt(m[1], 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+};
+const rgbToHex = (r, g, b) =>
+  `#${[r, g, b].map((c) => clamp255(c).toString(16).padStart(2, '0')).join('')}`;
+
+/** HSV with h in 0-360, s/v in 0-1; returns 0-255 channels. */
+const hsvToRgb = (h, s, v) => {
+  const hue = ((h % 360) + 360) % 360;
+  const c = v * s;
+  const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
+  const m = v - c;
+  const [r, g, b] =
+    hue < 60 ? [c, x, 0]
+    : hue < 120 ? [x, c, 0]
+    : hue < 180 ? [0, c, x]
+    : hue < 240 ? [0, x, c]
+    : hue < 300 ? [x, 0, c]
+    : [c, 0, x];
+  return { r: (r + m) * 255, g: (g + m) * 255, b: (b + m) * 255 };
+};
+const rgbToHsv = (r, g, b) => {
+  const rn = r / 255;
+  const gn = g / 255;
+  const bn = b / 255;
+  const max = Math.max(rn, gn, bn);
+  const min = Math.min(rn, gn, bn);
+  const d = max - min;
+  let h = 0;
+  if (d !== 0) {
+    if (max === rn) h = 60 * (((gn - bn) / d) % 6);
+    else if (max === gn) h = 60 * ((bn - rn) / d + 2);
+    else h = 60 * ((rn - gn) / d + 4);
+  }
+  if (h < 0) h += 360;
+  return { h, s: max === 0 ? 0 : d / max, v: max };
+};
+const hsToHex = (hue, sat) => {
+  const rgb = hsvToRgb(hue, (sat || 0) / 100, 1);
+  return rgbToHex(rgb.r, rgb.g, rgb.b);
+};
+
+const gammaEncode = (c) => (c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055);
+const gammaDecode = (c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+
+/** xy -> RGB (displaying xy-mode state): Y=1, sRGB D65 matrix, negatives
+ * clamped to 0, scaled so the max channel is 1, then gamma-encoded. No
+ * per-vendor gamut: the bulb's own clamping is what the echo shows. */
+const xyToRgb = (x, y) => {
+  if (!y) return { r: 0, g: 0, b: 0 };
+  const X = x / y;
+  const Y = 1;
+  const Z = (1 - x - y) / y;
+  let r = Math.max(0, 3.2406 * X - 1.5372 * Y - 0.4986 * Z);
+  let g = Math.max(0, -0.9689 * X + 1.8758 * Y + 0.0415 * Z);
+  let b = Math.max(0, 0.0557 * X - 0.204 * Y + 1.057 * Z);
+  const max = Math.max(r, g, b, 1e-9);
+  r /= max;
+  g /= max;
+  b /= max;
+  return { r: clamp255(gammaEncode(r) * 255), g: clamp255(gammaEncode(g) * 255), b: clamp255(gammaEncode(b) * 255) };
+};
+const xyToHex = (x, y) => {
+  const rgb = xyToRgb(x, y);
+  return rgbToHex(rgb.r, rgb.g, rgb.b);
+};
+
+/** hs -> xy, for writing to xy-only bulbs: hsv -> sRGB -> linear -> XYZ -> xy,
+ * rounded to 4 decimals. */
+const hsToXy = (hue, sat) => {
+  const rgb = hsvToRgb(hue, (sat || 0) / 100, 1);
+  const r = gammaDecode(rgb.r / 255);
+  const g = gammaDecode(rgb.g / 255);
+  const b = gammaDecode(rgb.b / 255);
+  const X = 0.4124 * r + 0.3576 * g + 0.1805 * b;
+  const Y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  const Z = 0.0193 * r + 0.1192 * g + 0.9505 * b;
+  const sum = X + Y + Z || 1e-9;
+  return { x: Math.round((X / sum) * 10000) / 10000, y: Math.round((Y / sum) * 10000) / 10000 };
+};
+
+/** Kelvin -> RGB, two piecewise-linear tables (§4.8). `swatchRGB` is the
+ * honest blackbody chromaticity; `trackRGB` matches it up to 5000 K, then
+ * bends toward a cool direction cue that real bulb light does not actually
+ * reach. Deliberate, and the two tables must stay separate. */
+const KELVIN_SWATCH_STOPS = [
+  [2000, '#ff890e'], [2200, '#ff9227'], [2700, '#ffa757'], [3000, '#ffb16e'],
+  [3500, '#ffc18d'], [4000, '#ffcea6'], [4500, '#ffdabb'], [5000, '#ffe4ce'],
+  [5500, '#ffedde'], [6500, '#fffefa'],
+];
+const KELVIN_TRACK_STOPS = [
+  [2000, '#ff890e'], [2200, '#ff9227'], [2700, '#ffa757'], [3000, '#ffb16e'],
+  [3500, '#ffc18d'], [4000, '#ffcea6'], [4500, '#ffdabb'], [5000, '#ffe4ce'],
+  [5500, '#f4e5de'], [6000, '#e8e5ef'], [6500, '#dde6ff'],
+];
+/**
+ * Interpolated in MIRED space, not kelvin space: the whole point of this
+ * track is "mired-linear, not kelvin-linear" (§4.6), and a table walked in
+ * kelvin would reintroduce exactly the non-perceptual spacing that decision
+ * exists to avoid. Anchors are still labelled by kelvin (the table above,
+ * and every caller) because kelvin is what the operator reads.
+ */
+const interpKelvinStops = (stops, kelvin) => {
+  const mired = 1e6 / kelvin;
+  const first = stops[0];
+  if (mired >= 1e6 / first[0]) return hexToRgb(first[1]);
+  const last = stops[stops.length - 1];
+  if (mired <= 1e6 / last[0]) return hexToRgb(last[1]);
+  for (let i = 1; i < stops.length; i += 1) {
+    const [k1, hex1] = stops[i - 1];
+    const [k2, hex2] = stops[i];
+    const m1 = 1e6 / k1;
+    const m2 = 1e6 / k2;
+    if (mired < m2) continue;
+    const t = (m1 - mired) / (m1 - m2);
+    const c1 = hexToRgb(hex1);
+    const c2 = hexToRgb(hex2);
+    return { r: c1.r + (c2.r - c1.r) * t, g: c1.g + (c2.g - c1.g) * t, b: c1.b + (c2.b - c1.b) * t };
+  }
+  return hexToRgb(last[1]);
+};
+const swatchRGB = (kelvin) => interpKelvinStops(KELVIN_SWATCH_STOPS, kelvin);
+const trackRGB = (kelvin) => interpKelvinStops(KELVIN_TRACK_STOPS, kelvin);
+const swatchHex = (kelvin) => {
+  const c = swatchRGB(kelvin);
+  return rgbToHex(c.r, c.g, c.b);
+};
+
+/** Display kelvin rounds to the nearest 100; writes stay exact mireds. */
+const miredToKelvinDisplay = (mired) => Math.round(1e6 / mired / 100) * 100;
+const kelvinToMired = (kelvin) => Math.round(1e6 / kelvin);
+
+/** Hue names (§4.8), for the state line, aria text, adjusted chips, and the
+ * L editor's meta fallback. Saturation under 15 always reads White. */
+const HUE_NAME_RANGES = [
+  [345, 360, 'Red'], [0, 15, 'Red'], [15, 40, 'Orange'], [40, 70, 'Yellow'],
+  [70, 150, 'Green'], [150, 200, 'Cyan'], [200, 255, 'Blue'], [255, 290, 'Purple'],
+  [290, 330, 'Magenta'], [330, 345, 'Pink'],
+];
+const hueName = (hue, sat) => {
+  if (sat !== undefined && sat !== null && sat < 15) return 'White';
+  const h = ((Number(hue) % 360) + 360) % 360;
+  const hit = HUE_NAME_RANGES.find(([lo, hi]) => h >= lo && h < hi);
+  return hit ? hit[2] : 'Red';
+};
+
+/** Brightness wire<->display (§4.4), roundtrip-stable at 25/50/75/100. */
+const brightnessMax = (expose) => (expose && expose.value_max !== undefined ? expose.value_max : 254);
+const brightnessToPct = (wire, max) => Math.max(1, Math.round((wire / max) * 100));
+const pctToBrightness = (pct, max) => Math.max(1, Math.min(max, Math.round((pct * max) / 100)));
+const BRIGHTNESS_CHIPS = [25, 50, 75, 100];
+
+/** Temperature position<->mired (§4.6): position space is 0-1000, warm at 0. */
+const tempPositionToMired = (pos, min, max) => Math.round(max + (min - max) * (pos / 1000));
+const miredToTempPosition = (mired, min, max) => Math.round(((mired - max) / (min - max)) * 1000);
+
+/** Curated commercial temperature presets (§4.6), independent of whatever a
+ * converter's own `presets` array happens to call warm/cool. */
+const TEMP_CHIPS = [
+  { name: 'Candle', kelvin: 2000, dot: '#ff890e' },
+  { name: 'Warm', kelvin: 2700, dot: '#ffa757' },
+  { name: 'Neutral', kelvin: 4000, dot: '#ffcea6' },
+  { name: 'Cool', kelvin: 5000, dot: '#ffe4ce' },
+  { name: 'Daylight', kelvin: 6500, dot: '#dde6ff' },
+];
+
+/** The nine canonical Inovelli LED-colour detents (§5.2), independent of a
+ * row's own `presets` array (which supplies names, not the detent points). */
+const L_DETENTS = [0, 21, 42, 85, 127, 170, 212, 234, 255];
+const l255ToDeg = (v) => (v / 255) * 360;
+
+/** Capitalizes the first letter only: converter preset names arrive lowercase
+ * ("coolest", "cool"), and this is what "sentence-cased" (§5.1/§5.3) means for
+ * a single word. Never forces the rest lower, so an embedded acronym survives. */
+const sentenceCase = (s) => {
+  const str = String(s || '');
+  return str ? str.charAt(0).toUpperCase() + str.slice(1) : str;
+};
+
+/** Editor M's wire encoding (§6.3), verbatim from the expose description:
+ * 1-60 seconds; 61-120 minutes (v-60); 121-254 hours (v-120); 255 indefinite. */
+const DURATION_UNITS = ['Seconds', 'Minutes', 'Hours', 'Forever'];
+const durationDecode = (wire) => {
+  const v = Number(wire);
+  if (v === 255) return { unit: 'Forever', val: 0 };
+  if (v >= 61 && v <= 120) return { unit: 'Minutes', val: v - 60 };
+  if (v >= 121 && v <= 254) return { unit: 'Hours', val: v - 120 };
+  return { unit: 'Seconds', val: Math.max(0, v) };
+};
+const durationEncode = (unit, val) => {
+  const n = Math.max(0, Math.round(Number(val) || 0));
+  if (unit === 'Forever') return 255;
+  if (unit === 'Minutes') return 60 + n;
+  if (unit === 'Hours') return 120 + n;
+  return n;
+};
+const durationHuman = (wire) => {
+  const v = Number(wire);
+  if (v === 255) return 'until cleared';
+  const { unit, val } = durationDecode(v);
+  if (unit === 'Hours') return `${val} h`;
+  if (unit === 'Minutes') return `${val} min`;
+  return `${val} s`;
+};
+const durationBounds = (unit) => (unit === 'Hours' ? { min: 1, max: 134 } : { min: 1, max: 60 });
+
 /* The coordinator board's own entities, owned by the smlight integration. Hardcoded
  * ids on purpose: this panel manages one household's mesh, and the card simply skips
  * whatever Home Assistant does not currently provide. */
@@ -317,6 +540,29 @@ const COORD_SWITCHES = [
   ['switch.z_coordinator_disable_leds', 'Disable LEDs'],
   ['switch.z_coordinator_led_night_mode', 'LED night mode'],
 ];
+
+/* Panel routing (round 2). Every top-level view maps to one path segment under
+ * this panel's own /z2m root, so the browser's address bar -- and its
+ * Back/Forward buttons -- walk the same history a tap through the UI would.
+ * `options` keeps its internal view name (it is what _bodyFor's switch and
+ * every existing `_go({name:'options'})` call already say) but is addressed
+ * as /z2m/settings: "Options" is the page title, "Settings" is what belongs
+ * in a URL that now sits next to a per-device Settings card of its own. */
+const ROUTE_PATH = {
+  dashboard: () => '',
+  devices: () => 'devices',
+  device: (v) => `device/${encodeURIComponent(v.ieee)}`,
+  groups: () => 'groups',
+  group: (v) => `group/${encodeURIComponent(v.group)}`,
+  map: () => 'map',
+  diagnostics: () => 'diagnostics',
+  options: () => 'settings',
+  logs: () => 'logs',
+  ota: () => 'ota',
+  network: () => 'network',
+  binds: (v) => `binds/${encodeURIComponent(v.ieee)}`,
+  bindsall: () => 'bindsall',
+};
 
 class Z2MPanel extends HTMLElement {
   constructor() {
@@ -352,6 +598,15 @@ class Z2MPanel extends HTMLElement {
     // are never baked into _markup (§1) -- everything below is keyed by ieee and
     // patched onto the page by _syncSettings, never rendered into the page string.
     this._settingsState = {}; // ieee -> merged property map from the state mirror
+    // ieee -> a message, while the devstate subscribe promise is rejected: the
+    // light block's own card-scoped feed alert and degraded path (§4.10).
+    this._deviceStateError = {};
+    // ieee -> { n -> {phase, message, token} }: the light block's own write
+    // lifecycle (§4.9), separate from Settings' because the block shows one
+    // chip per block, not one per control.
+    this._lightWrite = {};
+    this._lightCache = {}; // ieee -> { n -> last-painted block HTML }, for _syncLight's diff
+    this._lightUI = {}; // ieee -> { n -> {editing: 'bright'|'temp'|'hex'|null} }, hex/readout tap-to-edit
     this._settingsWrite = {}; // ieee -> { rowKey -> {phase, message, echoed, token} }
     this._settingsDraft = {}; // ieee -> { compositeKey -> {featureProp -> value} }
     this._settingsOpen = {}; // ieee -> { groupKey -> expanded }, kept for the session
@@ -1119,6 +1374,10 @@ class Z2MPanel extends HTMLElement {
       startedAt: null,
       setup: { saving: false, completed: false, device: null },
       wait: null,
+      // Set while a '#pair' history entry from _openPairDialog is still
+      // unpopped, so _closePairDialog knows whether a button-driven close
+      // owes the browser a Back of its own (§ routing).
+      historyPushed: false,
     };
   }
 
@@ -1152,14 +1411,125 @@ class Z2MPanel extends HTMLElement {
     if (this._hass) this._render();
   }
 
-  set route(_v) {}
+  /**
+   * Home Assistant's own router calls this whenever the panel's URL changes --
+   * a sidebar link, the operator's own Back/Forward, and the very first mount,
+   * on top of the native `popstate` listener below (which some hosting paths,
+   * such as a cold load straight onto the panel URL before HA's own chrome has
+   * registered -- see CHROME above -- never reach on their own). `v.path` is
+   * already stripped of this panel's own /z2m prefix.
+   */
+  set route(v) {
+    this._syncRouteView(v && typeof v.path === 'string' ? v.path : this._locationSubpath());
+  }
 
   set panel(v) {
     this._panel = v;
   }
 
+  /** The browser's own URL, with this panel's /z2m root stripped and no
+   * leading slash: what `route.path` would say if Home Assistant's router had
+   * already set it. Used as the cold-boot fallback and by `_onPopState`,
+   * which gets no route object of its own. */
+  _locationSubpath() {
+    const path = (typeof window !== 'undefined' && window.location && window.location.pathname) || '';
+    return path.replace(/^\/?z2m\/?/, '');
+  }
+
+  /** A subpath (no leading/trailing slash needed) to a view object, the
+   * `_view` shape `_go`/`_bodyFor`/`_title` already speak. Unrecognised or
+   * empty subpaths fall back to the dashboard -- the same page a bare /z2m
+   * load always showed before routing existed. */
+  _parseRoute(subpath) {
+    const parts = String(subpath || '')
+      .replace(/^\/+|\/+$/g, '')
+      .split('/')
+      .filter(Boolean);
+    const [head, arg] = parts;
+    switch (head) {
+      case undefined:
+        return { name: 'dashboard' };
+      case 'devices':
+        return { name: 'devices' };
+      case 'device':
+        return arg ? { name: 'device', ieee: decodeURIComponent(arg) } : { name: 'devices' };
+      case 'groups':
+        return { name: 'groups' };
+      case 'group':
+        return arg ? { name: 'group', group: decodeURIComponent(arg) } : { name: 'groups' };
+      case 'map':
+        return { name: 'map' };
+      case 'diagnostics':
+        return { name: 'diagnostics' };
+      case 'settings':
+        return { name: 'options' };
+      case 'logs':
+        return { name: 'logs' };
+      case 'ota':
+        return { name: 'ota' };
+      case 'network':
+        return { name: 'network' };
+      case 'binds':
+        return arg ? { name: 'binds', ieee: decodeURIComponent(arg) } : { name: 'devices' };
+      case 'bindsall':
+        return { name: 'bindsall' };
+      default:
+        return { name: 'dashboard' };
+    }
+  }
+
+  /** The inverse of `_parseRoute`, via the ROUTE_PATH table above. */
+  _routePath(view) {
+    const fn = ROUTE_PATH[view && view.name];
+    return fn ? fn(view) : '';
+  }
+
+  /** Same view, for deciding whether a route echo is a no-op: same name, and
+   * same identifying param for the views that carry one. */
+  _viewsEqual(a, b) {
+    if (!a || !b || a.name !== b.name) return false;
+    if (a.name === 'device' || a.name === 'binds') return a.ieee === b.ieee;
+    if (a.name === 'group') return String(a.group) === String(b.group);
+    return true;
+  }
+
+  /**
+   * Applies whatever subpath the browser or Home Assistant's router now says
+   * is current. Never pushes a history entry -- the address bar already says
+   * this, whether it is HA's `route` setter echoing our own push or the
+   * operator's own Back/Forward -- and is a no-op when the parsed view is
+   * already on screen, which is what makes that echo harmless.
+   */
+  _syncRouteView(subpath) {
+    const view = this._parseRoute(subpath);
+    if (this._viewsEqual(view, this._view)) return;
+    if (!this._hass || !this.shadowRoot) {
+      // Boot has not run yet: hand the parsed view to _boot()'s first render
+      // instead of leaving/entering a page that was never on screen.
+      this._view = view;
+      this._routeApplied = true;
+      return;
+    }
+    this._navigate(view, false);
+  }
+
+  /** The native Back/Forward event. A dialog owns the one '#pair' entry it
+   * pushed on open (§ pairing); only a press past that entry is a real view
+   * change, so the dialog gets first refusal. */
+  _onPopState() {
+    if (this._pairing.open) {
+      this._closePairDialog(true);
+      return;
+    }
+    this._syncRouteView(this._locationSubpath());
+  }
+
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
+    if (!this._onPopStateBound) this._onPopStateBound = () => this._onPopState();
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      window.addEventListener('popstate', this._onPopStateBound);
+    }
   }
 
   disconnectedCallback() {
@@ -1171,10 +1541,22 @@ class Z2MPanel extends HTMLElement {
       clearTimeout(this._logTimer);
       this._logTimer = null;
     }
+    if (this._onPopStateBound && typeof window !== 'undefined' && window.removeEventListener) {
+      window.removeEventListener('popstate', this._onPopStateBound);
+    }
   }
 
   _boot() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
+    // A deep link (/z2m/device/0x...) has to be the very first paint, not a
+    // dashboard frame that then jumps: derive the opening view from the URL
+    // before that first _render() call below, unless Home Assistant's own
+    // `route` setter already got here first -- it can arrive before `hass`
+    // does, and _syncRouteView already applied it when it did.
+    if (!this._routeApplied) {
+      this._view = this._parseRoute(this._locationSubpath());
+      this._routeApplied = true;
+    }
 
     // Paint before any network or helper work. A cold panel is useful immediately,
     // even while the individual feeds are still being read.
@@ -1729,6 +2111,100 @@ class Z2MPanel extends HTMLElement {
       .setfeature-ctl { flex:none; }
       .setcomposite-apply { display:flex; justify-content:flex-end; padding:var(--ha-space-2, 8px) var(--ha-space-4, 16px) 0; }
 
+      /* ------------------------------------------------- gslider primitive */
+      .gslider { -webkit-appearance:none; appearance:none; display:block; width:100%;
+                 height:32px; margin:0; background:transparent; touch-action:pan-y;
+                 /* Plain K sliders carry no gradient class, so the track needs a real default. */
+                 --gs-track:var(--divider-color, rgba(127,127,127,.35));
+                 cursor:pointer; }
+      .gslider::-webkit-slider-runnable-track { height:12px; border-radius:6px; background:var(--gs-track); }
+      .gslider::-moz-range-track { height:12px; border-radius:6px; background:var(--gs-track); }
+      .gslider::-webkit-slider-thumb { -webkit-appearance:none; width:22px; height:22px;
+                 margin-top:-5px; border-radius:50%; background:#fff;
+                 border:2px solid rgba(0,0,0,.16); box-shadow:0 1px 4px rgba(0,0,0,.4); }
+      .gslider::-moz-range-thumb { width:22px; height:22px; border-radius:50%; background:#fff;
+                 border:2px solid rgba(0,0,0,.16); box-shadow:0 1px 4px rgba(0,0,0,.4); }
+      .gslider:focus-visible::-webkit-slider-thumb, .gslider:focus-visible::-moz-range-thumb {
+                 outline:2px solid var(--primary-color); outline-offset:2px; }
+      .gslider.mini { width:132px; height:32px; }
+      .gslider.mini::-webkit-slider-runnable-track, .gslider.mini::-moz-range-track { height:8px; border-radius:4px; }
+      .gslider.mini::-webkit-slider-thumb { width:18px; height:18px; margin-top:-5px; }
+      .gslider.mini::-moz-range-thumb { width:18px; height:18px; }
+      /* Fixed tracks: the rainbow used by the light block's own hue slider,
+       * and the same rainbow with L's white cap at 254/255 (§4.7, §5.2). */
+      .gslider.hue360 { --gs-track:linear-gradient(to right, hsl(0,100%,50%), hsl(60,100%,50%) 16.7%,
+                 hsl(120,100%,50%) 33.3%, hsl(180,100%,50%) 50%, hsl(240,100%,50%) 66.7%,
+                 hsl(300,100%,50%) 83.3%, hsl(360,100%,50%)); }
+      .gslider.hue255 { --gs-track:linear-gradient(to right, hsl(0,100%,50%), hsl(60,100%,50%) 16.7%,
+                 hsl(120,100%,50%) 33.3%, hsl(180,100%,50%) 50%, hsl(240,100%,50%) 66.7%,
+                 hsl(300,100%,50%) 83.3%, hsl(358.6,100%,50%) 99.6%, #fff 99.6% 100%); }
+
+      /* ---------------------------------------------------- pchip and seg */
+      .pchip { display:inline-flex; align-items:center; gap:6px; min-height:32px;
+               padding:0 var(--ha-space-3, 12px); border-radius:var(--ha-border-radius-pill, 999px);
+               border:var(--ha-border-width,1px) solid var(--divider-color);
+               background:none; color:var(--primary-text-color);
+               font:inherit; font-size:var(--ha-font-size-s, 13px); cursor:pointer; }
+      .pchip[aria-pressed="true"], .pchip[aria-checked="true"] { background:var(--primary-color);
+               border-color:var(--primary-color); color:var(--text-primary-color); }
+      .pchip .dot { width:10px; height:10px; border-radius:50%; flex:none; border:1px solid rgba(0,0,0,.12); }
+      .pchips { display:flex; flex-wrap:wrap; gap:var(--ha-space-2, 8px); margin-top:var(--ha-space-2, 8px); }
+      .seg { display:flex; border:var(--ha-border-width,1px) solid var(--divider-color);
+             border-radius:var(--ha-border-radius-pill, 999px); padding:2px; gap:2px; }
+      .seg button { flex:1; min-height:32px; border:0; border-radius:inherit;
+             background:none; color:var(--secondary-text-color); font:inherit;
+             font-size:var(--ha-font-size-s, 13px); cursor:pointer; }
+      .seg button[aria-selected="true"] { background:var(--primary-color); color:var(--text-primary-color); }
+
+      /* ------------------------------------------------------- K, L, N, M */
+      .setk, .setn { display:flex; flex-direction:column; align-items:flex-end; gap:var(--ha-space-1, 4px); }
+      .setslidewrap { display:flex; align-items:center; gap:var(--ha-space-2, 8px); }
+      .setl { display:flex; align-items:center; gap:var(--ha-space-2, 8px); }
+      .setl input.fallback, .setl ha-textfield { width:64px; }
+      .setrow[data-editor="k"] .setrow-ctl, .setrow[data-editor="l"] .setrow-ctl,
+      .setrow[data-editor="n"] .setrow-ctl, .setrow[data-editor="m"] .setrow-ctl { width:100%; max-width:none; }
+      @media (max-width:600px) {
+        .setrow[data-editor="k"] .setrow-top, .setrow[data-editor="l"] .setrow-top,
+        .setrow[data-editor="n"] .setrow-top, .setrow[data-editor="m"] .setrow-top {
+          flex-direction:column; align-items:stretch; }
+      }
+      .cswatch { width:24px; height:24px; border-radius:6px; flex:none;
+                 border:1px solid var(--divider-color); display:inline-flex;
+                 align-items:center; justify-content:center; }
+      .cswatch-sync { background:var(--secondary-background-color); }
+      .cswatch-sync ha-svg-icon { width:16px; height:16px; color:var(--secondary-text-color); }
+      .cswatch-unknown { background:var(--secondary-background-color); border-style:dashed; }
+      .setfeature-slide { display:flex; align-items:center; gap:var(--ha-space-2, 8px); }
+      .setdur { display:flex; align-items:center; gap:var(--ha-space-2, 8px); flex-wrap:wrap; }
+      .setdur-meta { color:var(--secondary-text-color); font-size:var(--ha-font-size-s, 12px);
+                     font-variant-numeric:tabular-nums; margin-top:var(--ha-space-1, 4px); }
+
+      /* --------------------------------------------------- light block */
+      .lt-hero { display:flex; align-items:center; gap:var(--ha-space-3, 12px);
+                 padding:var(--ha-space-2, 8px) var(--ha-space-4, 16px); }
+      .lt-swatch { width:44px; height:44px; border-radius:50%; flex:none; }
+      .lt-info { flex:1; min-width:0; }
+      .lt-name { font-size:var(--ha-font-size-m, 14px); }
+      .lt-state { display:flex; align-items:center; gap:var(--ha-space-2, 8px);
+                  color:var(--secondary-text-color); font-size:var(--ha-font-size-s, 12px); }
+      .lt ha-control-switch { width:72px; height:36px; flex:none; }
+      .lt-row { padding:var(--ha-space-2, 8px) var(--ha-space-4, 16px); }
+      .lt-row:last-child { padding-bottom:var(--ha-space-3, 12px); }
+      .lt-cap { display:flex; align-items:center; justify-content:space-between;
+                color:var(--secondary-text-color); font-size:var(--ha-font-size-s, 13px);
+                padding-bottom:var(--ha-space-1, 4px); }
+      .lt-readout { font-variant-numeric:tabular-nums; }
+      .lt ha-control-slider { height:48px; width:100%; }
+      .lt-panel[hidden] { display:none; }
+      .lt-hex { display:flex; justify-content:flex-end; padding-top:var(--ha-space-1, 4px);
+                font-family:var(--ha-font-family-code, monospace); font-size:var(--ha-font-size-s, 12px); }
+      .lt-hex button.linklike { font-family:inherit; }
+      .lt-hexfield { width:96px; min-height:32px; font-family:var(--ha-font-family-code, monospace); text-align:right; }
+      .lt-err { padding:0 var(--ha-space-4, 16px) var(--ha-space-3, 12px);
+                color:var(--error-color); font-size:var(--ha-font-size-s, 13px); }
+      .lt-err[hidden] { display:none; }
+      .lt + .ctl, .ctl + .lt, .lt + .lt { border-top:1px solid var(--divider-color); }
+
       /* Viewport-proportional, not a fixed box: an interview emits dozens of lines
        * and the old 168px strip showed nine of them. height (not max-height)
        * claims the space immediately so the box does not jump around as lines
@@ -2246,6 +2722,164 @@ class Z2MPanel extends HTMLElement {
             : { entity_id: el.dataset.ctlbright, brightness_pct: Math.round(pct) });
       });
     });
+
+    // The light block (§4). Reads/writes the state mirror via z2m/device/set,
+    // never hass.callService -- see §4.2 for why.
+    r.querySelectorAll('[data-ltswitch]').forEach((el) => {
+      if (el._z2mLt) return;
+      el._z2mLt = true;
+      el.addEventListener('change', () => {
+        const [ieee, n] = el.dataset.ltswitch.split('|');
+        this._lightCommit(ieee, Number(n), { state: el.checked ? 'ON' : 'OFF' });
+      });
+    });
+    const lightPayload = (ieee, n, extra) => {
+      const d = this._dev(ieee);
+      const expose = d && this._lightExposes(d)[Number(n)];
+      const s = expose && this._lightState(d, expose);
+      return s && s.on === false ? { state: 'ON', ...extra } : extra;
+    };
+    r.querySelectorAll('[data-ltbar]').forEach((el) => {
+      if (el._z2mLt) return;
+      el._z2mLt = true;
+      const commit = (pct) => {
+        const [ieee, n] = el.dataset.ltbar.split('|');
+        const d = this._dev(ieee);
+        const expose = d && this._lightExposes(d)[Number(n)];
+        if (!expose) return;
+        if (pct <= 0) return void this._lightCommit(ieee, Number(n), { state: 'OFF' });
+        const brightF = this._lightFeature(expose, 'brightness');
+        const wire = pctToBrightness(pct, brightnessMax(brightF || {}));
+        this._lightCommit(ieee, Number(n), lightPayload(ieee, n, { brightness: wire }));
+      };
+      el.addEventListener('value-changed', (ev) => commit(Number((ev.detail || {}).value)));
+      el.onchange = () => commit(Number(el.value));
+    });
+    r.querySelectorAll('[data-ltbchip]').forEach((el) => {
+      el.onclick = () => {
+        const [ieee, n, wire] = el.dataset.ltbchip.split('|');
+        this._lightCommit(ieee, Number(n), lightPayload(ieee, n, { brightness: Number(wire) }));
+      };
+    });
+    r.querySelectorAll('[data-ltseg]').forEach((el) => {
+      el.onclick = () => {
+        const [ieee, n, which] = el.dataset.ltseg.split('|');
+        const r2 = this.shadowRoot;
+        const tPanel = r2.getElementById(`lt${n}-temppanel`);
+        const cPanel = r2.getElementById(`lt${n}-colorpanel`);
+        const seg = r2.getElementById(`lt${n}-seg`);
+        if (tPanel) tPanel.hidden = which !== 'temp';
+        if (cPanel) cPanel.hidden = which === 'temp';
+        if (seg) {
+          const btns = seg.querySelectorAll('[data-ltseg]');
+          btns.forEach((b) => b.setAttribute('aria-selected', String(b.dataset.ltseg.endsWith(which))));
+        }
+      };
+    });
+    r.querySelectorAll('[data-lttchip]').forEach((el) => {
+      el.onclick = () => {
+        const [ieee, n, mired] = el.dataset.lttchip.split('|');
+        this._lightCommit(ieee, Number(n), lightPayload(ieee, n, { color_temp: Number(mired) }));
+      };
+    });
+    r.querySelectorAll('[data-lthue]').forEach((el) => {
+      const stampHot = () => { el._z2mHot = Date.now(); };
+      el.onpointerdown = stampHot;
+      el.oninput = () => {
+        stampHot();
+        const [ieee, n] = el.dataset.lthue.split('|');
+        const sat = this.shadowRoot.getElementById(`lt${n}-sat`);
+        if (sat) sat.style.setProperty('--gs-track', `linear-gradient(to right, #fff, hsl(${el.value},100%,50%))`);
+      };
+      el.onchange = () => {
+        const [ieee, n] = el.dataset.lthue.split('|');
+        const sat = this.shadowRoot.getElementById(`lt${n}-sat`);
+        const satVal = sat ? Number(sat.value) : 100;
+        const d = this._dev(ieee);
+        const expose = d && this._lightExposes(d)[Number(n)];
+        if (!expose) return;
+        this._lightCommit(ieee, Number(n), lightPayload(ieee, n, this._lightColorPayload(expose, Number(el.value), satVal)));
+      };
+    });
+    r.querySelectorAll('[data-ltsat]').forEach((el) => {
+      const stampHot = () => { el._z2mHot = Date.now(); };
+      el.onpointerdown = stampHot;
+      el.oninput = stampHot;
+      el.onchange = () => {
+        const [ieee, n] = el.dataset.ltsat.split('|');
+        const hue = this.shadowRoot.getElementById(`lt${n}-hue`);
+        const hueVal = hue ? Number(hue.value) : 0;
+        const d = this._dev(ieee);
+        const expose = d && this._lightExposes(d)[Number(n)];
+        if (!expose) return;
+        this._lightCommit(ieee, Number(n), lightPayload(ieee, n, this._lightColorPayload(expose, hueVal, Number(el.value))));
+      };
+    });
+    // The hex readout (§4.7): tap swaps it for an inline field; Enter/blur
+    // commits through the same hue/saturation-or-xy write path the sliders
+    // use, Escape or an empty blur just restores the readout.
+    r.querySelectorAll('[data-lthexedit]').forEach((el) => {
+      el.onclick = () => {
+        const [ieee, n] = el.dataset.lthexedit.split('|');
+        this._lightSetHexEditing(ieee, Number(n), true);
+        const field = this.shadowRoot.getElementById(`lt${n}-hexfield`);
+        if (field) {
+          field.focus();
+          if (field.setSelectionRange) field.setSelectionRange(0, field.value.length);
+        }
+      };
+    });
+    r.querySelectorAll('[data-lthexcommit]').forEach((el) => {
+      const [ieee, n] = el.dataset.lthexcommit.split('|');
+      const cancel = () => this._lightSetHexEditing(ieee, Number(n), false);
+      const commit = () => {
+        const raw = el.value.trim();
+        if (raw === '') return cancel();
+        if (!/^#?[0-9a-f]{6}$/i.test(raw)) {
+          if (el.classList) el.classList.add('invalid');
+          this._lightShowError(Number(n), 'Use six hex digits, like #ff8800');
+          return;
+        }
+        if (el.classList) el.classList.remove('invalid');
+        this._lightClearError(Number(n));
+        const d = this._dev(ieee);
+        const expose = d && this._lightExposes(d)[Number(n)];
+        if (!expose) return cancel();
+        const rgb = hexToRgb(raw.startsWith('#') ? raw : `#${raw}`);
+        const hsv = rgbToHsv(rgb.r, rgb.g, rgb.b);
+        this._lightSetHexEditing(ieee, Number(n), false);
+        this._lightCommit(ieee, Number(n), lightPayload(ieee, n, this._lightColorPayload(expose, hsv.h, hsv.s * 100)));
+      };
+      el.onkeydown = (ev) => {
+        if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+        else if (ev.key === 'Escape') { ev.preventDefault(); cancel(); }
+      };
+      el.onblur = commit;
+    });
+    r.querySelectorAll('[data-lttemp]').forEach((el) => {
+      const stampHot = () => { el._z2mHot = Date.now(); };
+      el.onpointerdown = stampHot;
+      el.oninput = () => {
+        stampHot();
+        const [ieee, n] = el.dataset.lttemp.split('|');
+        const d = this._dev(ieee);
+        const expose = d && this._lightExposes(d)[Number(n)];
+        const tempF = expose && this._lightFeature(expose, 'color_temp');
+        if (!tempF) return;
+        const mired = tempPositionToMired(Number(el.value), tempF.value_min, tempF.value_max);
+        const readout = this.shadowRoot.getElementById(`lt${n}-tk`);
+        if (readout) readout.textContent = `${miredToKelvinDisplay(mired)} K`;
+      };
+      el.onchange = () => {
+        const [ieee, n] = el.dataset.lttemp.split('|');
+        const d = this._dev(ieee);
+        const expose = d && this._lightExposes(d)[Number(n)];
+        const tempF = expose && this._lightFeature(expose, 'color_temp');
+        if (!tempF) return;
+        const mired = tempPositionToMired(Number(el.value), tempF.value_min, tempF.value_max);
+        this._lightCommit(ieee, Number(n), lightPayload(ieee, n, { color_temp: mired }));
+      };
+    });
     r.querySelectorAll('[data-change]').forEach((el) => {
       el.onchange = () => this._change(el.dataset.change, el);
     });
@@ -2294,26 +2928,6 @@ class Z2MPanel extends HTMLElement {
         el.addEventListener('selected', commit);
       }
     });
-    r.querySelectorAll('[data-setpreset]').forEach((el) => {
-      const commit = () => {
-        const [ieee, key, domId] = el.dataset.setpreset.split('|');
-        const custom = r.getElementById(`setpresetcustom-${domId}`);
-        if (el.value === '__custom__') {
-          if (custom) custom.hidden = false;
-          return;
-        }
-        if (custom) custom.hidden = true;
-        const d = this._dev(ieee);
-        const entry = d && this._settingsFindEntry(d, key);
-        const presets = entry && entry.expose.presets;
-        if (presets && presets[Number(el.value)]) this._settingsCommit(ieee, entry, presets[Number(el.value)].value);
-      };
-      el.onchange = commit;
-      if (!el._z2mSetPreset) {
-        el._z2mSetPreset = true;
-        el.addEventListener('selected', commit);
-      }
-    });
     r.querySelectorAll('[data-setnum]').forEach((el) => {
       const [ieee, key] = el.dataset.setnum.split('|');
       const commit = () => this._settingsCommitNumber(ieee, key, el);
@@ -2355,6 +2969,72 @@ class Z2MPanel extends HTMLElement {
         const entry = d && this._settingsFindEntry(d, key);
         if (entry) this._settingsPaintCtl(ieee, entry);
       };
+    });
+    r.querySelectorAll('[data-gs]').forEach((el) => {
+      const stampHot = () => { el._z2mHot = Date.now(); };
+      el.onpointerdown = stampHot;
+      el.oninput = () => { stampHot(); this._gsliderInput(el); };
+      el.onchange = () => this._gsliderCommit(el);
+      el.onkeydown = (ev) => {
+        stampHot();
+        if (!ev || !/^Arrow/.test(ev.key)) return;
+        clearTimeout(el._z2mKeyTimer);
+        el._z2mKeyTimer = setTimeout(() => this._gsliderCommit(el), 400);
+      };
+    });
+    r.querySelectorAll('[data-setpresetchip]').forEach((el) => {
+      el.onclick = () => {
+        const [ieee, key, idx] = el.dataset.setpresetchip.split('|');
+        const d = this._dev(ieee);
+        const entry = d && this._settingsFindEntry(d, key);
+        const preset = entry && (entry.expose.presets || [])[Number(idx)];
+        if (preset) this._settingsCommit(ieee, entry, preset.value);
+      };
+    });
+    r.querySelectorAll('[data-setntemp]').forEach((el) => {
+      const [ieee, key] = el.dataset.setntemp.split('|');
+      const commit = () => this._settingsCommitNTemp(ieee, key, el);
+      el.onkeydown = (ev) => {
+        if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+        else if (ev.key === 'Escape') { ev.preventDefault(); el.value = el.dataset.value; }
+      };
+      el.onblur = commit;
+    });
+    r.querySelectorAll('[data-setdurval]').forEach((el) => {
+      const [ieee, key] = el.dataset.setdurval.split('|');
+      const commit = () => this._settingsCommitDuration(ieee, key, el);
+      el.onkeydown = (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); commit(); } };
+      el.onblur = commit;
+    });
+    r.querySelectorAll('[data-setdurunit]').forEach((el) => {
+      el.onclick = () => {
+        const [ieee, key, unit] = el.dataset.setdurunit.split('|');
+        this._settingsDurationSetUnit(ieee, key, unit);
+      };
+    });
+    r.querySelectorAll('[data-setfeatchip]').forEach((el) => {
+      el.onclick = () => {
+        const [ieee, key, prop, val] = el.dataset.setfeatchip.split('|');
+        const store = (this._settingsDraft[ieee] = this._settingsDraft[ieee] || {});
+        (store[key] = store[key] || {})[prop] = val;
+        this._settingsRepaintFeature(ieee, key, prop);
+      };
+    });
+    r.querySelectorAll('[data-setfeatdurval]').forEach((el) => {
+      el.onchange = () => {
+        const [ieee, key, prop] = el.dataset.setfeatdurval.split('|');
+        this._settingsFeatureDurationSetVal(ieee, key, prop, el);
+      };
+    });
+    r.querySelectorAll('[data-setfeatdurunit]').forEach((el) => {
+      el.onclick = () => {
+        const [ieee, key, prop, unit] = el.dataset.setfeatdurunit.split('|');
+        this._settingsFeatureDurationSetUnit(ieee, key, prop, unit);
+      };
+    });
+    r.querySelectorAll('[data-setfeatslider]').forEach((el) => {
+      el.onpointerdown = () => { el._z2mHot = Date.now(); };
+      el.oninput = () => { el._z2mHot = Date.now(); };
     });
     r.querySelectorAll('[data-setlistdel]').forEach((el) => {
       el.onclick = () => {
@@ -2552,23 +3232,46 @@ class Z2MPanel extends HTMLElement {
   }
 
   _go(view) {
+    this._navigate(view, true);
+  }
+
+  /**
+   * Every panel-internal navigation funnels through here. `push` is false
+   * only when the URL already says this -- Home Assistant's `route` setter or
+   * a native `popstate` -- so the two never fight over the same history
+   * entry (§ routing).
+   */
+  _navigate(view, push) {
     this._leave();
     this._view = view;
     this._filter = '';
     this._filterCaret = null;
     this._setFilter = '';
     this._setFilterCaret = null;
+    if (push) this._pushRoute(view);
     this._render();
     this.shadowRoot.scrollTop = 0;
   }
+
+  /** Pushes a real history entry for `view`, so the browser's own Back walks
+   * panel views one at a time instead of leaving the panel on the first press. */
+  _pushRoute(view) {
+    if (typeof history === 'undefined' || !history.pushState) return;
+    const path = this._routePath(view);
+    history.pushState(null, '', `/z2m${path ? `/${path}` : ''}`);
+  }
+
 
   /** Tear down whatever the view being left had running. */
   _leave() {
     if (this._view.name === 'logs') this._unsub('logs');
     if (this._view.name === 'device') this._unsub('devstate');
-    // The dialog floats above whatever view is beneath it, and navigating out from
-    // under it would leave the network open with nothing on screen saying so.
-    if (this._pairing.open) this._closePairDialog();
+    // The dialog floats above whatever view is beneath it, and navigating out
+    // from under it would leave the network open with nothing on screen
+    // saying so. `_navigate` is about to push (or already answered) its own
+    // history entry for wherever this is going, so the dialog's own '#pair'
+    // entry is not this close's to pop -- see _closePairDialog.
+    if (this._pairing.open) this._closePairDialog(true);
     if (this._view.name === 'map') {
       this._unsub('map');
       this._unsub('scan');
@@ -2616,7 +3319,16 @@ class Z2MPanel extends HTMLElement {
       if (d && !this._subs.devstate) {
         this._sub('devstate', { type: 'z2m/device/state/subscribe', device: d.ieee_address }, (ev) =>
           this._onDeviceState(d.ieee_address, ev)
-        );
+        )
+          .then(() => {
+            if (!this._deviceStateError[d.ieee_address]) return;
+            delete this._deviceStateError[d.ieee_address];
+            this._render();
+          })
+          .catch((err) => {
+            this._deviceStateError[d.ieee_address] = this._feedMessage(err, 'Could not read live values');
+            this._render();
+          });
       }
       this._readValues = this._readValues || {};
       if (d && d.availability !== 'offline' && d.power_source === 'Mains (single phase)'
@@ -3010,7 +3722,7 @@ class Z2MPanel extends HTMLElement {
              window. Controls will queue or fail until it is heard again.
            </ha-alert>`
         : ''
-    }${feed}${this._controlsCard(live)}${this._sensorsCard(live)}${this._settingsCard(
+    }${feed}${this._controlsCard(d, live)}${this._sensorsCard(live)}${this._settingsCard(
       d
     )}<ha-card class="nav-card"><div id="fwbox">${this._fwInner(
       d
@@ -3154,14 +3866,46 @@ class Z2MPanel extends HTMLElement {
     return chips.join('');
   }
 
-  _controlsCard(live) {
-    if (!live.controls.length) return '';
-    const rows = live.controls.map((item) => this._controlRow(item)).join('');
+  _controlsCard(d, live) {
+    // Light rows are replaced by the light block (§4) when the state feed is
+    // up; every other row, and light itself when the feed is down, keeps the
+    // entity-driven row unchanged (§2.7/§4.10's degraded path). A light
+    // expose renders its block even with no HA entity paired yet -- MQTT
+    // discovery can lag the Zigbee2MQTT inventory this page already has.
+    const lightExposes = this._lightExposes(d);
+    const lightEntities = live.controls.filter((item) => item.domain === 'light');
+    const feedUp = !this._deviceStateError[d.ieee_address];
+    if (!live.controls.length && !(feedUp && lightExposes.length)) return '';
+    const seen = new Set();
+    const rows = live.controls
+      .map((item) => {
+        if (item.domain !== 'light' || !feedUp) return this._controlRow(item);
+        const n = lightEntities.indexOf(item);
+        const expose = lightExposes[n];
+        if (!expose) return this._controlRow(item);
+        seen.add(n);
+        return `<div class="lt" id="lt${n}" data-lt="${n}">${this._lightBlockHtml(d, expose, n, item)}</div>`;
+      })
+      .join('');
+    const extra = feedUp
+      ? lightExposes
+          .map((expose, n) => (seen.has(n) ? '' : `<div class="lt" id="lt${n}" data-lt="${n}">${this._lightBlockHtml(d, expose, n, this._lightFallbackEntity(d))}</div>`))
+          .join('')
+      : '';
+    const alert = !feedUp
+      ? `<ha-alert alert-type="warning">Live values are unavailable, so lights fall back to Home Assistant's own controls.</ha-alert>`
+      : '';
     return `<ha-card class="nav-card">
         <div class="card-header">Controls${live.refreshBtn
           ? `<span class="header-actions">${live.refreshBtn}</span>` : ''}</div>
-        <div class="card-content">${rows}</div>
+        <div class="card-content">${alert}${rows}${extra}</div>
       </ha-card>`;
+  }
+
+  /** A stand-in entity item for `_entityName`, when a light expose has no
+   * paired HA entity yet (MQTT discovery lag, or a headless test fixture). */
+  _lightFallbackEntity(d) {
+    return { eid: null, domain: 'light', st: { attributes: { friendly_name: d.friendly_name } } };
   }
 
   /**
@@ -3222,6 +3966,312 @@ class Z2MPanel extends HTMLElement {
           <ha-button appearance="filled" size="s" data-svc="${domain}.${open}|${esc(item.eid)}">Open</ha-button>
         </span>
       </div>`;
+  }
+
+  /* --------------------------------------------------------- light block */
+
+  _lightExposes(d) {
+    return (d.exposes || []).filter((e) => e && e.type === 'light');
+  }
+
+  _lightFeature(expose, name) {
+    return (expose.features || []).find((f) => f && f.name === name);
+  }
+
+  /** Composed light state (§4.2), read from the same state mirror Settings
+   * uses -- one subscription, two consumers (`_syncSettings`, `_syncLight`). */
+  _lightState(d, expose) {
+    const raw = this._settingsState[d.ieee_address] || {};
+    const stateF = this._lightFeature(expose, 'state');
+    const brightF = this._lightFeature(expose, 'brightness');
+    const tempF = this._lightFeature(expose, 'color_temp');
+    const hsF = this._lightFeature(expose, 'color_hs');
+    const xyF = this._lightFeature(expose, 'color_xy');
+    const hasStateVal = !!stateF && Object.prototype.hasOwnProperty.call(raw, stateF.property);
+    const on = hasStateVal ? raw[stateF.property] === (stateF.value_on === undefined ? true : stateF.value_on) : null;
+    const briKnown = !!brightF && Object.prototype.hasOwnProperty.call(raw, brightF.property);
+    const briMax = brightnessMax(brightF || {});
+    const briWire = briKnown ? Number(raw[brightF.property]) : null;
+    const pct = briKnown ? brightnessToPct(briWire, briMax) : null;
+    const tempKnown = !!tempF && Object.prototype.hasOwnProperty.call(raw, tempF.property);
+    const mired = tempKnown ? Number(raw[tempF.property]) : null;
+    const color = raw.color || {};
+    const rawHue = typeof color.hue === 'number' ? color.hue : null;
+    const rawSat = typeof color.saturation === 'number' ? color.saturation : null;
+    const x = typeof color.x === 'number' ? color.x : null;
+    const y = typeof color.y === 'number' ? color.y : null;
+    const rawMode = raw.color_mode;
+    const inTemp = rawMode === 'color_temp' || (!rawMode && tempKnown && rawHue === null && x === null);
+    // Display hue/saturation: the bulb's own hs state when it has one,
+    // otherwise derived from xy (rgbToHsv(xyToRgb(x,y))) so an xy-only bulb
+    // (no color_hs feature at all) still drives the color panel's thumbs
+    // and the state line's hue name (§4.2 amendment for xy-only fixtures).
+    let hue = rawHue;
+    let sat = rawSat;
+    if (hue === null && sat === null && x !== null && y !== null) {
+      const rgb = xyToRgb(x, y);
+      const hsv = rgbToHsv(rgb.r, rgb.g, rgb.b);
+      hue = hsv.h;
+      sat = hsv.s * 100;
+    }
+    let hex = null;
+    if (inTemp && tempKnown) hex = swatchHex(1e6 / mired);
+    else if (hue !== null && sat !== null) hex = hsToHex(hue, sat);
+    return {
+      known: hasStateVal || briKnown || tempKnown || hue !== null || x !== null,
+      on,
+      pct,
+      briWire,
+      briMax,
+      colorMode: inTemp ? 'color_temp' : rawHue !== null ? 'hs' : x !== null ? 'xy' : null,
+      mired,
+      hue,
+      sat,
+      x,
+      y,
+      hex,
+      hasTemp: !!tempF,
+      hasColor: !!(hsF || xyF),
+      hasHs: !!hsF,
+      hasXy: !!xyF,
+      hasBright: !!brightF,
+      tempF,
+      brightF,
+      stateF,
+    };
+  }
+
+  _lightAlphaRgb(hex, alpha) {
+    const c = hexToRgb(hex);
+    return `rgba(${c.r},${c.g},${c.b},${alpha})`;
+  }
+
+  /** The one write shape for any hue/saturation the operator picked --
+   * slider, chip, or the hex field: `{color:{hue,saturation}}` when the
+   * bulb exposes color_hs, else converted to `{color:{x,y}}` for an xy-only
+   * bulb, so the echo the write lifecycle compares against is in the same
+   * shape the device itself reports (never a phantom "Device set"). */
+  _lightColorPayload(expose, hue, sat) {
+    if (this._lightFeature(expose, 'color_hs')) return { color: { hue, saturation: sat } };
+    const xy = hsToXy(hue, sat);
+    return { color: { x: xy.x, y: xy.y } };
+  }
+
+  _lightHexEditing(ieee, n) {
+    return !!(((this._lightUI[ieee] || {})[n] || {}).editingHex);
+  }
+
+  _lightSetHexEditing(ieee, n, editing) {
+    this._lightUI[ieee] = this._lightUI[ieee] || {};
+    this._lightUI[ieee][n] = this._lightUI[ieee][n] || {};
+    this._lightUI[ieee][n].editingHex = editing;
+    this._paintLightHex(ieee, n);
+  }
+
+  /** The hex readout (§4.7): a plain button, or -- tapped -- a 96px field
+   * prefilled without the leading #, matching the brightness/kelvin
+   * readouts' own tap-to-edit affordance. */
+  _lightHexWrapHtml(ieee, n, s) {
+    if (this._lightHexEditing(ieee, n)) {
+      const val = (s.hex || '').replace(/^#/, '');
+      return `<input type="text" class="fallback lt-hexfield" id="lt${n}-hexfield"
+          data-lthexcommit="${esc(ieee)}|${n}" value="${esc(val)}" maxlength="6" placeholder="rrggbb">`;
+    }
+    return `<button type="button" class="linklike" id="lt${n}-hex" data-lthexedit="${esc(ieee)}|${n}">${
+      s.hex || '\u2014'
+    }</button>`;
+  }
+
+  /** Repaints only the hex wrap -- entering/leaving edit mode is a UI-local
+   * toggle, not a value the device echoed, so it does not wait for _syncLight. */
+  _paintLightHex(ieee, n) {
+    const r = this.shadowRoot;
+    const wrap = r && r.getElementById(`lt${n}-hexwrap`);
+    const d = this._dev(ieee);
+    const expose = d && this._lightExposes(d)[n];
+    if (!wrap || !expose) return;
+    wrap.innerHTML = this._lightHexWrapHtml(ieee, n, this._lightState(d, expose));
+    this._wire(wrap);
+  }
+
+  _lightShowError(n, message) {
+    const err = this.shadowRoot && this.shadowRoot.getElementById(`lt${n}-err`);
+    if (!err) return;
+    err.hidden = false;
+    err.textContent = message;
+  }
+
+  _lightClearError(n) {
+    const err = this.shadowRoot && this.shadowRoot.getElementById(`lt${n}-err`);
+    if (!err) return;
+    err.hidden = true;
+    err.textContent = '';
+  }
+
+  /** The block's one lifecycle chip (§4.3/§4.9): pending stays silent for
+   * the first 400ms (`write.slow` flips once that timer fires). */
+  _lightChipHtml(write) {
+    if (!write || !write.phase) return '';
+    if (write.phase === 'pending') return write.slow ? 'Sending\u2026' : '';
+    if (write.phase === 'adjusted') return `Device set ${esc(write.message || '')}`;
+    const spec = SETTINGS_CHIP[write.phase];
+    return spec ? spec[0] : '';
+  }
+
+  /** The curated temperature chips (§4.6), snapped to the device's own
+   * bounds when within 5 mired and hidden entirely outside them. */
+  _lightTempChipsHtml(ieee, n, s) {
+    const min = s.tempF.value_min;
+    const max = s.tempF.value_max;
+    return TEMP_CHIPS.map((c) => {
+      let mired = kelvinToMired(c.kelvin);
+      if (Math.abs(mired - min) <= 5) mired = min;
+      if (Math.abs(mired - max) <= 5) mired = max;
+      if (mired < min || mired > max) return '';
+      const active = s.mired !== null && Math.abs(s.mired - mired) <= 5;
+      return `<button type="button" class="pchip" aria-pressed="${active}"
+          data-lttchip="${esc(ieee)}|${n}|${mired}"><span class="dot" style="background:${c.dot}"></span>${
+        c.name
+      }</button>`;
+    }).join('');
+  }
+
+  /**
+   * The light block (§4): one per light expose, replacing that entity's row.
+   * Current values are safe to bake into this string -- like every Settings
+   * control, it is diffed by `_syncLight` against its own per-block memo,
+   * never against the page-level `_markup` `_render()` compares.
+   */
+  _lightBlockHtml(d, expose, n, entity) {
+    const ieee = d.ieee_address;
+    const s = this._lightState(d, expose);
+    const name = esc(this._entityName(entity));
+    const write = (this._lightWrite[ieee] || {})[n] || {};
+    const dis = d.disabled ? ' disabled' : '';
+
+    let swatchStyle;
+    let swatchClass = 'lt-swatch';
+    if (!s.known) {
+      swatchStyle = 'background:var(--secondary-background-color);border:1px dashed var(--divider-color)';
+    } else if (s.on === false) {
+      swatchStyle = s.hex ? `background:${s.hex};opacity:.35;border:1px solid var(--divider-color)` : 'opacity:.35';
+    } else if (s.hex) {
+      const a = 0.15 + 0.4 * ((s.pct || 0) / 100);
+      swatchStyle = `background:${s.hex};box-shadow:0 0 16px 2px ${this._lightAlphaRgb(s.hex, a)}`;
+    } else {
+      swatchStyle = 'background:#ffa757';
+    }
+
+    let stateText;
+    if (!s.known) stateText = '\u2014';
+    else if (s.on === false) stateText = 'Off';
+    else {
+      const bits = ['On'];
+      if (s.pct !== null) bits.push(`${s.pct}%`);
+      if (s.colorMode === 'color_temp' && s.mired !== null) bits.push(`${miredToKelvinDisplay(s.mired)} K`);
+      else if (s.hue !== null && s.sat !== null) bits.push(hueName(s.hue, s.sat));
+      stateText = bits.join(' \u00b7 ');
+    }
+    const chip = this._lightChipHtml(write);
+
+    const switchHtml = this._has('ha-control-switch')
+      ? `<ha-control-switch id="lt${n}-switch" data-ltswitch="${esc(ieee)}|${n}"${s.on ? ' checked' : ''}${dis}></ha-control-switch>`
+      : `<input type="checkbox" class="fallback-check" id="lt${n}-switch" data-ltswitch="${esc(
+          ieee
+        )}|${n}"${s.on ? ' checked' : ''}${dis}>`;
+
+    let brightHtml = '';
+    if (s.hasBright) {
+      const pct = s.pct === null ? 0 : s.pct;
+      const ghost = s.on === false;
+      const tint = s.hex ? (ghost ? this._lightAlphaRgb(s.hex, 0.35) : s.hex) : 'var(--primary-color)';
+      const barHtml = this._has('ha-control-slider')
+        ? `<ha-control-slider id="lt${n}-bar" data-ltbar="${esc(
+            ieee
+          )}|${n}" min="0" max="100" step="1" value="${pct}" style="--control-slider-color:${tint}"${dis}></ha-control-slider>`
+        : `<input type="range" class="gslider" id="lt${n}-bar" data-ltbar="${esc(
+            ieee
+          )}|${n}" min="0" max="100" step="1" value="${pct}"
+              style="--gs-track:linear-gradient(to right, ${tint} 0 ${pct}%, var(--divider-color) ${pct}% 100%)"${dis}>`;
+      const chips = BRIGHTNESS_CHIPS.map((c) => {
+        const wire = pctToBrightness(c, s.briMax);
+        const active = s.pct !== null && s.pct === c;
+        return `<button type="button" class="pchip" aria-pressed="${active}" data-ltbchip="${esc(
+          ieee
+        )}|${n}|${wire}">${c}%</button>`;
+      }).join('');
+      brightHtml = `<div class="lt-row">
+          <div class="lt-cap">Brightness<span class="lt-readout" id="lt${n}-barpct">${
+        s.pct === null ? '\u2014' : `${s.pct}%`
+      }</span></div>
+          ${barHtml}
+          <div class="pchips" id="lt${n}-bchips">${chips}</div>
+        </div>`;
+    }
+
+    const hasSeg = s.hasTemp && s.hasColor;
+    const showTemp = s.hasTemp && !(hasSeg && (s.colorMode === 'hs' || s.colorMode === 'xy'));
+    let segHtml = '';
+    if (hasSeg) {
+      segHtml = `<div class="lt-row"><div class="seg" id="lt${n}-seg" role="tablist">
+          <button type="button" role="tab" aria-selected="${showTemp}" data-ltseg="${esc(
+        ieee
+      )}|${n}|temp">Temperature</button>
+          <button type="button" role="tab" aria-selected="${!showTemp}" data-ltseg="${esc(
+        ieee
+      )}|${n}|color">Color</button>
+        </div></div>`;
+    }
+
+    let tempHtml = '';
+    if (s.hasTemp) {
+      const min = s.tempF.value_min;
+      const max = s.tempF.value_max;
+      const pos = s.mired !== null ? miredToTempPosition(s.mired, min, max) : 500;
+      const label = hasSeg ? '' : '<span>Temperature</span>';
+      tempHtml = `<div class="lt-row lt-panel" id="lt${n}-temppanel"${showTemp ? '' : ' hidden'}>
+          <div class="lt-cap">${label}<span class="lt-readout" id="lt${n}-tk">${
+        s.mired !== null ? `${miredToKelvinDisplay(s.mired)} K` : '\u2014'
+      }</span></div>
+          <input type="range" class="gslider" id="lt${n}-temp" data-lttemp="${esc(
+        ieee
+      )}|${n}" min="0" max="1000" step="1"
+              value="${pos}" style="--gs-track:${this._tempTrackCss(min, max)}" aria-label="Color temperature"${dis}>
+          <div class="pchips" id="lt${n}-tchips">${this._lightTempChipsHtml(ieee, n, s)}</div>
+        </div>`;
+    }
+
+    let colorHtml = '';
+    if (s.hasColor) {
+      const hue = s.hue !== null ? s.hue : 30;
+      const sat = s.sat !== null ? s.sat : 100;
+      colorHtml = `<div class="lt-row lt-panel" id="lt${n}-colorpanel"${showTemp ? ' hidden' : ''}>
+          <div class="lt-cap"><span>Hue</span></div>
+          <input type="range" class="gslider hue360" id="lt${n}-hue" data-lthue="${esc(
+        ieee
+      )}|${n}" min="0" max="360" step="1" value="${hue}" aria-label="Hue"${dis}>
+          <div class="lt-cap" style="margin-top:var(--ha-space-2, 8px)"><span>Saturation</span></div>
+          <input type="range" class="gslider" id="lt${n}-sat" data-ltsat="${esc(
+        ieee
+      )}|${n}" min="0" max="100" step="1" value="${sat}"
+              style="--gs-track:linear-gradient(to right, #fff, hsl(${hue},100%,50%))" aria-label="Saturation"${dis}>
+          <div class="lt-hex" id="lt${n}-hexwrap">${this._lightHexWrapHtml(ieee, n, s)}</div>
+        </div>`;
+    }
+
+    const errHtml = write.message && write.phase === 'failed' ? esc(write.message) : '';
+    return `<div class="lt-hero">
+          <div class="${swatchClass}" id="lt${n}-swatch" style="${swatchStyle}" aria-hidden="true"></div>
+          <div class="lt-info">
+            <div class="lt-name">${name}</div>
+            <div class="lt-state"><span id="lt${n}-state">${esc(stateText)}</span><span class="chip" id="lt${n}-chip"${
+      chip ? '' : ' hidden'
+    }>${esc(chip)}</span></div>
+          </div>
+          ${switchHtml}
+        </div>
+        ${brightHtml}${segHtml}${tempHtml}${colorHtml}
+        <div class="lt-err" id="lt${n}-err"${errHtml ? '' : ' hidden'}>${errHtml}</div>`;
   }
 
   _sensorsCard(live) {
@@ -3381,31 +4431,20 @@ class Z2MPanel extends HTMLElement {
     const diagnostic = [];
     const options = [];
     (d.exposes || []).forEach((e) => {
-      if (!e || SETTINGS_CONTROL_TYPES.has(e.type)) return; // a Controls-card entity owns this
-      if (!(e.access & 2)) return; // not settable: Readings owns it, not Settings
-      const entry = {
-        source: 'expose',
-        expose: e,
-        prop: e.property,
-        key: `expose:${e.property}`,
-        label: deCamel(e.label || e.name || e.property || ''),
-        description: e.description || '',
-      };
-      if (e.type === 'enum' && Array.isArray(e.values) && e.values.length === 1) {
-        entry.isAction = true;
-        actions.push(entry);
+      if (!e) return;
+      if (e.type === 'light') {
+        // §2.1 amendment: only the control feature set is excluded; every
+        // other feature of a light composite (color_temp_startup and
+        // friends) is classified normally, one level up -- the light block
+        // (§4) is what owns state/brightness/color_temp/color_xy/color_hs.
+        (e.features || []).forEach((f) => {
+          if (!f || LIGHT_CONTROL_FEATURES.has(f.name)) return;
+          this._settingsClassifyOne(f, actions, main, diagnostic);
+        });
         return;
       }
-      if (e.category === 'diagnostic') {
-        diagnostic.push(entry);
-        return;
-      }
-      if (e.type === 'composite') {
-        entry.features = (e.features || [])
-          .filter((f) => f && f.property && (f.access & 2))
-          .map((f) => ({ expose: f, prop: f.property, label: deCamel(f.label || f.name || f.property || '') }));
-      }
-      main.push(entry);
+      if (SETTINGS_CONTROL_TYPES.has(e.type)) return; // a Controls-card entity owns this
+      this._settingsClassifyOne(e, actions, main, diagnostic);
     });
     (d.options || []).forEach((o) => {
       if (!o || !o.property || o.property === 'friendly_name') return; // Rename owns this one
@@ -3419,6 +4458,61 @@ class Z2MPanel extends HTMLElement {
       });
     });
     return { actions, main, diagnostic, options };
+  }
+
+  /** One expose (or light feature) sorted into where §3.2 puts it. Shared by
+   * the top-level exposes[] walk and the light composite's narrowed walk. */
+  _settingsClassifyOne(e, actions, main, diagnostic) {
+    if (!(e.access & 2)) return; // not settable: Readings owns it, not Settings
+    const entry = {
+      source: 'expose',
+      expose: e,
+      prop: e.property,
+      key: `expose:${e.property}`,
+      label: deCamel(e.label || e.name || e.property || ''),
+      description: e.description || '',
+    };
+    if (e.type === 'enum' && Array.isArray(e.values) && e.values.length === 1) {
+      entry.isAction = true;
+      actions.push(entry);
+      return;
+    }
+    if (e.category === 'diagnostic') {
+      diagnostic.push(entry);
+      return;
+    }
+    if (e.type === 'numeric') entry.editor = this._numericEditorKind(e);
+    if (e.type === 'composite') {
+      entry.features = (e.features || [])
+        .filter((f) => f && f.property && (f.access & 2))
+        .map((f) => ({
+          expose: f,
+          prop: f.property,
+          label: deCamel(f.label || f.name || f.property || ''),
+          editor: f.type === 'numeric' ? this._numericEditorKind(f) : undefined,
+        }));
+    }
+    main.push(entry);
+  }
+
+  /**
+   * Settings editor matrix v2 (§5): which editor a numeric expose gets,
+   * checked in this fixed order. M and N read the expose's own units/name;
+   * L is a value-shape predicate (0-255, "color" in the name); K is anything
+   * else with a track-worthy number of positions; everything left is F.
+   */
+  _numericEditorKind(e) {
+    if (!e || e.type !== 'numeric') return 'F';
+    if (e.name === 'duration' && e.value_max === 255 && /minutes calculated/i.test(e.description || '')) {
+      return 'M';
+    }
+    if (e.unit === 'mired') return 'N';
+    if (e.value_min === 0 && e.value_max === 255 && /color/i.test(e.name || '')) return 'L';
+    if (e.value_min !== undefined && e.value_max !== undefined) {
+      const positions = (e.value_max - e.value_min) / (e.value_step || 1);
+      if (positions >= 5 && positions <= 1000) return 'K';
+    }
+    return 'F';
   }
 
   /** Every classified entry, flattened, for the write-commit handlers to look one up by key. */
@@ -3525,7 +4619,13 @@ class Z2MPanel extends HTMLElement {
   _settingsMetaHtml(d, entry) {
     const e = entry.expose;
     const parts = [];
-    if (e.type === 'numeric' && e.value_min !== undefined && e.value_max !== undefined) {
+    if (e.type === 'numeric' && entry.editor === 'N' && e.value_min !== undefined && e.value_max !== undefined) {
+      parts.push(`${miredToKelvinDisplay(e.value_max)}-${miredToKelvinDisplay(e.value_min)} K`);
+    } else if (e.type === 'numeric' && entry.editor === 'L') {
+      const { known, value } = this._settingsValue(d, entry);
+      const name = known ? this._settingsLName(e, entry.description, value) : '';
+      parts.push(name ? `0-255 \u00b7 ${name}` : '0-255');
+    } else if (e.type === 'numeric' && e.value_min !== undefined && e.value_max !== undefined) {
       parts.push(`${e.value_min}-${e.value_max}`);
     }
     const chip = this._settingsChipHtml(d, entry);
@@ -3548,7 +4648,7 @@ class Z2MPanel extends HTMLElement {
       case 'enum':
         return this._settingsEnumHtml(ctx);
       case 'numeric':
-        return entry.expose.presets ? this._settingsPresetHtml(ctx) : this._settingsNumericHtml(ctx);
+        return this._settingsNumericDispatch(ctx);
       case 'list':
         return this._settingsListHtml(ctx);
       default:
@@ -3607,7 +4707,14 @@ class Z2MPanel extends HTMLElement {
     const max = e.value_max !== undefined ? ` max="${esc(e.value_max)}"` : '';
     const step = e.value_step !== undefined ? esc(e.value_step) : 'any';
     const val = known ? esc(String(value)) : '';
-    const placeholder = entry.source === 'option' && !known ? ' placeholder="Z2M default"' : '';
+    // K/N park an out-of-range known value (§5.1's 65535 "previous" case) by
+    // asking this box to render empty with the matching preset's name in
+    // place of the usual "Z2M default" placeholder.
+    const placeholder = ctx.presetPlaceholder
+      ? ` placeholder="${esc(ctx.presetPlaceholder)}"`
+      : entry.source === 'option' && !known
+        ? ' placeholder="Z2M default"'
+        : '';
     const tag = `data-setrow="${id}" data-setnum="${esc(ieee)}|${esc(entry.key)}" data-value="${val}"${min}${max} step="${step}"${
       disabled ? ' disabled' : ''
     }${placeholder}`;
@@ -3618,7 +4725,9 @@ class Z2MPanel extends HTMLElement {
         }</span>`;
   }
 
-  /** H: free text, same commit rule as F. */
+  /** H: free text, same commit rule as F. §2.5 amendment: a description that
+   * mentions "hex" (the Hue `effect_color`) grows a 24px live swatch, tinted
+   * when the field currently parses as #RRGGBB, neutral otherwise. */
   _settingsTextHtml(ctx) {
     const { entry, known, value, disabled, ieee, id } = ctx;
     const val = known ? esc(String(value)) : '';
@@ -3626,31 +4735,221 @@ class Z2MPanel extends HTMLElement {
     const tag = `data-setrow="${id}" data-settext="${esc(ieee)}|${esc(entry.key)}" data-value="${val}"${
       disabled ? ' disabled' : ''
     }${placeholder}`;
-    return this._has('ha-textfield') ? `<ha-textfield type="text" ${tag}></ha-textfield>` : `<input type="text" class="fallback" ${tag}>`;
+    const field = this._has('ha-textfield')
+      ? `<ha-textfield type="text" ${tag}></ha-textfield>`
+      : `<input type="text" class="fallback" ${tag}>`;
+    if (!/hex/i.test(entry.description || '')) return field;
+    const hex = known && /^#?[0-9a-f]{6}$/i.test(String(value)) ? this._hexNormalize(String(value)) : null;
+    return `<span class="setl"><span class="cswatch" id="settextswatch-${id}" style="background:${
+      hex || 'var(--secondary-background-color)'
+    }"></span>${field}</span>`;
   }
 
-  /** E: a preset select plus final "Custom…", revealing an F-style field for anything else. */
-  _settingsPresetHtml(ctx) {
+  _hexNormalize(s) {
+    return s.startsWith('#') ? s : `#${s}`;
+  }
+
+  /** Numeric dispatch (§5): `entry.editor`, computed once at classify time,
+   * picks M, N, L, K, or the F fallback -- exactly the fixed order §5's
+   * table runs in, without re-deriving it here. */
+  _settingsNumericDispatch(ctx) {
+    switch (ctx.entry.editor) {
+      case 'M':
+        return this._settingsMHtml(ctx);
+      case 'N':
+        return this._settingsNHtml(ctx);
+      case 'L':
+        return this._settingsLHtml(ctx);
+      case 'K':
+        return this._settingsKHtml(ctx);
+      default:
+        return this._settingsNumericHtml(ctx);
+    }
+  }
+
+  /** K/N's preset row (§5.1): sentence-cased names, description as title,
+   * exact-match active state, tap commits that value. */
+  _settingsPresetChipsHtml(ieee, entry, presets, value) {
+    const chips = presets
+      .map((p, i) => {
+        const active = value !== undefined && this._settingsValuesEqual(entry.expose, p.value, value);
+        return `<button type="button" class="pchip" aria-pressed="${active}" title="${esc(
+          p.description || ''
+        )}" data-setpresetchip="${esc(ieee)}|${esc(entry.key)}|${i}">${esc(sentenceCase(p.name))}</button>`;
+      })
+      .join('');
+    return `<div class="pchips">${chips}</div>`;
+  }
+
+  /** The warm-left, mired-linear temperature track (§4.6), shared by the
+   * light block's own temperature slider and every N editor: 9 stops across
+   * the given mired bounds, painted from `trackRGB`. */
+  _tempTrackCss(min, max) {
+    const stops = [];
+    for (let i = 0; i <= 8; i += 1) {
+      const mired = tempPositionToMired(i * 125, min, max);
+      const rgb = trackRGB(1e6 / mired);
+      stops.push(`${rgbToHex(rgb.r, rgb.g, rgb.b)} ${i * 12.5}%`);
+    }
+    return `linear-gradient(to right, ${stops.join(', ')})`;
+  }
+
+  /**
+   * Editor K, exact (§5.1): `.gslider.mini` with a theme-tokened two-stop
+   * fill, the F number box, and preset chips when the expose has any. An
+   * unknown value hides the slider outright rather than fabricate a thumb
+   * position (this rule -- and the out-of-range park below -- is shared with
+   * L and N).
+   */
+  _settingsKHtml(ctx) {
     const { entry, known, value, disabled, ieee, id } = ctx;
     const e = entry.expose;
-    const presets = e.presets || [];
-    const matchIdx = known ? presets.findIndex((p) => this._settingsValuesEqual(e, p.value, value)) : -1;
-    const custom = known && matchIdx === -1;
-    const selected = custom ? '__custom__' : matchIdx >= 0 ? String(matchIdx) : '';
     const dis = disabled ? ' disabled' : '';
-    const items = presets.map((p, i) => `<ha-list-item value="${i}">${esc(p.name)}</ha-list-item>`).join('');
-    const opts = presets.map((p, i) => `<option value="${i}">${esc(p.name)}</option>`).join('');
-    const select = this._has('ha-select')
-      ? `<ha-select data-setrow="${id}" naturalMenuWidth fixedMenuPosition data-value="${esc(
-          selected
-        )}" data-setpreset="${esc(ieee)}|${esc(entry.key)}|${id}"${dis}>${items}<ha-list-item value="__custom__">Custom\u2026</ha-list-item></ha-select>`
-      : `<select class="fallback" data-setrow="${id}" data-value="${esc(selected)}" data-setpreset="${esc(
+    const min = e.value_min;
+    const max = e.value_max;
+    const step = e.value_step || 1;
+    const presets = e.presets || [];
+    const outOfRange = known && (Number(value) < min || Number(value) > max);
+    let sliderHtml = '';
+    let boxCtx = ctx;
+    if (known && !outOfRange) {
+      const v = Number(value);
+      const pct = max > min ? ((v - min) / (max - min)) * 100 : 0;
+      sliderHtml = `<input type="range" class="gslider mini" data-gs="setk|${esc(ieee)}|${esc(
+        entry.key
+      )}" min="${esc(min)}" max="${esc(max)}" step="${esc(step)}" value="${v}" style="--gs-fill:${pct}%"
+          aria-label="${esc(entry.label)}" aria-valuetext="${esc(v)}${
+        e.unit ? ` ${esc(e.unit)}` : ''
+      }"${dis}>`;
+    } else if (outOfRange) {
+      const parkedMax = Math.abs(Number(value) - max) <= Math.abs(Number(value) - min);
+      sliderHtml = `<input type="range" class="gslider mini" data-gs="setk|${esc(ieee)}|${esc(
+        entry.key
+      )}" min="${esc(min)}" max="${esc(max)}" step="${esc(step)}" value="${parkedMax ? max : min}"
+          style="--gs-fill:${parkedMax ? 100 : 0}%" aria-label="${esc(entry.label)}"${dis}>`;
+      const preset = presets.find((p) => this._settingsValuesEqual(e, p.value, value));
+      boxCtx = { ...ctx, known: false, presetPlaceholder: preset ? sentenceCase(preset.name) : undefined };
+    }
+    const box = this._settingsNumericHtml(boxCtx);
+    const chips = presets.length ? this._settingsPresetChipsHtml(ieee, entry, presets, known ? value : undefined) : '';
+    return `<div class="setk"><div class="setslidewrap">${sliderHtml}${box}</div>${chips}</div>`;
+  }
+
+  /** L's meta name (§5.2): the converter's own preset name on an exact
+   * match, else the hue name, else White (255, preset rows) or Synced to all
+   * LEDs (255, sync rows -- description mentions synchronization). */
+  _settingsLName(expose, description, value) {
+    if (value === undefined || value === null) return '';
+    const preset = (expose.presets || []).find((p) => this._settingsValuesEqual(expose, p.value, value));
+    if (preset) return preset.name;
+    const v = Number(value);
+    if (v === 255) return /synchroni/i.test(description || '') ? 'Synced to all LEDs' : 'White';
+    return hueName(l255ToDeg(v));
+  }
+
+  /**
+   * Editor L, the hue trio (§5.2): `.gslider.mini` on the fixed rainbow-plus-
+   * white-cap track, a 24px swatch, and the F number box (64px, §5.2). No
+   * preset chips ever -- the nine converter presets are absorbed as detents
+   * and the meta name instead (§5.2's own rule, independent of K's).
+   */
+  _settingsLHtml(ctx) {
+    const { entry, known, value, disabled, ieee, id } = ctx;
+    const dis = disabled ? ' disabled' : '';
+    let sliderHtml = '';
+    let swatchHtml = `<span class="cswatch cswatch-unknown"></span>`;
+    if (known) {
+      const v = Number(value);
+      sliderHtml = `<input type="range" class="gslider mini hue255" data-gs="setl|${esc(ieee)}|${esc(
+        entry.key
+      )}" min="0" max="255" step="1" value="${v}" aria-label="${esc(entry.label)}"
+          aria-valuetext="${esc(this._settingsLName(entry.expose, entry.description, v))}"${dis}>`;
+      if (v === 255) {
+        swatchHtml = /synchroni/i.test(entry.description || '')
+          ? `<span class="cswatch cswatch-sync" title="Synced to all LEDs">${icon(MDI.link, '')}</span>`
+          : `<span class="cswatch" style="background:#fff"></span>`;
+      } else {
+        swatchHtml = `<span class="cswatch" style="background:${esc(hsToHex(l255ToDeg(v), 100))}"></span>`;
+      }
+    }
+    const box = this._settingsNumericHtml(ctx);
+    return `<div class="setl">${sliderHtml}${swatchHtml}${box}</div>`;
+  }
+
+  /**
+   * Editor N, the temperature trio (§5.3): `.gslider.mini` on the same
+   * device-range mired-linear track the light block generates, a kelvin
+   * box, and the converter's own preset chips verbatim. No mired anywhere.
+   */
+  _settingsNHtml(ctx) {
+    const { entry, known, value, disabled, ieee, id } = ctx;
+    const e = entry.expose;
+    const dis = disabled ? ' disabled' : '';
+    const min = e.value_min;
+    const max = e.value_max;
+    const presets = e.presets || [];
+    const outOfRange = known && (Number(value) < min || Number(value) > max);
+    let sliderHtml = '';
+    let kelvinVal = '';
+    let placeholder = '';
+    if (known && !outOfRange) {
+      const v = Number(value);
+      const pos = miredToTempPosition(v, min, max);
+      sliderHtml = `<input type="range" class="gslider mini" data-gs="setn|${esc(ieee)}|${esc(
+        entry.key
+      )}" min="0" max="1000" step="1" value="${pos}" style="--gs-track:${this._tempTrackCss(min, max)}"
+          aria-label="${esc(entry.label)}" aria-valuetext="${miredToKelvinDisplay(v)} K"${dis}>`;
+      kelvinVal = String(miredToKelvinDisplay(v));
+    } else {
+      if (outOfRange) {
+        const preset = presets.find((p) => this._settingsValuesEqual(e, p.value, value));
+        placeholder = preset ? sentenceCase(preset.name) : '';
+      }
+      const parkedMax = outOfRange && Math.abs(Number(value) - max) <= Math.abs(Number(value) - min);
+      sliderHtml = `<input type="range" class="gslider mini" data-gs="setn|${esc(ieee)}|${esc(
+        entry.key
+      )}" min="0" max="1000" step="1" value="${parkedMax ? 0 : 1000}" style="--gs-track:${this._tempTrackCss(
+        min,
+        max
+      )}" aria-label="${esc(entry.label)}"${outOfRange ? '' : ' hidden'}${dis}>`;
+    }
+    const boxTag = `data-setrow="${id}" data-setntemp="${esc(ieee)}|${esc(entry.key)}" data-value="${esc(
+      kelvinVal
+    )}" min="${miredToKelvinDisplay(max)}" max="${miredToKelvinDisplay(min)}" step="1"${dis}${
+      placeholder ? ` placeholder="${esc(placeholder)}"` : ''
+    }`;
+    const box = this._has('ha-textfield')
+      ? `<ha-textfield type="number" ${boxTag} suffix="K"></ha-textfield>`
+      : `<span class="setnumwrap"><input type="number" class="fallback" ${boxTag}><span class="setunit">K</span></span>`;
+    const chips = presets.length ? this._settingsPresetChipsHtml(ieee, entry, presets, known ? value : undefined) : '';
+    return `<div class="setn"><div class="setslidewrap">${sliderHtml}${box}</div>${chips}</div>`;
+  }
+
+  /** Editor M, the duration editor (§6.3): a number box plus a four-segment
+   * unit picker, with the wire byte kept visible in the meta line -- the one
+   * place this document shows a raw wire value on purpose. Composite-only in
+   * the real fleet (`entry.editor === 'M'` never fires on a top-level
+   * expose), but the markup and encode/decode pair are generic. */
+  _settingsMHtml(ctx) {
+    const { entry, known, value, disabled, ieee, id } = ctx;
+    const dis = disabled ? ' disabled' : '';
+    const decoded = known ? durationDecode(value) : { unit: 'Seconds', val: '' };
+    const bounds = durationBounds(decoded.unit);
+    const forever = decoded.unit === 'Forever';
+    const boxTag = `id="setdurbox-${id}" data-setdurval="${esc(ieee)}|${esc(entry.key)}" min="${bounds.min}" max="${bounds.max}" step="1"${dis}`;
+    const box = this._has('ha-textfield')
+      ? `<ha-textfield type="number" ${boxTag} data-value="${known ? esc(decoded.val) : ''}"${forever ? ' hidden' : ''}></ha-textfield>`
+      : `<input type="number" class="fallback compact" ${boxTag} value="${known ? esc(decoded.val) : ''}"${forever ? ' hidden' : ''}>`;
+    const seg = DURATION_UNITS.map(
+      (u) =>
+        `<button type="button" role="tab" aria-selected="${u === decoded.unit}" data-setdurunit="${esc(
           ieee
-        )}|${esc(entry.key)}|${id}"${dis}>${opts}<option value="__custom__">Custom\u2026</option></select>`;
-    const showCustom = custom || selected === '';
-    return `<span class="setpreset">${select}<span class="setpreset-custom" id="setpresetcustom-${id}"${
-      showCustom ? '' : ' hidden'
-    }>${this._settingsNumericHtml(ctx)}</span></span>`;
+        )}|${esc(entry.key)}|${u}">${u}</button>`
+    ).join('');
+    const meta = known
+      ? `Writes ${esc(value)} \u00b7 runs ${esc(durationHuman(value))}`
+      : '';
+    return `<div class="setm" data-setrow="${id}"><div class="setdur">${box}<span class="seg" id="setdurseg-${id}" role="tablist">${seg}</span></div><div class="setdur-meta" id="setdurmeta-${id}">${meta}</div></div>`;
   }
 
   /** I: a list of numbers as removable chips, with an explicit Apply for the whole array. */
@@ -3711,16 +5010,96 @@ class Z2MPanel extends HTMLElement {
       }${known ? '' : ' data-indeterminate="1"'}>`;
     }
     if (f.expose.type === 'enum') {
-      const opts = (f.expose.values || []).map((v) => `<option value="${esc(String(v))}">${esc(String(v))}</option>`).join('');
+      const values = f.expose.values || [];
+      if (values.length <= 7) {
+        // §2.6: a composite-body enum with 7 or fewer values is a
+        // single-select chip row; the Inovelli `led` picker is the case.
+        const chips = values
+          .map((v) => {
+            const active = known && String(value) === String(v);
+            return `<button type="button" class="pchip" role="radio" aria-checked="${active}"
+                data-setfeatchip="${esc(ieee)}|${esc(entry.key)}|${esc(f.prop)}|${esc(String(v))}">${esc(
+              String(v)
+            )}</button>`;
+          })
+          .join('');
+        return `<div class="pchips" role="radiogroup" ${tag}>${chips}</div>`;
+      }
+      const opts = values.map((v) => `<option value="${esc(String(v))}">${esc(String(v))}</option>`).join('');
       return `<select class="fallback compact" ${tag} data-setfeatkind="enum" data-value="${
         known ? esc(String(value)) : ''
       }">${known ? '' : '<option value="" disabled>Choose\u2026</option>'}${opts}</select>`;
+    }
+    if (f.expose.type === 'numeric' && f.editor === 'M') return this._settingsFeatureDurationHtml(d, entry, f, id, known, value);
+    if (f.expose.type === 'numeric' && (f.editor === 'K' || f.editor === 'L')) {
+      return this._settingsFeatureSliderHtml(d, entry, f, id, known, value);
     }
     return `<input type="number" class="fallback compact" ${tag} data-setfeatkind="numeric" data-value="${
       known ? esc(String(value)) : ''
     }"${f.expose.value_min !== undefined ? ` min="${esc(f.expose.value_min)}"` : ''}${
       f.expose.value_max !== undefined ? ` max="${esc(f.expose.value_max)}"` : ''
     }>`;
+  }
+
+  /** K/L inside a composite body (§6): the same slider+box (+swatch for L)
+   * as the top-level editors, but the slider writes into the draft on
+   * change (like every other feature) instead of committing on its own --
+   * only Apply writes anything from inside a composite. */
+  _settingsFeatureSliderHtml(d, entry, f, id, known, value) {
+    const ieee = d.ieee_address;
+    const e = f.expose;
+    const dataKey = `${esc(ieee)}|${esc(entry.key)}|${esc(f.prop)}`;
+    const boxTag = `data-setfeat="${dataKey}" data-setfeatkind="numeric" data-value="${known ? esc(String(value)) : ''}"`;
+    const box = `<input type="number" class="fallback compact" ${boxTag}${
+      e.value_min !== undefined ? ` min="${esc(e.value_min)}"` : ''
+    }${e.value_max !== undefined ? ` max="${esc(e.value_max)}"` : ''}>`;
+    if (f.editor === 'L') {
+      let swatch = `<span class="cswatch cswatch-unknown"></span>`;
+      let slider = '';
+      if (known) {
+        const v = Number(value);
+        slider = `<input type="range" class="gslider mini hue255" data-setfeat="${dataKey}" data-setfeatkind="numeric"
+            data-setfeatslider="l" min="0" max="255" step="1" value="${v}" aria-label="${esc(f.label)}"
+            aria-valuetext="${esc(this._settingsLName(e, e.description, v))}">`;
+        swatch =
+          v === 255
+            ? /synchroni/i.test(e.description || '')
+              ? `<span class="cswatch cswatch-sync" title="Synced to all LEDs">${icon(MDI.link, '')}</span>`
+              : `<span class="cswatch" style="background:#fff"></span>`
+            : `<span class="cswatch" style="background:${esc(hsToHex(l255ToDeg(v), 100))}"></span>`;
+      }
+      return `<div class="setl setfeature-slide" data-setrow="${id}">${slider}${swatch}${box}</div>`;
+    }
+    let slider = '';
+    if (known && e.value_min !== undefined && e.value_max !== undefined) {
+      const v = Number(value);
+      const pct = e.value_max > e.value_min ? ((v - e.value_min) / (e.value_max - e.value_min)) * 100 : 0;
+      slider = `<input type="range" class="gslider mini" data-setfeat="${dataKey}" data-setfeatkind="numeric"
+          data-setfeatslider="k" min="${esc(e.value_min)}" max="${esc(e.value_max)}" step="${esc(
+        e.value_step || 1
+      )}" value="${v}" style="--gs-fill:${pct}%" aria-label="${esc(f.label)}">`;
+    }
+    return `<div class="setk setfeature-slide" data-setrow="${id}">${slider}${box}</div>`;
+  }
+
+  /** M inside a composite body (§6.3): identical box+seg to the top-level
+   * editor, writing into the draft instead of committing directly. */
+  _settingsFeatureDurationHtml(d, entry, f, id, known, value) {
+    const ieee = d.ieee_address;
+    const decoded = known ? durationDecode(value) : { unit: 'Seconds', val: '' };
+    const bounds = durationBounds(decoded.unit);
+    const forever = decoded.unit === 'Forever';
+    const dataKey = `${esc(ieee)}|${esc(entry.key)}|${esc(f.prop)}`;
+    const boxTag = `id="setdurbox-${id}" data-setfeatdurval="${dataKey}" min="${bounds.min}" max="${bounds.max}" step="1"`;
+    const box = `<input type="number" class="fallback compact" ${boxTag} value="${
+      known ? esc(decoded.val) : ''
+    }"${forever ? ' hidden' : ''}>`;
+    const seg = DURATION_UNITS.map(
+      (u) =>
+        `<button type="button" role="tab" aria-selected="${u === decoded.unit}" data-setfeatdurunit="${dataKey}|${u}">${u}</button>`
+    ).join('');
+    const meta = known ? `Writes ${esc(value)} \u00b7 runs ${esc(durationHuman(value))}` : '';
+    return `<div class="setm" data-setrow="${id}"><div class="setdur">${box}<span class="seg" id="setdurseg-${id}" role="tablist">${seg}</span></div><div class="setdur-meta" id="setdurmeta-${id}">${meta}</div></div>`;
   }
 
   /* ----------------------------------------------------------- row skeletons */
@@ -3744,7 +5123,7 @@ class Z2MPanel extends HTMLElement {
   _settingsRowHtml(d, entry) {
     const id = this._settingsDomId(entry);
     const e = entry.expose;
-    return `<div class="setrow" id="setrow-${id}" data-prop="${esc(entry.prop)}" data-etype="${esc(e.type)}">
+    return `<div class="setrow" id="setrow-${id}" data-prop="${esc(entry.prop)}" data-etype="${esc(e.type)}" data-editor="${esc((entry.editor || '').toLowerCase())}">
         <div class="setrow-top">
           <div class="setrow-label"><div class="setrow-name">${esc(entry.label)}</div></div>
           <div class="setrow-ctl" id="setctl-${id}"></div>
@@ -3885,6 +5264,15 @@ class Z2MPanel extends HTMLElement {
     return !!(el && el.dataset && el.dataset.setrow === id);
   }
 
+  /** Is a `.gslider` inside `box` mid-drag, or within 1s of its last input
+   * (§3.2)? The slider-specific form of the guard above: a range input does
+   * not reliably become `activeElement` on every pointer path. */
+  _settingsRowHot(box) {
+    if (!box || !box.querySelectorAll) return false;
+    // NodeList has no .some in real browsers (the test stub returns arrays); spread first.
+    return [...box.querySelectorAll('[data-gs]')].some((el) => el._z2mHot && Date.now() - el._z2mHot < 1000);
+  }
+
   /**
    * The sibling of `_syncLive`/`_syncFw`: patches every row's control and meta box
    * from the state mirror and the write-lifecycle table, in place.
@@ -3949,7 +5337,7 @@ class Z2MPanel extends HTMLElement {
     if (w && w.phase === 'pending') return;
     const id = this._settingsDomId(entry);
     const box = r.getElementById(`setctl-${id}`);
-    if (!box || this._settingsRowFocused(r, id)) return;
+    if (!box || this._settingsRowFocused(r, id) || this._settingsRowHot(box)) return;
     const html = this._settingsControlHtml(d, entry);
     const cache = this._settingsCache[ieee] || (this._settingsCache[ieee] = { ctl: {}, meta: {} });
     if (cache.ctl[entry.key] === html) return;
@@ -4196,6 +5584,144 @@ class Z2MPanel extends HTMLElement {
     this._settingsCommit(ieee, entry, raw);
   }
 
+  /** N's kelvin box: typed kelvin converts to a clamped mired on commit. */
+  _settingsCommitNTemp(ieee, key, el) {
+    const d = this._dev(ieee);
+    const entry = d && this._settingsFindEntry(d, key);
+    if (!entry) return;
+    this._settingsClearError(ieee, entry);
+    if (el.classList) el.classList.remove('invalid');
+    const raw = el.value;
+    if (raw === '' || raw === el.dataset.value) return;
+    const kelvin = Number(raw);
+    const e = entry.expose;
+    if (!Number.isFinite(kelvin) || kelvin <= 0) {
+      if (el.classList) el.classList.add('invalid');
+      this._settingsShowError(
+        ieee, entry, `Between ${miredToKelvinDisplay(e.value_max)} and ${miredToKelvinDisplay(e.value_min)} K`
+      );
+      return;
+    }
+    el.dataset.value = raw;
+    this._settingsCommit(ieee, entry, Math.max(e.value_min, Math.min(e.value_max, Math.round(1e6 / kelvin))));
+  }
+
+  /** Top-level M's box (§6.3): commits like F, in whatever unit the segment
+   * currently shows. */
+  _settingsCommitDuration(ieee, key, el) {
+    const d = this._dev(ieee);
+    const entry = d && this._settingsFindEntry(d, key);
+    if (!entry) return;
+    const id = this._settingsDomId(entry);
+    const seg = this.shadowRoot.getElementById(`setdurseg-${id}`);
+    const active = seg && (seg.querySelectorAll('[aria-selected="true"]') || [])[0];
+    const unit = active ? active.textContent : 'Seconds';
+    this._settingsClearError(ieee, entry);
+    const raw = el.value;
+    if (raw === '' || raw === el.dataset.value) return;
+    const n = Number(raw);
+    const bounds = durationBounds(unit);
+    if (!Number.isFinite(n) || n < bounds.min || n > bounds.max) {
+      this._settingsShowError(ieee, entry, `Between ${bounds.min} and ${bounds.max}`);
+      return;
+    }
+    el.dataset.value = raw;
+    this._settingsCommit(ieee, entry, durationEncode(unit, n));
+  }
+
+  /** Top-level M's unit segment: commits immediately -- there is no Apply to
+   * defer to outside a composite. */
+  _settingsDurationSetUnit(ieee, key, unit) {
+    const d = this._dev(ieee);
+    const entry = d && this._settingsFindEntry(d, key);
+    if (!entry) return;
+    const id = this._settingsDomId(entry);
+    const box = this.shadowRoot.getElementById(`setdurbox-${id}`);
+    const bounds = durationBounds(unit);
+    const val = box && box.value ? Number(box.value) : bounds.min;
+    this._settingsCommit(ieee, entry, durationEncode(unit, unit === 'Forever' ? 0 : val || bounds.min));
+  }
+
+  /** M inside a composite: the box writes into the draft using whatever
+   * unit its own segment currently shows. */
+  _settingsFeatureDurationSetVal(ieee, key, prop, el) {
+    const id = `${this._settingsDomId({ key })}-${prop.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    const seg = this.shadowRoot.getElementById(`setdurseg-${id}`);
+    const active = seg && (seg.querySelectorAll('[aria-selected="true"]') || [])[0];
+    const unit = active ? active.textContent : 'Seconds';
+    const n = Number(el.value);
+    if (!Number.isFinite(n)) return;
+    const store = (this._settingsDraft[ieee] = this._settingsDraft[ieee] || {});
+    (store[key] = store[key] || {})[prop] = durationEncode(unit, n);
+  }
+
+  /** M inside a composite: the unit segment writes into the draft too, so
+   * switching units before Apply is pressed is not lost. */
+  _settingsFeatureDurationSetUnit(ieee, key, prop, unit) {
+    const store = (this._settingsDraft[ieee] = this._settingsDraft[ieee] || {});
+    const draft = (store[key] = store[key] || {});
+    const bounds = durationBounds(unit);
+    const current = Object.prototype.hasOwnProperty.call(draft, prop) ? durationDecode(draft[prop]).val : bounds.min;
+    draft[prop] = durationEncode(unit, unit === 'Forever' ? 0 : current || bounds.min);
+    this._settingsRepaintFeature(ieee, key, prop);
+  }
+
+  /** Repaints one composite feature's control after a draft-only change
+   * (a chip tap, a unit switch) that the generic onchange path never sees. */
+  _settingsRepaintFeature(ieee, key, prop) {
+    const d = this._dev(ieee);
+    const entry = d && this._settingsFindEntry(d, key);
+    const f = entry && entry.features && entry.features.find((x) => x.prop === prop);
+    if (!entry || !f) return;
+    const id = `${this._settingsDomId(entry)}-${prop.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    const box = this.shadowRoot.getElementById(`setfeat-${id}`);
+    if (!box) return;
+    box.innerHTML = this._settingsFeatureControlHtml(d, entry, f, id);
+    this._wire(box);
+  }
+
+  /** Local-only UI for a `.gslider`, keyed by `data-gs="role|payload"`: pure
+   * presentation (readout, dependent tints), never a write (§3.2). */
+  _gsliderInput(el) {
+    const [role, ieee, key] = String(el.dataset.gs || '').split('|');
+    const box = el.parentElement && el.parentElement.querySelectorAll
+      ? el.parentElement.querySelectorAll('[data-setnum],[data-setntemp]')[0]
+      : null;
+    if (role === 'setk' && box) box.value = el.value;
+    if (role === 'setn' && box) {
+      const d = this._dev(ieee);
+      const entry = d && this._settingsFindEntry(d, key);
+      if (entry) {
+        const mired = tempPositionToMired(Number(el.value), entry.expose.value_min, entry.expose.value_max);
+        box.value = miredToKelvinDisplay(mired);
+      }
+    }
+    if (role === 'setl') {
+      // Magnetic detents (§5.2): snap the thumb within \u00b1 4 of a canonical point.
+      const v = Number(el.value);
+      const near = L_DETENTS.find((d2) => Math.abs(d2 - v) <= 4);
+      if (near !== undefined && near !== v) el.value = String(near);
+      if (box) box.value = el.value;
+    }
+  }
+
+  /** The commit for every `.gslider` role (§3.2): one write per release or
+   * keyboard-arrow burst. */
+  _gsliderCommit(el) {
+    const [role, ieee, key] = String(el.dataset.gs || '').split('|');
+    const d = this._dev(ieee);
+    const entry = d && this._settingsFindEntry(d, key);
+    if (!entry) return;
+    if (role === 'setk') {
+      this._settingsCommit(ieee, entry, Number(el.value));
+    } else if (role === 'setl') {
+      this._settingsCommit(ieee, entry, Number(el.value));
+    } else if (role === 'setn') {
+      const mired = tempPositionToMired(Number(el.value), entry.expose.value_min, entry.expose.value_max);
+      this._settingsCommit(ieee, entry, mired);
+    }
+  }
+
   _settingsApplyComposite(ieee, key) {
     const d = this._dev(ieee);
     const entry = d && this._settingsFindEntry(d, key);
@@ -4346,6 +5872,139 @@ class Z2MPanel extends HTMLElement {
     if (this._view.name !== 'device' || this._view.ieee !== ieee) return;
     this._settingsState[ieee] = (ev && ev.state) || {};
     this._syncSettings();
+    this._syncLight(ieee);
+  }
+
+  /** Patches every light block's hero/brightness/temp/color surfaces in
+   * place, diffed per block like every other sync helper here. */
+  _syncLight(ieee) {
+    const r = this.shadowRoot;
+    if (!r || this._view.name !== 'device' || this._view.ieee !== ieee) return;
+    const d = this._dev(ieee);
+    if (!d) return;
+    const live = this._liveEntities(ieee);
+    const lightExposes = this._lightExposes(d);
+    const lightEntities = live.controls.filter((item) => item.domain === 'light');
+    const cache = (this._lightCache[ieee] = this._lightCache[ieee] || {});
+    lightExposes.forEach((expose, n) => {
+      const entity = lightEntities[n] || this._lightFallbackEntity(d);
+      const box = r.getElementById(`lt${n}`);
+      if (!box || this._settingsRowFocused(r, `lt${n}`) || this._settingsRowHot(box)) return;
+      const html = this._lightBlockHtml(d, expose, n, entity);
+      if (cache[n] === html) return;
+      cache[n] = html;
+      box.innerHTML = html;
+      this._wire(box);
+    });
+  }
+
+  /**
+   * The light block's write lifecycle (§4.9): the v1.12.0 machine, with a
+   * 400ms silent-success window and one chip for the whole block rather
+   * than per control. `payload` is the full combined write (already carries
+   * `state: "ON"` when the light was off, per the caller).
+   */
+  async _lightCommit(ieee, n, payload) {
+    const store = (this._lightWrite[ieee] = this._lightWrite[ieee] || {});
+    const token = ((store[n] || {}).token || 0) + 1;
+    const w = (store[n] = { phase: 'pending', token, slow: false, message: null });
+    const slowTimer = setTimeout(() => {
+      if (store[n] !== w) return;
+      w.slow = true;
+      this._paintLightChip(ieee, n);
+    }, 400);
+    try {
+      const res = await this._call('z2m/device/set', { device: ieee, payload });
+      clearTimeout(slowTimer);
+      if (store[n] !== w) return;
+      if (res && res.confirmed) {
+        const echoed = res.state || {};
+        const adjusted = Object.keys(payload).some((k) => !this._lightValueClose(k, payload[k], echoed[k]));
+        if (adjusted) {
+          w.phase = 'adjusted';
+          w.message = this._lightAdjustedText(ieee, n, echoed);
+        } else {
+          w.phase = 'confirmed';
+          this._lightFadeWrite(ieee, n, token);
+        }
+      } else if (res && Object.prototype.hasOwnProperty.call(res, 'sleeping')) {
+        w.phase = res.sleeping ? 'queued' : 'unconfirmed';
+      } else {
+        w.phase = 'sent';
+        this._lightFadeWrite(ieee, n, token);
+      }
+    } catch (err) {
+      clearTimeout(slowTimer);
+      if (store[n] !== w) return;
+      w.phase = 'failed';
+      w.message = this._feedMessage(err, 'The write failed');
+    }
+    this._paintLightBlock(ieee, n);
+  }
+
+  _lightValueClose(prop, written, echoed) {
+    if (echoed === undefined) return false;
+    if (prop === 'state') return String(written) === String(echoed);
+    if (prop === 'brightness' || prop === 'color_temp') return Math.abs(Number(written) - Number(echoed)) <= 2;
+    if (prop === 'color') {
+      if (written && written.hue !== undefined) {
+        return (
+          echoed && Math.abs((written.hue || 0) - (echoed.hue || 0)) <= 4 && Math.abs((written.saturation || 0) - (echoed.saturation || 0)) <= 4
+        );
+      }
+      return true; // xy/hex echoes: the bulb's own gamut clamp is authoritative
+    }
+    return true;
+  }
+
+  _lightAdjustedText(ieee, n, echoed) {
+    const d = this._dev(ieee);
+    const expose = this._lightExposes(d)[n];
+    if (!expose) return '';
+    if (echoed.brightness !== undefined) {
+      return `${brightnessToPct(Number(echoed.brightness), brightnessMax(this._lightFeature(expose, 'brightness') || {}))}%`;
+    }
+    if (echoed.color_temp !== undefined) return `${miredToKelvinDisplay(Number(echoed.color_temp))} K`;
+    if (echoed.color && echoed.color.hue !== undefined) return hueName(echoed.color.hue, echoed.color.saturation);
+    if (echoed.state !== undefined) return String(echoed.state);
+    return '';
+  }
+
+  _lightFadeWrite(ieee, n, token) {
+    setTimeout(() => {
+      const store = this._lightWrite[ieee];
+      const w = store && store[n];
+      if (!w || w.token !== token) return;
+      delete store[n];
+      this._paintLightBlock(ieee, n);
+    }, 2000);
+  }
+
+  _paintLightChip(ieee, n) {
+    const r = this.shadowRoot;
+    const chipEl = r && r.getElementById(`lt${n}-chip`);
+    if (!chipEl) return;
+    const write = (this._lightWrite[ieee] || {})[n];
+    const text = this._lightChipHtml(write);
+    chipEl.hidden = !text;
+    chipEl.textContent = text;
+  }
+
+  /** After a commit settles, repaint just this block the same way `_syncLight` does. */
+  _paintLightBlock(ieee, n) {
+    const r = this.shadowRoot;
+    if (!r || this._view.name !== 'device' || this._view.ieee !== ieee) return;
+    const d = this._dev(ieee);
+    const expose = d && this._lightExposes(d)[n];
+    const live = this._liveEntities(ieee);
+    const entity = (d && expose && (live.controls.filter((item) => item.domain === 'light')[n] || this._lightFallbackEntity(d))) || null;
+    const box = r.getElementById(`lt${n}`);
+    if (!d || !expose || !entity || !box) return;
+    const html = this._lightBlockHtml(d, expose, n, entity);
+    const cache = (this._lightCache[ieee] = this._lightCache[ieee] || {});
+    cache[n] = html;
+    box.innerHTML = html;
+    this._wire(box);
   }
 
   /* --------------------------------------------------------------- firmware */
@@ -5191,6 +6850,15 @@ class Z2MPanel extends HTMLElement {
     this._paintPairDialog();
     if (d.native) d.el.open = true;
     this._startTicker();
+    // A Back press while the dialog is open closes the dialog instead of
+    // leaving the panel view underneath it (§ routing): this entry exists
+    // only to be popped, either by that press or by the dialog's own close
+    // affordances.
+    if (typeof history !== 'undefined' && history.pushState) {
+      const path = this._locationSubpath();
+      history.pushState(null, '', `/z2m${path ? `/${path}` : ''}#pair`);
+      p.historyPushed = true;
+    }
     // Watching starts immediately; the radio waits for Start.
     await this._openPairing();
   }
@@ -5198,10 +6866,13 @@ class Z2MPanel extends HTMLElement {
   /**
    * Close the dialog, and with it the window and the subscriptions.
    *
-   * Closing is the same event however it arrives -- the button, Escape, the scrim,
-   * or navigating away -- so all of them land here.
+   * Closing is the same event however it arrives -- the button, Escape, the
+   * scrim, navigating away, or the operator's own Back press -- so all of
+   * them land here. Only the first four owe the '#pair' history entry a pop:
+   * a Back-driven close (`skipHistoryPop`) already consumed it by definition,
+   * and popping it here too would walk one entry too far.
    */
-  _closePairDialog() {
+  _closePairDialog(skipHistoryPop) {
     const p = this._pairing;
     if (!p.open) return;
     p.open = false;
@@ -5211,9 +6882,13 @@ class Z2MPanel extends HTMLElement {
       d.el.remove();
       d.painted = null;
     }
+    const historyPushed = p.historyPushed;
     this._leavePairing();
     this._startTicker();
     this._render();
+    if (!skipHistoryPop && historyPushed && typeof history !== 'undefined' && history.back) {
+      history.back();
+    }
   }
 
   /**

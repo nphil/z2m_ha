@@ -215,6 +215,17 @@ DEVICE_SET_TIMEOUT = 10
 # converter failure on bridge/logging, the same idea as SCENE_RECALL_GRACE.
 DEVICE_SET_GRACE = 3.0
 
+# z2m/device/read_values chunks the gettable property list rather than
+# publishing it in one payload. Z2M serialises radio work per device, and the
+# Inovelli VZM31-SN alone exposes 82 readable properties on this fleet --
+# measured timing out most of them when asked for together, each waiting
+# behind roughly 81 others for its turn on the air before Z2M gives up on it.
+# A chunk of 8 and a pause between chunks is the same device-serialisation
+# lesson SCAN_MIN_INTERVAL encodes for the network map above, applied to one
+# device's own read queue instead of a walk across many.
+DEVICE_READ_CHUNK_SIZE = 8
+DEVICE_READ_CHUNK_DELAY = 2.0
+
 # The pairing log-level restore is fire-and-forget MQTT, so it is made durable
 # rather than trusted: the pending target level is written here the moment
 # Zigbee2MQTT is raised to debug, and not cleared until bridge/info actually

@@ -415,6 +415,21 @@ class Z2MData:
         # scoped to that device's own topic is both cheaper and gives
         # async_device_write a clean per-device signal to wait on.
         self._device_watches: dict[str, _DeviceWatch] = {}
+        # Every device state publish since Home Assistant started, shallow-merged
+        # per ieee, fed by a subscription that runs for the entry's whole life --
+        # see _on_state_cache_message. This is what device_state() reads first:
+        # unlike _device_watches above it needs nobody to have a page open, which
+        # is the whole point -- a value Zigbee2MQTT already knows must not look
+        # unread just because nobody had Settings open when it last said so. Not
+        # persisted to disk on purpose: a restart starts this cache empty rather
+        # than risk showing a value that may no longer be true.
+        self._state_cache: dict[str, dict[str, Any]] = {}
+        # friendly_name -> ieee, rebuilt whenever bridge/devices republishes (see
+        # _reconcile_state_cache). What lets _on_state_cache_message turn away a
+        # topic that is not a currently known device's own state -- a group, a
+        # stale name mid-rename, bridge noise that slipped past the prefix check
+        # -- at the cost of exactly one failed dict lookup rather than a scan.
+        self._ieee_by_name: dict[str, str] = {}
         # Set by Z2MLabels once the label is resolved, and surfaced in summary() so
         # the panel can deep-link into HA's own tables with ?label=<id>.
         self.label_id: str | None = None
@@ -483,6 +498,18 @@ class Z2MData:
         self._unsubs.append(
             await mqtt.async_subscribe(
                 self.hass, f"{self.base_topic}/+/availability", self._on_availability, 0
+            )
+        )
+
+        # Every device's own state topic, subscribed for the entry's whole life
+        # rather than refcounted like the OTA and per-device mirrors below: the
+        # point of this one is that a Settings page nobody has opened since Home
+        # Assistant started still shows values Zigbee2MQTT already knows. See
+        # _on_state_cache_message for what it keeps and _reconcile_state_cache
+        # for how it stays bounded to devices actually on the network.
+        self._unsubs.append(
+            await mqtt.async_subscribe(
+                self.hass, f"{self.base_topic}/#", self._on_state_cache_message, 0
             )
         )
 
@@ -598,6 +625,7 @@ class Z2MData:
             self.devices = payload
             self._reconcile_pairing_devices()
             self._reconcile_device_watch_names()
+            self._reconcile_state_cache()
             devices_changed = True
         elif suffix == TOPIC_GROUPS and isinstance(payload, list):
             self.groups = payload
@@ -1032,6 +1060,63 @@ class Z2MData:
             return
         async_dispatcher_send(self.hass, SIGNAL_UPDATE)
         async_dispatcher_send(self.hass, SIGNAL_DEVICE_LIST)
+
+    @callback
+    def _on_state_cache_message(self, msg: mqtt.ReceiveMessage) -> None:
+        """Shallow-merge one device's state publish into the permanent cache.
+
+        Subscribed for the whole life of the config entry (see async_start),
+        unlike the OTA mirror and the per-device watch below, which only listen
+        while a firmware view or a device page is open. That is the point of
+        this one: device_state() can answer with a value Zigbee2MQTT already
+        knows even when nobody has had Settings open for this device since Home
+        Assistant started, which is the bug this cache exists to fix.
+
+        The exclusions mirror what the OTA mirror already filters on the same
+        `<base>/#` wildcard: the retained bridge/* topics, availability, and any
+        set/get echo. A friendly name can itself contain '/', so both are ruled
+        out by their fixed prefix or suffix rather than by counting path
+        segments. What survives that is checked against the known devices with
+        one dict lookup; a group, a name mid-rename, or anything else
+        unrecognised costs exactly that lookup and nothing more.
+        """
+        suffix = msg.topic[len(self.base_topic) + 1 :]
+        if not suffix or suffix.startswith("bridge/"):
+            return
+        tail = suffix.rsplit("/", 1)[-1]
+        if tail in ("availability", "set", "get") or "/set/" in suffix or "/get/" in suffix:
+            return
+        ieee = self._ieee_by_name.get(suffix)
+        if ieee is None:
+            return
+        try:
+            payload = json.loads(msg.payload)
+        except ValueError:
+            return
+        if not isinstance(payload, dict):
+            return
+        self._state_cache.setdefault(ieee, {}).update(payload)
+
+    @callback
+    def _reconcile_state_cache(self) -> None:
+        """Rebuild the friendly_name -> ieee lookup and drop devices gone from it.
+
+        bridge/devices is the only place either fact is learned: a rename means
+        a different name's publishes now belong to the same ieee, and a removed
+        device stops publishing altogether -- without this its last known
+        values would sit in `_state_cache` forever instead of leaving with it.
+        """
+        by_name: dict[str, str] = {}
+        known: set[str] = set()
+        for device in self.devices:
+            name = device.get("friendly_name")
+            ieee = device.get("ieee_address")
+            if isinstance(name, str) and isinstance(ieee, str):
+                by_name[name] = ieee
+                known.add(ieee)
+        self._ieee_by_name = by_name
+        for stale in [ieee for ieee in self._state_cache if ieee not in known]:
+            del self._state_cache[stale]
 
     @callback
     def _on_extensions(self, msg: mqtt.ReceiveMessage) -> None:
@@ -1827,6 +1912,13 @@ class Z2MData:
     # async_device_write a clean per-device signal to wait on, at the cost of
     # having to follow the device if it gets renamed while watched (see
     # _reconcile_device_watch_names).
+    #
+    # A second mirror sits underneath this one and is NOT scoped to a watch at
+    # all: _state_cache, fed by a wildcard subscribed for the whole life of the
+    # entry (see _on_state_cache_message), so device_state() has something
+    # honest to answer even when no device page has been open since Home
+    # Assistant started. The watch below is still what a page actually
+    # subscribes to for live pushes; the cache is what it inherits on open.
 
     async def async_device_state_acquire(self, ieee: str) -> None:
         """Start mirroring one device's state topic, if nobody already is.
@@ -1874,15 +1966,20 @@ class Z2MData:
 
     @callback
     def device_state(self, ieee: str) -> dict[str, Any]:
-        """The merged property map mirrored for one device, or {} if unwatched.
+        """The best known property map for one device: cache, live watch on top.
 
-        {} covers both "nobody has acquired a watch" and "a watch is open but
-        the device has not echoed anything yet" -- on this fleet those are
-        indistinguishable and both honestly mean "not read yet", which is
-        exactly the row state the panel renders for it.
+        The permanent cache (`_state_cache`) has held every state publish since
+        Home Assistant started, watch or no watch; a live watch, when one is
+        open, is laid over it rather than replacing it, so a cached property the
+        watch has not seen again yet stays visible instead of disappearing the
+        moment a device page opens. {} still honestly means "not read yet" --
+        Zigbee2MQTT has said nothing about this device since this run started.
         """
+        merged = dict(self._state_cache.get(ieee, {}))
         watch = self._device_watches.get(ieee)
-        return dict(watch.state) if watch is not None else {}
+        if watch is not None:
+            merged.update(watch.state)
+        return merged
 
     @callback
     def _on_device_watch_message(self, ieee: str, msg: mqtt.ReceiveMessage) -> None:

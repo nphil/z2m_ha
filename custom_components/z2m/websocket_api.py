@@ -6,6 +6,7 @@ mirroring how the built-in zwave_js panel talks to its integration.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -19,6 +20,8 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
 from .const import (
     BACKUP_TIMEOUT,
+    DEVICE_READ_CHUNK_DELAY,
+    DEVICE_READ_CHUNK_SIZE,
     DOMAIN,
     OTA_ACCEPT_WINDOW,
     REQUEST_TIMEOUT,
@@ -815,13 +818,22 @@ def _gettable_properties(device: dict) -> tuple[list[str], list[str]]:
 @websocket_api.async_response
 @_guard
 async def ws_read_values(hass, connection, msg, data) -> None:
-    """Ask the device to report every readable attribute, in one MQTT get.
+    """Ask the device to report every readable attribute, paced in chunks.
 
-    Z2M accepts a multi-property payload on `<friendly_name>/get`, so the whole
-    read is one publish and, on the radio, a burst of unicast reads to exactly
-    this device -- cheap for a powered device, and a sleeping battery device
-    simply answers at its next wake-up. Answers come back on the device's state
-    topic, so they land in Home Assistant's entities with no further plumbing.
+    Z2M accepts a multi-property payload on `<friendly_name>/get`, but Z2M
+    serialises radio work per device, and a dimmer like the Inovelli VZM31-SN
+    exposes 82 readable properties on this fleet -- proven to time out most of
+    them when asked for in one payload, because each one waits behind roughly
+    81 others for its turn on the air before Z2M gives up on it. Chunked into
+    groups of DEVICE_READ_CHUNK_SIZE with DEVICE_READ_CHUNK_DELAY between
+    publishes instead, the same device-serialisation lesson the network map's
+    SCAN_MIN_INTERVAL encodes, aimed at one device's own read queue rather than
+    a walk across many.
+
+    Still fire-and-forget from the caller's side, same as a single publish
+    always was: this resolves once the LAST chunk is on the wire, without
+    waiting for any of them to be answered. Answers come back on the device's
+    state topic exactly as before, so they land with no further plumbing.
     """
     dev = next(
         (
@@ -837,9 +849,16 @@ async def ws_read_values(hass, connection, msg, data) -> None:
     readable, skipped = _gettable_properties(dev)
     if readable:
         topic = f"{data.base_topic}/{dev.get('friendly_name')}/get"
-        await mqtt.async_publish(
-            hass, topic, json.dumps({p: "" for p in readable}), qos=0, retain=False
-        )
+        chunks = [
+            readable[i : i + DEVICE_READ_CHUNK_SIZE]
+            for i in range(0, len(readable), DEVICE_READ_CHUNK_SIZE)
+        ]
+        for index, chunk in enumerate(chunks):
+            if index:
+                await asyncio.sleep(DEVICE_READ_CHUNK_DELAY)
+            await mqtt.async_publish(
+                hass, topic, json.dumps({p: "" for p in chunk}), qos=0, retain=False
+            )
     battery = (dev.get("power_source") or "") == "Battery"
     connection.send_result(
         msg["id"],
@@ -852,16 +871,20 @@ async def ws_read_values(hass, connection, msg, data) -> None:
 # The Settings card's live values come from the device's OWN state topic, not
 # from Home Assistant entities: on this fleet the config-category entities
 # Z2M's homeassistant extension would create are disabled by choice, and would
-# leave most Settings rows blank. Z2MData.async_device_state_acquire/_release
-# hold a refcounted mirror per ieee -- see the comment above that method in
-# coordinator.py for why this is a per-device subscription rather than the OTA
+# leave most Settings rows blank. Z2MData.device_state answers from a
+# PERMANENT cache fed by every state publish since Home Assistant started
+# (see _on_state_cache_message in coordinator.py), merged under a live watch
+# while a device page has one open. Z2MData.async_device_state_acquire/_release
+# hold that refcounted watch per ieee -- see the comment above it in
+# coordinator.py for why it is a per-device subscription rather than the OTA
 # mirror's single wildcard.
 #
-# Not retained, same as OTA: the mirror only knows what has actually echoed
-# since something started watching, and a device that has said nothing yet is
-# legitimately {} rather than an error. All three commands are admin-gated
-# because the mirror echoes raw MQTT payloads verbatim, which this file's own
-# policy (see the network map admin comment above) reserves for admins.
+# The cache is not persisted to disk on purpose, so {} still honestly means
+# "Zigbee2MQTT has said nothing about this device since this run of Home
+# Assistant started" rather than a stale value surviving a restart. All three
+# commands are admin-gated because the mirror echoes raw MQTT payloads
+# verbatim, which this file's own policy (see the network map admin comment
+# above) reserves for admins.
 
 
 @websocket_api.require_admin
@@ -871,12 +894,12 @@ async def ws_read_values(hass, connection, msg, data) -> None:
 @websocket_api.async_response
 @_guard
 async def ws_device_state(hass, connection, msg, data) -> None:
-    """The device's mirrored state, or {} if nobody has watched it yet.
+    """The device's best known state: cached, live watch on top, or {}.
 
-    A plain read of whatever is already mirrored -- it does not itself start a
-    watch. z2m/device/state/subscribe is what the panel actually opens a
-    device page with; this exists for a caller that only ever wants one
-    snapshot.
+    A plain read of whatever Z2MData already knows -- it does not itself
+    start a watch. z2m/device/state/subscribe is what the panel actually
+    opens a device page with; this exists for a caller that only ever wants
+    one snapshot.
     """
     connection.send_result(msg["id"], {"state": data.device_state(msg["device"])})
 
@@ -888,7 +911,8 @@ async def ws_device_state(hass, connection, msg, data) -> None:
 @websocket_api.async_response
 @_guard
 async def ws_device_state_subscribe(hass, connection, msg, data) -> None:
-    """Snapshot first, then one merged-map push per state publish.
+    """Snapshot first (cache merged under any live watch), then one merged-map
+    push per state publish.
 
     Refcounted per ieee on Z2MData, so two tabs open on the same device share
     one MQTT subscription and the last to leave is what tears it down -- Home

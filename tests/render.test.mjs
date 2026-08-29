@@ -311,8 +311,50 @@ Object.defineProperty(globalThis, 'navigator', {
   configurable: true,
   writable: true,
 });
-globalThis.window = { location: { href: '' } }; // deliberately no loadCardHelpers
-globalThis.history = { back() {} };
+// A minimal but faithful window: real `addEventListener`/`dispatchEvent`, and a
+// `location` that `history.pushState`/`back` below actually keep in sync, so the
+// panel's own routing (the `route` setter, its `popstate` listener, and every
+// `_go()`-driven push) can be exercised the same way a browser would drive it.
+const windowListeners = {};
+globalThis.window = {
+  location: { href: '/z2m', pathname: '/z2m', search: '', hash: '' },
+  addEventListener(type, fn) {
+    (windowListeners[type] = windowListeners[type] || []).push(fn);
+  },
+  removeEventListener(type, fn) {
+    if (!windowListeners[type]) return;
+    windowListeners[type] = windowListeners[type].filter((f) => f !== fn);
+  },
+  dispatchEvent(ev) {
+    (windowListeners[ev.type] || []).slice().forEach((fn) => fn(ev));
+    return true;
+  },
+}; // deliberately no loadCardHelpers
+let historyStack = ['/z2m'];
+let historyIndex = 0;
+const applyHistoryUrl = (url) => {
+  const [path, hash] = String(url).split('#');
+  window.location.pathname = path;
+  window.location.hash = hash ? `#${hash}` : '';
+  window.location.href = url;
+};
+globalThis.history = {
+  pushState(_state, _title, url) {
+    historyStack = historyStack.slice(0, historyIndex + 1);
+    historyStack.push(url);
+    historyIndex = historyStack.length - 1;
+    applyHistoryUrl(url);
+  },
+  // Real browsers resolve Back asynchronously; firing `popstate` synchronously
+  // here is observationally equivalent for every caller in this file, which
+  // always follows a history-touching action with `await tick()`.
+  back() {
+    if (historyIndex <= 0) return;
+    historyIndex -= 1;
+    applyHistoryUrl(historyStack[historyIndex]);
+    window.dispatchEvent({ type: 'popstate' });
+  },
+};
 globalThis.confirm = () => true;
 globalThis.alert = () => {};
 
@@ -2521,7 +2563,8 @@ const inovelliDevice = {
       features: [
         { access: 3, name: 'effect', property: 'effect', type: 'enum', values: ['off', 'solid', 'fast_blink'] },
         { access: 3, name: 'level', property: 'level', type: 'numeric', value_max: 100, value_min: 0 },
-        { access: 3, name: 'duration', property: 'duration', type: 'numeric', unit: 's' },
+        { access: 3, name: 'duration', property: 'duration', type: 'numeric', value_max: 255, value_min: 0, unit: 's',
+          description: '1-60 is seconds. 61-120 is minutes calculated as (60-120)-60 (1 min - 60 min). 255 is indefinite.' },
       ] },
     { access: 7, category: 'config', label: 'DimmingSpeedUpRemote', name: 'dimmingSpeedUpRemote', property: 'dimmingSpeedUpRemote', type: 'numeric', value_max: 127, value_min: 0 },
     { access: 7, category: 'config', label: 'DimmingSpeedUpLocal', name: 'dimmingSpeedUpLocal', property: 'dimmingSpeedUpLocal', type: 'numeric', value_max: 127, value_min: 0 },
@@ -2553,8 +2596,218 @@ const inovelliDevice = {
   ],
   option_values: { friendly_name: 'Stairway Dimmer' },
 };
-p._devices = fx.devices.concat([hueDevice, inovelliDevice]);
+const hueGlobeDevice = {
+  ieee_address: '0x9290012573a00001',
+  friendly_name: "Isabel's office globe",
+  network_address: 5003,
+  vendor: 'Philips',
+  model: '9290012573A',
+  description: 'Hue White and Color Ambiance A19',
+  type: 'Router',
+  power_source: 'Mains (single phase)',
+  availability: 'online',
+  supported: true,
+  scenes: [],
+  endpoints: [1],
+  exposes: [
+    { type: 'light', features: [
+      { access: 7, name: 'state', property: 'state', type: 'binary', value_off: 'OFF', value_on: 'ON' },
+      { access: 7, name: 'brightness', property: 'brightness', type: 'numeric', value_max: 254, value_min: 0 },
+      { access: 7, name: 'color_temp', property: 'color_temp', type: 'numeric', unit: 'mired', value_max: 500, value_min: 153,
+        presets: [
+          { name: 'coolest', value: 153, description: 'Coolest temperature supported' },
+          { name: 'cool', value: 250, description: 'Cool white' },
+          { name: 'neutral', value: 370, description: 'Neutral white' },
+          { name: 'warm', value: 454, description: 'Warm white' },
+          { name: 'warmest', value: 500, description: 'Warmest temperature supported' },
+        ] },
+      { access: 7, name: 'color_xy', property: 'color', type: 'composite', features: [
+        { access: 7, name: 'x', property: 'x', type: 'numeric' },
+        { access: 7, name: 'y', property: 'y', type: 'numeric' },
+      ] },
+      { access: 7, name: 'color_hs', property: 'color', type: 'composite', features: [
+        { access: 7, name: 'hue', property: 'hue', type: 'numeric', value_max: 360, value_min: 0 },
+        { access: 7, name: 'saturation', property: 'saturation', type: 'numeric', value_max: 100, value_min: 0 },
+      ] },
+      { access: 3, name: 'color_temp_startup', property: 'color_temp_startup', type: 'numeric', unit: 'mired',
+        value_max: 500, value_min: 153,
+        presets: [
+          { name: 'coolest', value: 153, description: 'Coolest temperature supported' },
+          { name: 'cool', value: 250, description: 'Cool white' },
+          { name: 'neutral', value: 370, description: 'Neutral white' },
+          { name: 'warm', value: 454, description: 'Warm white' },
+          { name: 'warmest', value: 500, description: 'Warmest temperature supported' },
+          { name: 'previous', value: 65535, description: 'Restore the previous color_temp value' },
+        ] },
+    ] },
+    { access: 7, label: 'effect_speed', name: 'effect_speed', property: 'effect_speed', type: 'numeric', value_max: 1, value_min: 0, value_step: 0.01 },
+  ],
+  options: [],
+  option_values: { friendly_name: "Isabel's office globe" },
+};
+// A real fleet device with no color_hs and no color_temp at all: xy is the
+// only color mode it speaks, which is the case the mode segment and the
+// color write path both have to handle without a hue/saturation feature.
+const nightlightDevice = {
+  ieee_address: '0x00178801000000c3',
+  friendly_name: "Isabel's Office Nightlight",
+  network_address: 5005,
+  vendor: 'Third Reality',
+  model: '3RSNL02043Z',
+  description: 'Zigbee smart night light',
+  type: 'Router',
+  power_source: 'Mains (single phase)',
+  availability: 'online',
+  supported: true,
+  scenes: [],
+  endpoints: [1],
+  exposes: [
+    { type: 'light', features: [
+      { access: 7, name: 'state', property: 'state', type: 'binary', value_off: 'OFF', value_on: 'ON' },
+      { access: 7, name: 'brightness', property: 'brightness', type: 'numeric', value_max: 254, value_min: 0 },
+      { access: 7, name: 'color_xy', property: 'color', type: 'composite', features: [
+        { access: 7, name: 'x', property: 'x', type: 'numeric' },
+        { access: 7, name: 'y', property: 'y', type: 'numeric' },
+      ] },
+    ] },
+  ],
+  options: [],
+  option_values: { friendly_name: "Isabel's Office Nightlight" },
+};
+p._devices = fx.devices.concat([hueDevice, inovelliDevice, hueGlobeDevice, nightlightDevice]);
 p._render();
+
+console.log('=== light block: Hue globe skeleton and state push ===');
+p._go({ name: 'device', ieee: hueGlobeDevice.ieee_address });
+await tick();
+check('the light block renders for the light expose', !!p.shadowRoot.getElementById('lt0'));
+check('unknown state shows the placeholder', html().includes('id="lt0-state">\u2014<'));
+check('the mode segment renders (both temp and color groups)', !!p.shadowRoot.getElementById('lt0-seg'));
+check('color_temp_startup is now a Settings N row (carve-out)',
+  !!find('data-prop', 'color_temp_startup'));
+push('z2m/device/state/subscribe', { state: { state: 'ON', brightness: 128, color_mode: 'color_temp', color_temp: 370 } });
+const lt0html = () => String(p.shadowRoot.getElementById('lt0').innerHTML);
+check('the hero state line patches from the push', lt0html().includes('id="lt0-state">On'));
+check('brightness percent is roundtrip-correct (128/254)', lt0html().includes('50%'));
+check('temperature kelvin reads from mired', lt0html().includes('id="lt0-tk">2700 K'));
+
+console.log('=== light block: a temperature preset writes the exact mired ===');
+sent.length = 0;
+const warmChip = p.shadowRoot.querySelectorAll('[data-lttchip]').find((e) => e.dataset.lttchip.endsWith('|370'));
+check('the Warm chip is present', !!warmChip);
+warmChip.onclick();
+await tick(30);
+check('it writes color_temp 370 exactly',
+  sent.some((m) => m.type === 'z2m/device/set' && m.payload.color_temp === 370));
+
+console.log('=== light block: a brightness chip turns the light on in one write ===');
+sent.length = 0;
+push('z2m/device/state/subscribe', { state: { state: 'OFF' } });
+const chip100 = p.shadowRoot.querySelectorAll('[data-ltbchip]').find((e) => e.dataset.ltbchip.endsWith('|254'));
+chip100.onclick();
+await tick(30);
+check('the write combines state ON with the brightness',
+  sent.some((m) => m.type === 'z2m/device/set' && m.payload.state === 'ON' && m.payload.brightness === 254));
+
+console.log('=== light block: hex tap-to-edit commits through the color path ===');
+p._go({ name: 'device', ieee: hueGlobeDevice.ieee_address });
+await tick();
+push('z2m/device/state/subscribe', { state: { state: 'ON', brightness: 200, color_mode: 'hs', color: { hue: 30, saturation: 100 } } });
+const hexBtn = p.shadowRoot.getElementById('lt0-hex');
+check('the hex readout is a tappable button, not dead markup', !!hexBtn);
+hexBtn.onclick();
+const hexWrap = p.shadowRoot.getElementById('lt0-hexwrap');
+const hexField = hexWrap.getElementById('lt0-hexfield');
+check('tapping swaps it for an inline field prefilled without #',
+  !!hexField && hexField.getAttribute('value') !== null && !hexField.getAttribute('value').startsWith('#'));
+sent.length = 0;
+hexField.value = 'notahex';
+hexField.onblur();
+await tick(20);
+check('an invalid hex writes nothing', !sent.some((m) => m.type === 'z2m/device/set'));
+check('and shows the helper text', p.shadowRoot.getElementById('lt0-err').textContent.includes('six hex digits'));
+hexField.value = '0000ff';
+sent.length = 0;
+hexField.onblur();
+await tick(20);
+const hexMsg = sent.find((m) => m.type === 'z2m/device/set');
+check('a valid hex commits through the hue/saturation write path',
+  !!hexMsg && hexMsg.payload.color && Math.round(hexMsg.payload.color.hue) === 240 && hexMsg.payload.color.saturation > 90);
+
+console.log('=== light block: an xy-only bulb has no mode segment and writes xy ===');
+p._go({ name: 'device', ieee: nightlightDevice.ieee_address });
+await tick();
+check('the light block renders', !!p.shadowRoot.getElementById('lt0'));
+check('no mode segment for a color-only bulb (no color_temp expose)', !p.shadowRoot.getElementById('lt0-seg'));
+check('the color panel is not hidden', (() => {
+  const panel = p.shadowRoot.getElementById('lt0-colorpanel');
+  return !!panel && panel.getAttribute('hidden') === null;
+})());
+push('z2m/device/state/subscribe', { state: { state: 'ON', brightness: 100, color: { x: 0.3, y: 0.3 } } });
+const nlHueSlider = p.shadowRoot.getElementById('lt0').getElementById('lt0-hue');
+check('the hue slider thumb derives from the reported xy (no color_hs at all)',
+  !!nlHueSlider && nlHueSlider.getAttribute('value') !== null && nlHueSlider.getAttribute('value') !== '30');
+sent.length = 0;
+nlHueSlider.value = '200';
+nlHueSlider.onchange();
+await tick(30);
+const xyMsg = sent.find((m) => m.type === 'z2m/device/set');
+check('the color panel commit writes color:{x,y}, not {hue,saturation}',
+  !!xyMsg && xyMsg.payload.color && typeof xyMsg.payload.color.x === 'number' && typeof xyMsg.payload.color.y === 'number'
+    && xyMsg.payload.color.hue === undefined);
+
+p._go({ name: 'dashboard' });
+await tick();
+
+console.log('=== settings K: a bounded numeric renders a slider and its chip writes ===');
+p._go({ name: 'device', ieee: hueGlobeDevice.ieee_address });
+await tick();
+const kBox = p.shadowRoot.getElementById('setctl-expose_effect_speed');
+check('effect_speed (0-1 step 0.01, 100 positions) renders a K slider', !!kBox && kBox.innerHTML.includes('class="setk"'));
+p._go({ name: 'device', ieee: inovelliDevice.ieee_address });
+await tick();
+push('z2m/device/state/subscribe', { state: { dimmingSpeedUpRemote: 40 } });
+const kSlider = p.shadowRoot.getElementById('setctl-expose_dimmingSpeedUpRemote').querySelectorAll('[data-gs]')[0];
+check('dimmingSpeedUpRemote (0-127) renders a K slider', !!kSlider);
+kSlider.value = '64';
+sent.length = 0;
+kSlider.onchange();
+await tick(30);
+check('K commits the slider position as the wire value',
+  sent.some((m) => m.type === 'z2m/device/set' && m.payload.dimmingSpeedUpRemote === 64));
+
+console.log('=== settings L: the hue trio maps 0-255 to a hue name ===');
+push('z2m/device/state/subscribe', { state: { ledColorWhenOn: 42 } });
+const lBox = p.shadowRoot.getElementById('setctl-expose_ledColorWhenOn');
+check('ledColorWhenOn (0-255, /color/i) renders an L trio', !!lBox && lBox.innerHTML.includes('class="setl"'));
+check('L never shows preset chips', !lBox.innerHTML.includes('class="pchips"'));
+const lSlider = lBox.querySelectorAll('[data-gs]')[0];
+lSlider.value = '170';
+sent.length = 0;
+lSlider.onchange();
+await tick(30);
+check('L commits the 0-255 wire value directly',
+  sent.some((m) => m.type === 'z2m/device/set' && m.payload.ledColorWhenOn === 170));
+push('z2m/device/state/subscribe', { state: { led_effect: { effect: 'solid', level: 40, duration: 10 } } });
+await tick(30);
+const durFeat = p.shadowRoot.getElementById('setfeat-expose_led_effect-duration');
+check('the duration feature renders the M editor', !!durFeat && durFeat.innerHTML.includes('class="setm"'));
+const durEdgeCases = [
+  [60, 'Seconds', '60', '60 s'], [61, 'Minutes', '1', '1 min'], [120, 'Minutes', '60', '60 min'],
+  [121, 'Hours', '1', '1 h'], [254, 'Hours', '134', '134 h'], [255, 'Forever', '', 'until cleared'],
+];
+durEdgeCases.forEach(([wire, unit, val, human]) => {
+  push('z2m/device/state/subscribe', { state: { led_effect: { effect: 'solid', level: 40, duration: wire } } });
+  const featHtml = String(p.shadowRoot.getElementById('setfeat-expose_led_effect-duration').innerHTML);
+  check(`wire ${wire} selects the ${unit} segment`,
+    featHtml.includes(`aria-selected="true" data-setfeatdurunit="0x00178801000000b2|expose:led_effect|duration|${unit}"`));
+  if (unit !== 'Forever') check(`wire ${wire} shows box value ${val}`, featHtml.includes(`value="${val}"`));
+  check(`wire ${wire} runs ${human}`, featHtml.includes(human));
+});
+
+p._go({ name: 'dashboard' });
+await tick();
+
 
 console.log('=== settings: Hue-PIR-shaped device (3 plain rows, no filter) ===');
 p._go({ name: 'device', ieee: hueDevice.ieee_address });
@@ -2644,9 +2897,14 @@ check('main rows keep exposes[] order, not alphabetical',
 check('Diagnostic group holds only the one settable diagnostic property (not action/linkquality)',
   invCls.diagnostic.length === 1 && invCls.diagnostic[0].prop === 'debugMode'
     && !!find('data-prop', 'debugMode') && html().includes('Diagnostic'));
-check('a preset numeric shows a preset select plus a hidden custom field', (() => {
+// Editor E (preset select + Custom…) is retired (§2.2): a numeric with
+// presets but too many positions for a track (32767, way past K's 1000-
+// position ceiling) is plain F now -- box only, no chips, no select.
+check('a large-range preset numeric is plain F, not a preset select', (() => {
   const box = p.shadowRoot.getElementById('setctl-expose_autoTimerOff');
-  return !!box && String(box.innerHTML).includes('data-setpreset') && String(box.innerHTML).includes('setpreset-custom');
+  return !!box && !String(box.innerHTML).includes('data-setpreset')
+    && !String(box.innerHTML).includes('pchip')
+    && String(box.innerHTML).includes('data-setnum');
 })());
 
 console.log('=== settings: the composite Apply writes the whole nested object ===');
@@ -2685,6 +2943,119 @@ for (let i = 0; i < 250; i += 1) {
 check('the pairing log is capped at PAIR_LOG_MAX (200), not the old 24', p._pairing.logs.length === 200);
 check('the cap keeps the newest lines', p._pairing.logs[p._pairing.logs.length - 1].message === 'interview step 249');
 await act('pairclose');
+
+/* =============================================================== routing */
+console.log('=== routing: _go pushes a history entry for every view ===');
+p._go({ name: 'dashboard' });
+await tick();
+const routeRoundtrip = [
+  [{ name: 'devices' }, '/z2m/devices'],
+  [{ name: 'device', ieee: fx.devices[0].ieee_address }, `/z2m/device/${fx.devices[0].ieee_address}`],
+  [{ name: 'groups' }, '/z2m/groups'],
+  [{ name: 'map' }, '/z2m/map'],
+  [{ name: 'diagnostics' }, '/z2m/diagnostics'],
+  [{ name: 'options' }, '/z2m/settings'],
+  [{ name: 'logs' }, '/z2m/logs'],
+  [{ name: 'ota' }, '/z2m/ota'],
+  [{ name: 'network' }, '/z2m/network'],
+  [{ name: 'bindsall' }, '/z2m/bindsall'],
+  [{ name: 'dashboard' }, '/z2m'],
+];
+for (const [view, path] of routeRoundtrip) {
+  const depthBefore = historyStack.length;
+  p._go(view);
+  await tick();
+  check(`${view.name} pushes ${path}`, window.location.pathname === path);
+  check(`${view.name} grows the history stack by one`, historyStack.length === depthBefore + 1);
+}
+
+console.log('=== routing: the route setter drives _view for a device deep link ===');
+const deepIeee = fx.devices[1].ieee_address;
+const cold = new Panel();
+cold.connectedCallback();
+// Home Assistant's router can set `route` before `hass` lands; the very first
+// paint still has to be the deep-linked page, not a dashboard that then jumps.
+cold.route = { prefix: '/z2m', path: `/device/${deepIeee}` };
+cold.hass = hass;
+await tick();
+check('a route set before hass drives the initial view',
+  cold._view.name === 'device' && cold._view.ieee === deepIeee);
+check('and the device page renders on the very first paint',
+  cold.shadowRoot.innerHTML.includes(fx.devices[1].friendly_name));
+cold.disconnectedCallback();
+
+console.log('=== routing: a cold load with no route falls back to the URL ===');
+const urlOnly = new Panel();
+urlOnly.connectedCallback();
+history.pushState(null, '', `/z2m/device/${deepIeee}`);
+urlOnly.hass = hass;
+await tick();
+check('the URL alone is enough to open a deep link',
+  urlOnly._view.name === 'device' && urlOnly._view.ieee === deepIeee);
+urlOnly.disconnectedCallback();
+p._go({ name: 'dashboard' });
+await tick();
+
+console.log('=== routing: popstate walks views back without re-pushing ===');
+p._go({ name: 'devices' });
+await tick();
+const depthAtDevices = historyStack.length;
+let navigateCalls = 0;
+const realNavigate = p._navigate.bind(p);
+p._navigate = (...args) => {
+  navigateCalls += 1;
+  return realNavigate(...args);
+};
+history.back();
+await tick();
+check('back moves _view to the previous page', p._view.name === 'dashboard');
+check('without growing the history stack', historyStack.length === depthAtDevices);
+check('through exactly one _navigate call', navigateCalls === 1);
+
+console.log('=== routing: a route echo of our own push is a no-op ===');
+p._go({ name: 'devices' });
+await tick();
+navigateCalls = 0;
+p.route = { prefix: '/z2m', path: '/devices' };
+check('an echoed route does not re-navigate', navigateCalls === 0);
+p.route = { prefix: '/z2m', path: '/groups' };
+check('but a genuine route change does', navigateCalls === 1 && p._view.name === 'groups');
+delete p._navigate;
+p._go({ name: 'dashboard' });
+await tick();
+
+console.log('=== routing: the pairing dialog owns one history entry back can close ===');
+const depthBeforePair = historyStack.length;
+await act('pair');
+await tick(60);
+check('opening the dialog pushes one history entry', historyStack.length === depthBeforePair + 1);
+check('tagged with the #pair marker', window.location.hash === '#pair');
+check('and the dialog remembers it owns that entry', p._pairing.historyPushed === true);
+
+// The operator's own Back press: closes the dialog, does not leave the panel
+// underneath it, and does not pop a second entry chasing the one Back already
+// consumed.
+history.back();
+await tick();
+check('back closes the dialog instead of leaving the panel',
+  p._pairing.open === false && p._view.name === 'dashboard');
+check('leaving the address bar past the marker', window.location.hash === '');
+check('and popping only the one entry it owned', historyStack.length === depthBeforePair + 1);
+
+// Re-open, then close by the dialog's own button: the button pops the entry
+// itself, exactly once.
+await act('pair');
+await tick(60);
+const indexAfterReopen = historyIndex;
+await act('pairclose');
+await tick();
+check('closing by button pops the entry it pushed on open',
+  historyIndex === indexAfterReopen - 1);
+check('and the dialog is closed', p._pairing.open === false);
+check('with the marker gone from the address bar', window.location.hash === '');
+
+p._go({ name: 'dashboard' });
+await tick();
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) =>
