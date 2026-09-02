@@ -1506,11 +1506,11 @@ check('no Re-scan button in the shell', !find('data-act', 'rescan'));
 check('the shell draws no node card of its own', !html().includes('id="mapsel"'));
 check('the map wrapper adds no padding', html().includes('.container.mapview { padding:0; }'));
 check('hass-subpage path: map fills the area below the header',
-  html().includes('.stage { height:calc(100vh - var(--header-height,56px)); min-height:360px; }'));
+  html().includes('.stage { height:calc(100vh - var(--header-height,56px)); height:calc(100dvh - var(--header-height,56px)); min-height:360px; }'));
 check('no mobile override shrinks the map', !/\.stage \{ height:calc\(100vh - \d/.test(html()));
 withoutElement('hass-subpage', () => {
   check('fallback chrome: same height rule',
-    html().includes('.stage { height:calc(100vh - var(--header-height,56px)); min-height:360px; }'));
+    html().includes('.stage { height:calc(100vh - var(--header-height,56px)); height:calc(100dvh - var(--header-height,56px)); min-height:360px; }'));
   check('fallback chrome: the sticky toolbar is exactly that band plus the safe area',
     html().includes('height:calc(var(--header-height, 56px) + var(--safe-area-inset-top, 0px))'));
   check('fallback chrome: still nothing between body and map',

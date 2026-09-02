@@ -1744,10 +1744,24 @@ class Z2MPanel extends HTMLElement {
     // panel-local palette. That keeps density, contrast, type and dark mode aligned
     // with the surrounding Settings surfaces.
     return `
-      :host { display:block; height:100%; overflow:auto;
+      /* The panel owns its viewport. Ambient height chains (ha-drawer et al) hold
+       * on desktop but NOT inside the companion apps, where a plain height:100%
+       * host grows to its content: the document scrolls, a sticky toolbar binds to
+       * a scrollport that never moves, and hass-subpage's narrow position:fixed
+       * lands at a pushed-down static position. dvh sidesteps all of it: the host
+       * is exactly one viewport tall, never scrolls, and scrolling lives in the
+       * chrome's own content region (hass-subpage .content, or #scroll in the
+       * fallback). */
+      :host { display:block; height:100vh; height:100dvh; overflow:hidden;
               background:var(--primary-background-color);
               color:var(--primary-text-color);
               font-family:var(--ha-font-family-body, var(--paper-font-body1_-_font-family, sans-serif)); }
+      /* The chrome's flex column lives on #app, the wrapper _ensureApp keeps as
+       * the shadow root's only child -- :host flex would style the wrapper, not
+       * the toolbar and scroller inside it. */
+      #app { display:flex; flex-direction:column; height:100%; min-height:0; }
+      hass-subpage { flex:1; min-height:0; }
+      #scroll { flex:1; min-height:0; overflow:auto; -webkit-overflow-scrolling:touch; }
       .container { padding:var(--ha-space-2, 8px) var(--ha-space-4, 16px)
                    calc(var(--ha-space-16, 64px) + var(--safe-area-inset-bottom, 0px)); }
       ha-card { display:block; max-width:600px; margin:var(--ha-space-4, 16px) auto 0; }
@@ -2308,8 +2322,8 @@ class Z2MPanel extends HTMLElement {
                              color:var(--secondary-text-color); }
       .recovery { border-top:var(--ha-border-width, 1px) solid var(--divider-color); }
       .container.mapview { padding:0; }
-      .stage { height:calc(100vh - var(--header-height,56px)); min-height:360px; }
-      .logwrap { min-height:280px; height:calc(100vh - 320px); overflow:auto;
+      .stage { height:calc(100vh - var(--header-height,56px)); height:calc(100dvh - var(--header-height,56px)); min-height:360px; }
+      .logwrap { min-height:280px; height:calc(100vh - 320px); height:calc(100dvh - 320px); overflow:auto;
                  border-top:var(--ha-border-width, 1px) solid var(--divider-color); }
       .log { display:flex; gap:var(--ha-space-2, 8px); padding:var(--ha-space-1, 4px) var(--ha-space-4, 16px);
              font-family:var(--ha-font-family-code, monospace); font-size:var(--ha-font-size-s, 12px);
@@ -2320,7 +2334,7 @@ class Z2MPanel extends HTMLElement {
       .log.info .l { color:var(--info-color, var(--primary-color)); }
       .log.debug .l { color:var(--secondary-text-color); }
       .log .m { flex:1; min-width:0; }
-      .toolbar { position:sticky; top:0; z-index:2; display:flex; align-items:center;
+      .toolbar { flex:none; z-index:2; display:flex; align-items:center;
                  gap:var(--ha-space-2, 8px); box-sizing:border-box;
                  height:calc(var(--header-height, 56px) + var(--safe-area-inset-top, 0px));
                  padding:calc(var(--ha-space-2, 8px) + var(--safe-area-inset-top, 0px))
@@ -2348,7 +2362,7 @@ class Z2MPanel extends HTMLElement {
         .kv .k { flex:none; }
         .form-row { align-items:stretch; flex-direction:column; }
         input[type=text], input[type=number], select { max-width:none; width:100%; }
-        .logwrap { height:calc(100vh - 280px); }
+        .logwrap { height:calc(100vh - 280px); height:calc(100dvh - 280px); }
       }
     `;
   }
@@ -2404,6 +2418,21 @@ class Z2MPanel extends HTMLElement {
 
   _render() {
     if (!this.shadowRoot) return;
+
+    // The companion apps enter sidebar panels with history.state.root set, which
+    // flips hass-subpage's header to a menu button (its render checks
+    // `this.mainPage || history.state?.root` before backPath). This page's
+    // contract is a back arrow to Settings from every entry point, so the root
+    // marker is stripped before the chrome renders. replaceState keeps the URL
+    // and the rest of the state untouched.
+    if (typeof history !== 'undefined' && history.state && history.state.root) {
+      try {
+        history.replaceState({ ...history.state, root: false }, '');
+      } catch (_) {
+        /* History API refusing replaceState (e.g. detached webview) must never
+         * block a render; the cost is a menu button, not a broken panel. */
+      }
+    }
 
     this._counts = this._countKey();
     const wide = this._view.name === 'devices' || this._view.name === 'bindsall';
@@ -2525,7 +2554,7 @@ class Z2MPanel extends HTMLElement {
         <ha-icon-button id="reload" data-act="refresh" data-path="${MDI.refresh}"
           data-label="Refresh"></ha-icon-button>
       </div>
-      ${body}`;
+      <div id="scroll">${body}</div>`;
   }
 
   _title() {
@@ -3254,7 +3283,14 @@ class Z2MPanel extends HTMLElement {
     this._setFilterCaret = null;
     if (push) this._pushRoute(view);
     this._render();
-    this.shadowRoot.scrollTop = 0;
+    // The scroller is the chrome's content region: hass-subpage's .content when
+    // the native shell is up, the fallback's #scroll otherwise. The host itself
+    // never scrolls (overflow:hidden), so resetting it would be a no-op.
+    const fallback = this.shadowRoot.getElementById('scroll');
+    if (fallback) fallback.scrollTop = 0;
+    const page = this.shadowRoot.getElementById('page');
+    const content = page && page.shadowRoot && page.shadowRoot.querySelector('.content');
+    if (content) content.scrollTop = 0;
   }
 
   /** Pushes a real history entry for `view`, so the browser's own Back walks
