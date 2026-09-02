@@ -2321,9 +2321,16 @@ class Z2MPanel extends HTMLElement {
                              line-height:1; font-size:var(--ha-font-size-xl, 20px);
                              color:var(--secondary-text-color); }
       .recovery { border-top:var(--ha-border-width, 1px) solid var(--divider-color); }
-      .container.mapview { padding:0; }
-      .stage { height:calc(100vh - var(--header-height,56px)); height:calc(100dvh - var(--header-height,56px)); min-height:360px; }
-      .logwrap { min-height:280px; height:calc(100vh - 320px); height:calc(100dvh - 320px); overflow:auto;
+      /* The scroller (#scroll or hass-subpage's .content) already has the exact
+       * height below the toolbar, safe-area inset included, so the map fills it
+       * with a plain 100% chain. Viewport math here would double-count the
+       * inset: 100dvh minus a bare --header-height leaves the toolbar's
+       * safe-area padding hanging out of the scroller on a notched phone. */
+      .container.mapview { padding:0; height:100%; box-sizing:border-box; }
+      .stage { height:100%; min-height:360px; }
+      .logwrap { min-height:280px; overflow:auto;
+                 height:calc(100vh - 320px - var(--safe-area-inset-top, 0px));
+                 height:calc(100dvh - 320px - var(--safe-area-inset-top, 0px));
                  border-top:var(--ha-border-width, 1px) solid var(--divider-color); }
       .log { display:flex; gap:var(--ha-space-2, 8px); padding:var(--ha-space-1, 4px) var(--ha-space-4, 16px);
              font-family:var(--ha-font-family-code, monospace); font-size:var(--ha-font-size-s, 12px);
@@ -2362,7 +2369,8 @@ class Z2MPanel extends HTMLElement {
         .kv .k { flex:none; }
         .form-row { align-items:stretch; flex-direction:column; }
         input[type=text], input[type=number], select { max-width:none; width:100%; }
-        .logwrap { height:calc(100vh - 280px); height:calc(100dvh - 280px); }
+        .logwrap { height:calc(100vh - 280px - var(--safe-area-inset-top, 0px));
+                   height:calc(100dvh - 280px - var(--safe-area-inset-top, 0px)); }
       }
     `;
   }
