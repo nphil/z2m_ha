@@ -654,7 +654,8 @@ console.log('=== built from HA components, not lookalikes ===');
 check('renders', html().length > 800);
 check('hosted in hass-subpage', html().includes('<hass-subpage'));
 check('subpage titled Zigbee', html().includes('header="Zigbee"'));
-check('top level has no back arrow (main-page)', html().includes(' main-page'));
+check('top level backs out to Settings like the Z-Wave dashboard',
+  html().includes(' back-path="/config"') && !html().includes(' main-page'));
 check('uses ha-card', html().includes('<ha-card'));
 check('uses ha-md-list', html().includes('<ha-md-list>'));
 check('uses ha-md-list-item', html().includes('<ha-md-list-item'));
@@ -1510,8 +1511,8 @@ check('no mobile override shrinks the map', !/\.stage \{ height:calc\(100vh - \d
 withoutElement('hass-subpage', () => {
   check('fallback chrome: same height rule',
     html().includes('.stage { height:calc(100vh - var(--header-height,56px)); min-height:360px; }'));
-  check('fallback chrome: the sticky toolbar is exactly that band',
-    html().includes('height:var(--header-height, 56px)'));
+  check('fallback chrome: the sticky toolbar is exactly that band plus the safe area',
+    html().includes('height:calc(var(--header-height, 56px) + var(--safe-area-inset-top, 0px))'));
   check('fallback chrome: still nothing between body and map',
     /<div class="container mapview">\s*<div class="stage" id="mapstage"><\/div>\s*<\/div>/
       .test(html()));

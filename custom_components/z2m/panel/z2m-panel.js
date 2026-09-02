@@ -1889,8 +1889,7 @@ class Z2MPanel extends HTMLElement {
       .network-status small, .supporting { color:var(--secondary-text-color);
               font-size:var(--ha-font-size-m, 14px); line-height:var(--ha-line-height-condensed, 1.2); }
       .network-status small.offline { color:var(--error-color); }
-      .network-status .version { align-self:flex-start; color:var(--secondary-text-color);
-              font-size:var(--ha-font-size-m, 14px); white-space:nowrap; }
+      .network-status .heading .logo { height:48px; width:auto; flex-shrink:0; align-self:center; }
       .kv { display:flex; gap:var(--ha-space-4, 16px); padding:var(--ha-space-3, 12px) var(--ha-space-4, 16px);
             font-size:var(--ha-font-size-m, 14px); }
       .kv + .kv { border-top:var(--ha-border-width, 1px) solid var(--divider-color); }
@@ -2322,8 +2321,10 @@ class Z2MPanel extends HTMLElement {
       .log.debug .l { color:var(--secondary-text-color); }
       .log .m { flex:1; min-width:0; }
       .toolbar { position:sticky; top:0; z-index:2; display:flex; align-items:center;
-                 gap:var(--ha-space-2, 8px); box-sizing:border-box; height:var(--header-height, 56px);
-                 padding:var(--ha-space-2, 8px) var(--ha-space-3, 12px);
+                 gap:var(--ha-space-2, 8px); box-sizing:border-box;
+                 height:calc(var(--header-height, 56px) + var(--safe-area-inset-top, 0px));
+                 padding:calc(var(--ha-space-2, 8px) + var(--safe-area-inset-top, 0px))
+                         var(--ha-space-3, 12px) var(--ha-space-2, 8px);
                  background-color:var(--app-header-background-color, var(--primary-color));
                  color:var(--app-header-text-color, var(--primary-text-color));
                  border-bottom:var(--app-header-border-bottom, none); }
@@ -2338,6 +2339,11 @@ class Z2MPanel extends HTMLElement {
            rather than squeezing a two-word heading into two lines. */
         .card-header { align-items:flex-start; flex-wrap:wrap; }
         .header-actions { justify-content:flex-start; width:100%; }
+        /* The network card keeps its pill beside the heading on a phone, the way
+           the Z-Wave dashboard does; the wrap rule above is for headers whose
+           actions genuinely do not fit. */
+        .card-header.nowrap { flex-wrap:nowrap; align-items:center; }
+        .card-header.nowrap .header-actions { width:auto; justify-content:flex-end; }
         .kv { flex-direction:column; gap:var(--ha-space-1, 4px); }
         .kv .k { flex:none; }
         .form-row { align-items:stretch; flex-direction:column; }
@@ -2497,9 +2503,9 @@ class Z2MPanel extends HTMLElement {
 
   /** HA's own page chrome: header, back arrow and refresh action. */
   _subpageChrome(body, top) {
-    return `<hass-subpage id="page" header="${esc(this._title())}"${top ? ' main-page' : ''}${
-      this._narrow ? ' narrow' : ''
-    }>
+    return `<hass-subpage id="page" header="${esc(this._title())}"${
+      top ? ' back-path="/config"' : ''
+    }${this._narrow ? ' narrow' : ''}>
         <ha-icon-button id="reload" slot="toolbar-icon" data-act="refresh"
           data-path="${MDI.refresh}" data-label="Refresh"></ha-icon-button>
         ${body}
@@ -2513,12 +2519,8 @@ class Z2MPanel extends HTMLElement {
    */
   _plainChrome(body, top) {
     return `<div class="toolbar">
-        ${
-          top
-            ? ''
-            : `<ha-icon-button id="back" data-act="back" data-path="${MDI.back}"
-                 data-label="Back"></ha-icon-button>`
-        }
+        <ha-icon-button id="back" data-act="${top ? 'backtop' : 'back'}" data-path="${MDI.back}"
+          data-label="Back"></ha-icon-button>
         <div class="maintitle">${esc(this._title())}</div>
         <ha-icon-button id="reload" data-act="refresh" data-path="${MDI.refresh}"
           data-label="Refresh"></ha-icon-button>
@@ -3148,8 +3150,10 @@ class Z2MPanel extends HTMLElement {
     const page = r.getElementById('page');
     if (page) {
       page.hass = this._hass;
-      // Sub-views step back through the panel's own view state. The top level has no
-      // in-panel parent, so it shows HA's menu button instead of a back arrow.
+      // Sub-views step back through the panel's own view state. The top level
+      // matches HA's Z-Wave dashboard exactly: a back arrow to Settings via
+      // back-path, never a menu button, so the header reads the same from the
+      // sidebar, from Configure, and inside the companion apps.
       page.backCallback = this._view.name === 'dashboard' ? undefined : () => this._back();
     }
 
@@ -3434,8 +3438,9 @@ class Z2MPanel extends HTMLElement {
               ${offline ? `<small class="offline">(${offline} offline)</small>` : ''}
               <br><small id="joinstate">${esc(this._joinText())}</small>
               ${rev ? `<br><small>Coordinator ${esc(c.type || '')} ${esc(String(rev))}</small>` : ''}
+              <br><small>Zigbee2MQTT ${esc(String(s.version || '?'))}</small>
             </div>
-            <span class="version">Zigbee2MQTT ${esc(String(s.version || '?'))}</span>
+            <img class="logo" alt="Zigbee2MQTT" src="/api/panel_custom/z2m/brand-logo.png">
           </div>
         </div>
       </ha-card>`;
@@ -3470,9 +3475,9 @@ class Z2MPanel extends HTMLElement {
     // (it now opens the pairing dialog, which watches before it touches the radio).
     return `
       <ha-card class="nav-card">
-        <div class="card-header">My network
+        <div class="card-header nowrap">My network
           <span class="header-actions">
-            <ha-button appearance="plain" data-act="map">${icon(MDI.map)}Show map</ha-button>
+            <ha-button appearance="filled" size="s" data-act="map">${icon(MDI.map)}Show map</ha-button>
           </span>
         </div>
         <div class="card-content">${list(rows)}</div>
@@ -8294,6 +8299,13 @@ class Z2MPanel extends HTMLElement {
       // Only reachable from the fallback chrome; hass-subpage owns its own back arrow.
       case 'back':
         return this._back();
+
+      // Top-level back leaves the panel for Settings, the same target as the
+      // Z-Wave dashboard's back arrow.
+      case 'backtop':
+        history.pushState(null, '', '/config');
+        window.dispatchEvent(new CustomEvent('location-changed', { detail: { replace: false } }));
+        return undefined;
 
       case 'map':
         return this._go({ name: 'map' });
